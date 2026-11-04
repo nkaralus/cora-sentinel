@@ -36,6 +36,7 @@ import errno
 import ipaddress
 import json
 import os
+import queue
 import select
 import socket
 import sys
@@ -52,6 +53,7 @@ SLIP_RATE_S = 60.0     # log each (ip, port) slip at most once per minute; all a
 TUPLE_TTL_S = 150.0    # how long a tapped connection's identity is remembered
 TAP_RECHECK_S = 10.0   # re-verify the tap rules this often even if no task came or went
 STALL_WARN_MS = 500    # warn once if a poll takes longer than this: events queue up behind it
+DISPATCH_QUEUE_MAX = 4096   # events waiting for delivery; beyond this they are DROPPED, loudly
 
 
 def _note(msg: str) -> None:
@@ -88,6 +90,14 @@ class NetMonitor:
         self._tap_checked = -1e9
         self._owners: Dict[str, tuple] = {}           # task -> (pid, argv, starttime) last seen ALIVE
         self.owner_diag: list = []                    # why an owner could not be resolved (first 20)
+        # The event loop never blocks on nft, a file lock or the registry lock. Those go to two workers:
+        self._dq: "queue.Queue" = queue.Queue(maxsize=DISPATCH_QUEUE_MAX)   # delivery (needs the registry lock)
+        self._dthread: Optional[threading.Thread] = None
+        self._sthread: Optional[threading.Thread] = None                    # tap rule sync (runs nft)
+        self._sync_req = threading.Event()
+        self._sync_lock = threading.Lock()
+        self._sync_want: Optional[Dict[str, int]] = None
+        self._sync_requested: Optional[Dict[str, int]] = None
         self._tap_synced: Dict[str, int] = {}
         self._tap_err_at = -1e9
         self.listen_ports: set = set()
@@ -191,10 +201,49 @@ class NetMonitor:
                             "note": "the task contacted this destination and no live process could be found for it"},
                            (ev["remote_ip"], ev["remote_port"]))
             return
+        self._enqueue((name, pid, argv, st, j["severity"], ev, now))
+
+    def _enqueue(self, item: tuple) -> None:
+        """The owner's identity is captured NOW (cheap, from /proc). Delivery needs the registry lock, which
+        the adjudicator holds while it runs nft, so it is handed to a worker: only delivery may wait."""
+        if self._dthread is None:                    # no worker (unit tests, library use): deliver inline
+            self._deliver(item)
+            return
+        try:
+            self._dq.put_nowait(item)
+        except queue.Full:
+            self.stats["dispatch_dropped"] += 1
+            n = self.stats["dispatch_dropped"]
+            if n <= 3 or n % 1000 == 0:
+                _note(f"dispatch queue full ({self._dq.maxsize}): event for task {item[0]!r} DROPPED "
+                      f"(delivery is stalled; {n} dropped so far)")
+
+    def _deliver(self, item: tuple) -> None:
+        name, pid, argv, st, severity, ev, now = item
         payload = build_payload(pid, self.s.net.ensure(pid), " ".join(argv),
-                                "unauthorized_connection", j["severity"], ev, st, cgroup=name)
+                                "unauthorized_connection", severity, ev, st, cgroup=name)
         self.s._fire((name, "unauthorized_connection", ev["remote_ip"], ev["remote_port"], ev.get("qname")),
                      now, payload)
+
+    def _dispatch_loop(self) -> None:
+        while True:
+            item = self._dq.get()
+            try:
+                if item is None:
+                    return
+                self._deliver(item)
+            except Exception as e:
+                self.stats["errors"] += 1
+                _note(f"delivery error: {e!r}")
+            finally:
+                self._dq.task_done()
+
+    def flush(self, timeout: float = 5.0) -> bool:
+        """Wait until every queued event has been delivered."""
+        end = time.monotonic() + timeout
+        while self._dq.unfinished_tasks and time.monotonic() < end:
+            time.sleep(0.005)
+        return not self._dq.unfinished_tasks
 
     # ---- source 2: dumps --------------------------------------------------
     def poll_once(self, now: Optional[float] = None) -> None:
@@ -255,17 +304,42 @@ class NetMonitor:
     def _sync_tap(self, cur: Dict[str, int]) -> None:
         """Reconcile tap rules with the task set. Costs an nft call, so ONLY when the set changed."""
         now = time.monotonic()
-        if cur == self._tap_synced and now - self._tap_checked < TAP_RECHECK_S:
+        if cur == self._sync_requested and now - self._tap_checked < TAP_RECHECK_S:
             return                                   # unchanged and recently verified: no nft call
+        self._sync_requested, self._tap_checked = dict(cur), now
+        if self._sthread is None:                    # no worker (unit tests, library use): sync inline
+            self._sync_now(cur)
+            return
+        with self._sync_lock:                        # the worker applies only the LATEST wanted state
+            self._sync_want = dict(cur)
+        self._sync_req.set()
+
+    def _sync_now(self, cur: Dict[str, int]) -> None:
+        t = time.monotonic()
         try:
-            added, removed = self.tap.sync(cur)      # also repairs duplicated/partial rule sets
-            self._tap_synced, self._tap_checked = dict(cur), now
+            added, removed = self.tap.sync(cur)      # runs nft under a cross-process lock; also repairs damage
+            self._tap_synced = dict(cur)
             self.stats["tap_installed"] += len(added)
         except Exception as e:
             self.stats["errors"] += 1
-            if time.monotonic() - self._tap_err_at > 30:      # retry every poll, complain every 30 s
+            self._sync_requested = None              # force a retry on the next poll
+            if time.monotonic() - self._tap_err_at > 30:      # retry often, complain every 30 s
                 self._tap_err_at = time.monotonic()
                 _note(f"tap rule sync failed: {e}")
+        finally:
+            ms = int((time.monotonic() - t) * 1000)
+            if ms > self.stats["tap_sync_ms_max"]:
+                self.stats["tap_sync_ms_max"] = ms
+
+    def _sync_loop(self) -> None:
+        while not self._stop.is_set():
+            if not self._sync_req.wait(0.5):
+                continue
+            self._sync_req.clear()
+            with self._sync_lock:
+                want = self._sync_want
+            if want is not None:
+                self._sync_now(want)
 
     # ---- source 1: SYN tap ------------------------------------------------
     def _drain_tap(self) -> None:
@@ -380,6 +454,11 @@ class NetMonitor:
                     _note(f"event error: {e!r}")
 
     def start(self) -> None:
+        if self.tap is not None:
+            self._sthread = threading.Thread(target=self._sync_loop, name="netmon-tapsync", daemon=True)
+            self._sthread.start()
+        self._dthread = threading.Thread(target=self._dispatch_loop, name="netmon-deliver", daemon=True)
+        self._dthread.start()
         self._thread = threading.Thread(target=self._run, name="netmon", daemon=True)
         self._thread.start()
 
@@ -394,13 +473,21 @@ class NetMonitor:
                if self.tap else "")
         return (f"polls={s['polls']} live_hits={s['live_hits']}{tap} slips={s['slips']} "
                 f"destroyed_seen={s['destroyed']} owner_gone={s['owner_gone']} "
-                f"owner_cached={s['owner_cached']} errors={s['errors']} poll_ms_max={s['poll_ms_max']} "
-                f"LOST={self.lost()}")
+                f"owner_cached={s['owner_cached']} dispatch_dropped={s['dispatch_dropped']} errors={s['errors']} "
+                f"poll_ms_max={s['poll_ms_max']} tap_sync_ms_max={s['tap_sync_ms_max']} LOST={self.lost()}")
 
     def stop(self) -> None:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=5)
+        if self._dthread:                            # let queued events be delivered before we stop
+            try:
+                self._dq.put(None, timeout=2)
+            except queue.Full:
+                pass
+            self._dthread.join(timeout=5)
+        if self._sthread:
+            self._sthread.join(timeout=2)
         _note(self.summary())
         for c in (self.diag, self.listener):
             try:

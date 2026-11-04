@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.3
+
+### Fixed
+- **The event loop could stall for seconds** (bare metal: polls of 1,501 ms and 13,160 ms). It ran `nft` inline, behind
+  a cross-process lock that `cora-run` also holds, and took the registry lock the adjudicator holds across an ISOLATE;
+  events queued while short-lived tasks exited. Tap-rule sync and event delivery now run on worker threads, and the
+  loop only does lock-free work. Measured with every `nft` call at 0.8 s: worst poll **4 ms** (2,418 ms before).
+- `Firewall` now serializes its own read-then-write steps (it relied on the caller holding the registry lock across
+  `nft`); the daemon no longer holds the registry lock across `Firewall.gc`; `ensure(pid)` takes no lock for a pid
+  it already knows.
+- A full delivery queue drops events **loudly** (counted in `dispatch_dropped` and noted on stderr), never silently.
+
+### Added
+- `tap_sync_ms_max` and `dispatch_dropped` in the monitor summary; `NetMonitor.flush()`.
+
+### Note
+- This closes the "Not resolved" item of 0.1.2: the cause was the stall, which the 0.1.2 instrumentation exposed.
+
 ## 0.1.2
 
 ### Fixed

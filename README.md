@@ -183,8 +183,8 @@ python -m pytest -q                              # unprivileged: kernel tests sk
 sudo -E ./venv/bin/python -m pytest -q           # everything (CORA_GGUF=path adds the real-model test)
 ```
 
-At 0.1.2: **245 passed, 1 skipped** as root against the installed wheel (the skip is an IPv6 loopback; the
-real-model test ran), and **188 passed, 58 skipped** unprivileged. The unprivileged run is what CI executes.
+At 0.1.3: **250 passed, 1 skipped** as root against the installed wheel (the skip is an IPv6 loopback; the
+real-model test ran), and **192 passed, 59 skipped** unprivileged. The unprivileged run is what CI executes.
 
 ## Layout
 

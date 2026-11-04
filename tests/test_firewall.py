@@ -363,3 +363,27 @@ def test_release_thaws_a_freeze_that_is_requested_but_not_yet_complete(tmp_path)
     undone = release_task(cg, fw, "t")
     assert "thawed" in undone
     assert (root / "t" / "cgroup.freeze").read_text().strip() == "0"
+
+
+def test_concurrent_block_calls_never_duplicate_an_egress_rule(tmp_path):
+    """Firewall used to rely on the CALLER holding the registry lock to serialize its read-then-add. With the
+    lock no longer held across nft, Firewall must serialize itself."""
+    import threading
+    base = tmp_path / "cgroup"; root = base / "cora"; (root / "a").mkdir(parents=True)
+    fake = FakeNft()
+    real_call = fake.__call__
+
+    def slow(args, stdin):                          # open the window AFTER the read
+        out = real_call(args, stdin)
+        if args[:2] == ["-j", "list"]:
+            time.sleep(0.02)
+        return out
+    fw = Firewall(CgroupRoot(str(root), str(base)), table="serial", nft_base=str(base), run=slow)
+    barrier = threading.Barrier(8)
+
+    def blocker():
+        barrier.wait()
+        fw.block("a")
+    threads = [threading.Thread(target=blocker) for _ in range(8)]
+    [t.start() for t in threads]; [t.join() for t in threads]
+    assert len(fake.rules) == 1

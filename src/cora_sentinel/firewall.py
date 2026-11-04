@@ -15,11 +15,13 @@ Isolation by construction:
 """
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -32,6 +34,16 @@ TABLE_RE = re.compile(r"[a-z][a-z0-9_]{0,31}", re.ASCII)
 
 class FirewallError(Exception):
     pass
+
+
+def _serialized(fn):
+    """Firewall's read-then-write steps must not interleave. They used to rely on the CALLER holding the
+    registry lock across nft, which stalled everything else that needs that lock for as long as nft took."""
+    @functools.wraps(fn)
+    def wrap(self, *a, **kw):
+        with self._lock:
+            return fn(self, *a, **kw)
+    return wrap
 
 
 Runner = Callable[[List[str], Optional[str]], Tuple[int, str, str]]
@@ -59,6 +71,7 @@ class Firewall:
             raise FirewallError(f"bad table name {table!r}")
         self.cg, self.table, self.nft_base = cgroups, table, nft_base
         self._run = run or _default_runner(nft)
+        self._lock = threading.RLock()
 
     # ---- plumbing ---------------------------------------------------------
     def _nft(self, args: List[str], stdin: Optional[str] = None) -> str:
@@ -71,6 +84,7 @@ class Firewall:
     def _script(self, text: str) -> None:
         self._nft(["-f", "-"], text)
 
+    @_serialized
     def ensure(self) -> None:
         """Idempotent. Creates only our own table and chain."""
         self._script(f"add table inet {self.table}\n"
@@ -119,6 +133,7 @@ class Firewall:
         return name in self.rules()
 
     # ---- actions ----------------------------------------------------------
+    @_serialized
     def block(self, name: str) -> bool:
         """Drop the task's egress. True if newly blocked, False if it already was."""
         text = self.rule_text(name)
@@ -132,6 +147,7 @@ class Firewall:
         self._script(f"add rule inet {self.table} {self.CHAIN} {text}\n")
         return True
 
+    @_serialized
     def unblock(self, name: str) -> bool:
         r = self.rules().get(name)
         if r is None:
@@ -139,6 +155,7 @@ class Firewall:
         self._script(f"delete rule inet {self.table} {self.CHAIN} handle {r['handle']}\n")
         return True
 
+    @_serialized
     def gc(self, live: Iterable[str]) -> List[str]:
         """Remove rules whose task cgroup no longer exists."""
         live = set(live)
@@ -154,6 +171,7 @@ class Firewall:
             self.unblock(n)
         return gone
 
+    @_serialized
     def purge(self) -> None:
         rc, _, _ = self._run(["delete", "table", "inet", self.table], None)
         # rc != 0 just means the table was not there

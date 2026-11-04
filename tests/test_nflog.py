@@ -1188,3 +1188,143 @@ def test_a_slow_poll_is_measured_so_a_stalled_monitor_is_visible(tmp_path):
     nm.diag.dump = lambda **kw: (time.sleep(0.25), real_dump(**kw))[1]
     nm.poll_once()
     assert nm.stats["poll_ms_max"] >= 200
+
+
+# ============ the event loop must never block on nft, a file lock, or the registry lock ============
+class FeedQ:
+    """A selectable fake netlink socket: push() makes it readable, poll() hands over what was pushed."""
+    lost = 0
+
+    def __init__(self):
+        self.s, self._w = socket.socketpair()
+        self.items = []
+
+    def push(self, item):
+        self.items.append(item)
+        self._w.send(b"x")
+
+    def poll(self, timeout):
+        self.s.setblocking(False)
+        try:
+            self.s.recv(4096)
+        except OSError:
+            pass
+        out, self.items = self.items, []
+        return out
+
+    def close(self):
+        self.s.close(); self._w.close()
+
+
+def _threaded_monitor(tmp_path, sync=lambda cur: (list(cur), [])):
+    """A monitor whose threads run for real, over a fake cgroup dir and fake netlink sockets."""
+    from cora_sentinel.netmon import NetMonitor
+    root = tmp_path / "cgroup" / "cora"
+    (root / "t1").mkdir(parents=True)
+    (root / "t1" / "cgroup.procs").write_text(f"{os.getpid()}\n")
+    tapq, destq = FeedQ(), FeedQ()
+
+    class Tap:
+        listener = tapq
+        def sync(self, cur): return sync(cur)
+        def close(self): pass
+
+    class FakeDiag:
+        def dump(self, **kw): return []
+        def close(self): pass
+
+    class NoProbe(NetMonitor):
+        def _probe_cgroup_ids(self): pass
+
+    bl = Blocklist(); bl.add_line("203.0.113.0/24", "rogue")
+    events = []
+    s = Sentinel("X", ["/tmp"], 10**6, 5, emit=events.append, net_allow=["0.0.0.0/0"],
+                 cgroups=CgroupRoot(str(root), str(tmp_path / "cgroup")), blocklist=bl, cooldown_s=0)
+    return NoProbe(s, interval=0.05, diag=FakeDiag(), listener=destq, tap=Tap()), events, tapq
+
+
+def _until(cond, timeout):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if cond():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def _hits(events):
+    return [e for e in events if e["anomaly"]["kind"] == "unauthorized_connection"]
+
+
+def test_a_blocked_tap_sync_does_not_stop_events_being_processed(tmp_path):
+    """Regression for the bare-metal stall (poll_ms_max=13160): nft runs under a cross-process lock, and a slow
+    nft used to freeze the whole event loop behind it, so a short-lived task could exit before its events ran."""
+    release = threading.Event()
+    nm, events, tapq = _threaded_monitor(tmp_path, sync=lambda cur: (release.wait(3), (list(cur), []))[1])
+    nm.start()
+    try:
+        time.sleep(0.3)                                    # the first sync is now stuck inside nft
+        assert not release.is_set()
+        tapq.push(_udp_syn())
+        assert _until(lambda: _hits(events), 1.0), "the event waited behind a blocked nft call"
+    finally:
+        release.set(); nm.stop()
+
+
+def test_a_held_registry_lock_does_not_stop_the_loop_draining_events(tmp_path):
+    """The adjudicator holds the registry lock while it runs nft for an ISOLATE. The event loop must keep
+    draining (and deduping) meanwhile; only DELIVERY may wait."""
+    nm, events, tapq = _threaded_monitor(tmp_path)
+    nm.start()
+    nm.s.net.lock.acquire()                                # an ISOLATE is mid-nft
+    try:
+        for i in range(5):
+            tapq.push(_udp_syn(sport=41000 + i))
+        assert _until(lambda: nm.stats["udp"] == 5, 1.0), f"loop stalled after {nm.stats['udp']} of 5 events"
+        assert _hits(events) == []                         # delivery is waiting for the lock, as it must
+    finally:
+        nm.s.net.lock.release()
+    assert _until(lambda: len(_hits(events)) == 5, 2.0)    # and nothing is lost once the lock frees
+    nm.stop()
+
+
+def test_a_full_dispatch_queue_drops_loudly_never_silently(tmp_path):
+    import queue
+    nm, events, tapq = _threaded_monitor(tmp_path)
+    nm._dq = queue.Queue(maxsize=2)
+    nm.start()
+    nm.s.net.lock.acquire()
+    try:
+        for i in range(8):
+            tapq.push(_udp_syn(sport=42000 + i))
+        assert _until(lambda: nm.stats["udp"] == 8, 1.0)
+        assert nm.stats["dispatch_dropped"] >= 4           # counted (and noted on stderr), not swallowed
+    finally:
+        nm.s.net.lock.release(); nm.stop()
+
+
+@real
+def test_a_slow_nft_no_longer_stalls_the_event_loop(env, monkeypatch, tmp_path):
+    """The bare-metal stall, reproduced and fixed: every nft call takes 0.8 s (a host with a large ruleset).
+    0.1.2 measured poll_ms_max=2418 under exactly this. The loop must stay responsive; only the sync worker
+    may be slow, and every flow must still be attributed."""
+    real_nft = shutil.which("nft")
+    shim = tmp_path / "nft"
+    shim.write_text(f'#!/bin/sh\nsleep 0.8\nexec {real_nft} "$@"\n')
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    cg, fw, made = env
+    events = []
+    s, nm = monitor(cg, fw, made, events)
+    plan = {"slowa": 30, "slowb": 20}
+    procs = [task(cg, fw, k, udp_beacons(5320, n, hold=4.0, sport_base=24000 + 1000 * i))
+             for i, (k, n) in enumerate(plan.items())]
+    for p in procs:
+        p.wait(timeout=120)
+    assert nm.flush(5)
+    print(f"\nslow nft: loop poll_ms_max={nm.stats['poll_ms_max']}  tap_sync_ms_max={nm.stats['tap_sync_ms_max']}  "
+          f"events per task={dict(nm.udp_by_task)}")
+    assert dict(nm.udp_by_task) == plan
+    assert len(_hits(events)) == sum(plan.values())
+    assert nm.stats["tap_sync_ms_max"] >= 700            # nft really was slow ...
+    assert nm.stats["poll_ms_max"] < 400                 # ... and the loop did not care

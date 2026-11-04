@@ -95,12 +95,30 @@ These are recorded because each came from a test that could fail, not from revie
 | a release test | `release` read the *actual* frozen state; freezing is asynchronous, so it could skip the thaw and leave a task frozen | key on the *requested* state (`cgroup.freeze`) |
 | an unprivileged run | the daemon opened its default output file before validating flags | validate first; clean error on an unwritable path |
 | a bare-metal run | the UDP flow set was shared across tasks, so one task's flow could suppress another's (about 2% of later tasks' flows at scale) | the task's cgroup is part of the key |
+| bare-metal instrumentation | the event loop ran `nft` and took locks inline: polls of 1.5 s and 13 s, events processed after their task exited | tap sync and delivery moved to workers; the loop only does lock-free work |
 | an executor review | an unknown verdict fell into the kill branch | explicit dispatch; unknown verdicts do nothing |
 
-One failure is recorded here because it is **not** explained: on bare metal the first-launched task's 40 UDP events
-were all `owner_gone`, although the tap counted them. It did not reproduce with a slow `nft` (0.4 s and 1.2 s per
-call), with a stalled monitor, or with tasks dropped to a normal uid as `sudo` does. The owner lookup was hardened
-(any live pid, last-known identity) and now records why a lookup fails; treat the cause as open until a run says.
+The one failure that was hard to find: on bare metal the first-launched task's 40 UDP events were all `owner_gone`,
+although the tap counted them. It first resisted reproduction (a slow `nft` at 0.4 s and 1.2 s, privilege-dropped
+tasks), because the reproduction had no per-poll timing and counting polls cannot rule out an occasional stall.
+Adding `poll_ms_max` showed it on the author's machine (a 1,501 ms poll, then 13,160 ms) and reproduced it here
+(2,418 ms with a 1.2 s `nft`). The cause was the event loop running `nft` inline, behind a cross-process lock that
+`cora-run` also holds, so events queued while a short-lived task exited. See the next section.
+
+## Threads, and what may block
+
+| Thread | Does | May block on |
+|---|---|---|
+| **event loop** (`netmon`) | drains the NFLOG and destroy sockets, dedupes, judges, resolves the owner from `/proc` | **nothing**: no `nft`, no file lock, no registry lock |
+| tap sync worker | applies the *latest wanted* rule set (coalesced) | `nft`, the per-table file lock |
+| delivery worker | builds the event and fires it | the registry lock (queue of 4,096; overflow is dropped **loudly**) |
+| adjudicator | model, gates, action; holds the registry lock across the action so check and act are atomic | `nft` (an ISOLATE), the model |
+| daemon main | memory/path detectors, `Firewall.gc` | `nft` (the Firewall serializes itself) |
+
+Detection is never held up by slow enforcement: only delivery can lag. *Measured* with every `nft` call at 0.8 s:
+the loop's worst poll was **4 ms** (2,418 ms before the change) while the sync worker took 1,616 ms; every flow was
+still attributed. Steady-state `ensure(pid)` takes no lock, and `Firewall` serializes its own read-then-write steps
+instead of relying on a caller holding the registry lock across `nft`.
 
 ## Containment
 

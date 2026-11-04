@@ -346,6 +346,9 @@ class VirtualNet:
         return f"%Task{pid}"
 
     def ensure(self, pid: int) -> str:
+        ip = self.by_pid.get(pid)                    # steady state takes NO lock, so an adjudicator holding it
+        if ip is not None:                           # across nft cannot stall callers for a pid already known
+            return ip
         with self.lock:
             return self._ensure(pid)
 
@@ -735,11 +738,10 @@ def main() -> int:
         s.tick()
         n += 1
         if fw and n % 60 == 0:  # housekeeping: drop rules whose task cgroup is gone
-            with s.net.lock:    # same lock the adjudicator holds while it acts
-                try:
-                    fw.gc(cg.names())
-                except Exception as e:
-                    print(f"[cora-sentinel] nft gc failed: {e}", file=sys.stderr)
+            try:                # Firewall serializes itself; holding the registry lock across nft stalled everyone
+                fw.gc(cg.names())
+            except Exception as e:
+                print(f"[cora-sentinel] nft gc failed: {e}", file=sys.stderr)
         time.sleep(a.interval)
     if netmon:
         netmon.stop()
