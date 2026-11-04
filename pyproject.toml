@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cora-sentinel"
+dynamic = ["version"]
+description = "Out-of-band security sentinel for Linux: per-task cgroups, nftables containment, connect-time attribution (NFLOG) for TCP/UDP/QUIC/DNS, and a grammar-constrained local LLM supervisor"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Nick" }]
+keywords = ["security", "cgroups", "nftables", "nflog", "sock_diag", "netlink", "llm", "sentinel"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+    "Topic :: System :: Monitoring",
+]
+# The only hard dependency is the author's own bus, installed straight from GitHub. (A direct URL
+# dependency is fine for `pip install` from GitHub; it would have to change before a PyPI upload.)
+dependencies = ["engine-telemetry-bus @ git+https://github.com/nkaralus/engine-telemetry-bus"]
+
+[project.optional-dependencies]
+model = ["llama-cpp-python"]          # the local GGUF supervisor; everything else runs without it
+dev = ["pytest>=7", "jsonschema>=4"]
+
+[project.scripts]
+cora-sentinel = "cora_sentinel.daemon:main"
+cora-run = "cora_sentinel.run:main"
+cora-demo = "cora_sentinel.demo:main"
+cora-cgroup = "cora_sentinel.cgroup:main"
+cora-firewall = "cora_sentinel.firewall:main"
+cora-blocklist = "cora_sentinel.blocklist:main"
+cora-report = "cora_sentinel.report:main"
+cora-selfcheck = "cora_sentinel.selfcheck:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "cora_sentinel.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

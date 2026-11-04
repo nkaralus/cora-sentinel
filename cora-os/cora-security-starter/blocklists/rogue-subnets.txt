@@ -1,0 +1,8 @@
+# rogue-subnets: addresses/networks no task should talk to. One CIDR or IP per line.
+# Comments start with '#' or ';' (so Spamhaus DROP style "1.2.3.0/24 ; SBL123" parses as-is).
+#
+# The entries below are RFC 5737 DOCUMENTATION ranges: placeholders that demonstrate the
+# format and are never routed on the real internet. Replace them with real intelligence.
+198.51.100.0/24 ; placeholder, RFC 5737 TEST-NET-2
+203.0.113.0/24  ; placeholder, RFC 5737 TEST-NET-3
+192.0.2.77      ; placeholder single host, RFC 5737 TEST-NET-1

@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nkaralus/cora-security/violation.schema.json",
+  "title": "cora.security.violation/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "report_id",
+    "observed_hour",
+    "violation",
+    "response",
+    "task_ref",
+    "process"
+  ],
+  "properties": {
+    "schema": {
+      "const": "cora.security.violation/v1"
+    },
+    "report_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "observed_hour": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:00:00Z$"
+    },
+    "task_ref": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{12}$"
+    },
+    "process": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 64
+    },
+    "violation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "list",
+        "entry",
+        "destination"
+      ],
+      "properties": {
+        "type": {
+          "enum": [
+            "tracker_domain",
+            "rogue_subnet"
+          ]
+        },
+        "list": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "entry": {
+          "type": "string",
+          "maxLength": 260
+        },
+        "destination": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "ip",
+            "port",
+            "ip_class"
+          ],
+          "properties": {
+            "ip": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "port": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535
+            },
+            "ip_class": {
+              "enum": [
+                "public",
+                "private",
+                "link_local",
+                "other"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "verdict",
+        "enforced",
+        "policy",
+        "model_confidence"
+      ],
+      "properties": {
+        "verdict": {
+          "enum": [
+            "ALLOW",
+            "THROTTLE",
+            "ISOLATE",
+            "SUSPEND",
+            "TERMINATE",
+            "ESCALATE"
+          ]
+        },
+        "enforced": {
+          "type": "boolean"
+        },
+        "policy": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 64
+        },
+        "model_confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      }
+    }
+  }
+}

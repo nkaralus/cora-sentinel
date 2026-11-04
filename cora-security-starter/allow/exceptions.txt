@@ -1,0 +1,6 @@
+# exceptions: entries here ALWAYS win over the blocklists. Same line formats.
+# Load with:  cora_sentinel.py --blocklist blocklists/ --blocklist-allow allow/
+# Use it for a CDN address a tracker domain shares with something you need, e.g.:
+#   203.0.113.45        ; shared CDN edge, needed by <app>
+#   cdn.example.com
+# (no active entries yet)

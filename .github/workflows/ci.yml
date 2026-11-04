@@ -1,0 +1,47 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unprivileged:
+    # Everything that does not need root. Kernel tests (cgroups, nftables, NFLOG) skip themselves.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -e ".[dev]"
+      - run: python -m pytest -q
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build
+      - run: python -m build
+      - run: pip install dist/*.whl
+      - run: cora-selfcheck || true   # reports machine capabilities; the runner is not expected to have them all
+
+  privileged:
+    # EXPERIMENTAL. Whether a GitHub-hosted runner exposes cgroup v2 delegation, nfnetlink_log and
+    # NETLINK_SOCK_DIAG to a root process has not been verified. Allowed to fail.
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get update && sudo apt-get install -y nftables
+      - run: python -m venv venv && ./venv/bin/pip install -e ".[dev]"
+      - run: sudo ./venv/bin/python -m pytest -q

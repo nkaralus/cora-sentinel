@@ -1,0 +1,19 @@
+# trackers-starter: a small hand-picked set of well-known ad/tracker domains.
+# Each entry also matches every subdomain. This is a STARTER, review it before enforcing.
+# For real coverage load an established hosts-format list as another file in this
+# directory (the parser reads hosts files directly); check each list's license first.
+doubleclick.net
+googleadservices.com
+googlesyndication.com
+google-analytics.com
+scorecardresearch.com
+quantserve.com
+adnxs.com
+criteo.com
+taboola.com
+outbrain.com
+hotjar.com
+pubmatic.com
+rubiconproject.com
+openx.net
+amazon-adsystem.com

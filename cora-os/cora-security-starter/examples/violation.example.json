@@ -1,0 +1,23 @@
+{
+  "schema": "cora.security.violation/v1",
+  "report_id": "0123456789abcdef0123456789abcdef",
+  "observed_hour": "2026-11-04T18:00:00Z",
+  "task_ref": "a1b2c3d4e5f6",
+  "process": null,
+  "violation": {
+    "type": "tracker_domain",
+    "list": "trackers-starter",
+    "entry": "doubleclick.net",
+    "destination": {
+      "ip": "198.51.100.23",
+      "port": 443,
+      "ip_class": "public"
+    }
+  },
+  "response": {
+    "verdict": "ISOLATE",
+    "enforced": true,
+    "policy": null,
+    "model_confidence": 0.9
+  }
+}

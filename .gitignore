@@ -1,0 +1,18 @@
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+
+# local models and run output: never commit these
+models/
+*.gguf
+*.jsonl
+cora_reports/
+cora-demo-*/
+sentinel_events.jsonl
+sentinel_decisions.jsonl
