@@ -113,6 +113,8 @@ Adding `poll_ms_max` showed it on the author's machine (a 1,501 ms poll, then 13
 | tap sync worker | applies the *latest wanted* rule set (coalesced) | `nft`, the per-table file lock |
 | delivery worker | builds the event and fires it | the registry lock (queue of 4,096; overflow is dropped **loudly**) |
 | adjudicator | model, gates, action; holds the registry lock across the action so check and act are atomic | `nft` (an ISOLATE), the model |
+| reload worker | on `SIGHUP`, rebuilds the lists and swaps them atomically (the handler only sets a flag) | file reads, store verification |
+| resolver | resolves listed domains to addresses hourly, and at once for new ones after a reload | DNS |
 | daemon main | memory/path detectors, `Firewall.gc` | `nft` (the Firewall serializes itself) |
 
 Detection is never held up by slow enforcement: only delivery can lag. *Measured* with every `nft` call at 0.8 s:

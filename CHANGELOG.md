@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.0
+
+### Added
+- **`SIGHUP` hot reload of the blocklists.** The daemon re-reads `--blocklist`, `--blocklist-store` and
+  `--blocklist-allow` without restarting; only the lists change (same nft rule handles, same sockets, cgroup tracking,
+  firewall rules and model). A failed load keeps the previous lists; an empty result is refused rather than silently
+  disabling detection; resolved addresses are carried over before the swap so there is no detection gap; new domains
+  are resolved at once and removed ones stop matching immediately. See `docs/blocklist-updates.md`.
+- `cora_sentinel.reload` (`Reloader`, `load_lists`), `Sentinel.set_blocklist()`, `DomainResolver.rebind()` / `.kick()`.
+
+### Changed
+- **`SIGHUP` no longer terminates the daemon**: it reloads, or is logged and ignored when no lists are configured.
+- `ConnDetector.judge()` reads the list reference once per decision (it read it up to three times).
+- `DomainResolver` resolves never-resolved names first, and marks a name whose lookup failed as tried so it cannot
+  starve the rotation. Its cache no longer keeps domains that were removed from the list.
+- Startup and reload build the lists through the same function, so they cannot disagree about what "the lists" are.
+- `cora-blocklist accept` now says how to apply the update (`kill -HUP`).
+
 ## 0.2.0
 
 ### Added

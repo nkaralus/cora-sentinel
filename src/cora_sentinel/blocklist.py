@@ -199,6 +199,10 @@ def system_resolve(name: str) -> List[str]:
 
 
 class DomainResolver:
+    """Resolves listed domains to addresses in the background, so a flow to a listed domain's CDN address matches
+    even though the packet carries no name. `rebind()` points it at a new list (hot reload) and primes that list
+    from the cache FIRST, so a reload never opens a window in which resolved addresses stop matching."""
+
     def __init__(self, bl: Blocklist, resolve: Callable[[str], Iterable[str]] = system_resolve,
                  max_per_cycle: int = 2000, workers: int = 8, deadline_s: float = 60.0,
                  interval_s: float = 3600.0,
@@ -209,18 +213,38 @@ class DomainResolver:
         self.deadline_s, self.interval_s = deadline_s, interval_s
         self._dom_ips: Dict[str, FrozenSet[str]] = {}
         self._cursor = 0
+        self._state = threading.Lock()          # guards bl, _dom_ips, _cursor; NEVER held across a DNS lookup
+        self._wake = threading.Event()          # kick(): run a cycle now instead of at the next interval
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
+    def _publish(self) -> None:
+        """Build the address map for the CURRENT list from the cache. Caller holds _state. Entries for domains
+        that are no longer listed are ignored, so a removed domain stops matching immediately."""
+        bl = self.bl
+        ipmap: Dict[str, Tuple[str, str]] = {}
+        for dom, ips in sorted(self._dom_ips.items()):
+            if dom not in bl.domains:
+                continue
+            for ip in ips:
+                ipmap.setdefault(ip, (dom, bl.domains[dom]))
+        bl.set_resolved(ipmap)
+
     def cycle(self) -> int:
-        names = sorted(self.bl.domains)
-        if not names:
-            return 0
-        batch = [names[(self._cursor + i) % len(names)] for i in range(min(self.max, len(names)))]
-        self._cursor = (self._cursor + len(batch)) % len(names)
+        with self._state:
+            names = sorted(self.bl.domains)
+            if not names:
+                return 0
+            # Never-resolved names go first (after a reload, the new entries); the rest rotate with a cursor.
+            fresh = [n for n in names if n not in self._dom_ips][:self.max]
+            stale = [n for n in names if n in self._dom_ips]
+            rot = [stale[(self._cursor + i) % len(stale)] for i in range(min(self.max - len(fresh), len(stale)))]
+            if stale:
+                self._cursor = (self._cursor + len(rot)) % len(stale)
+            batch = fresh + rot
+        got: Dict[str, FrozenSet[str]] = {}
         ex = ThreadPoolExecutor(max_workers=self.workers)
         futs = {ex.submit(lambda n=n: list(self.resolve(n))): n for n in batch}
-        done = 0
         try:
             for f in as_completed(futs, timeout=self.deadline_s):
                 try:
@@ -235,31 +259,43 @@ class DomainResolver:
                         continue
                     if a.is_global:           # drop sinkholes (0.0.0.0, 127.x, private)
                         keep.add(str(a))
-                self._dom_ips[futs[f]] = frozenset(keep)
-                done += 1
+                got[futs[f]] = frozenset(keep)
         except Exception:
             pass                               # deadline hit: keep what we have
         finally:
             ex.shutdown(wait=False, cancel_futures=True)
-        ipmap: Dict[str, Tuple[str, str]] = {}
-        for dom, ips in sorted(self._dom_ips.items()):
-            for ip in ips:
-                ipmap.setdefault(ip, (dom, self.bl.domains[dom]))
-        self.bl.set_resolved(ipmap)
-        return done
+        with self._state:
+            self._dom_ips.update(got)
+            for n in fresh:                    # attempted and got nothing (NXDOMAIN, timeout): count it as tried,
+                self._dom_ips.setdefault(n, frozenset())      # or it would stay "fresh" and starve the rotation
+            self._publish()                    # onto the CURRENT list, even if a reload happened mid-cycle
+        return len(got)
+
+    def rebind(self, new_bl: Blocklist) -> None:
+        """Hot reload: aim at `new_bl` and fill its address map from the cache before it goes live."""
+        with self._state:
+            self.bl = new_bl
+            self._dom_ips = {d: ips for d, ips in self._dom_ips.items() if d in new_bl.domains}
+            self._cursor = 0
+            self._publish()
+
+    def kick(self) -> None:
+        self._wake.set()
 
     def start(self) -> None:
         def loop():
             while not self._stop.is_set():
+                self._wake.clear()
                 n = self.cycle()
                 if self.on_cycle:
                     self.on_cycle(n)
-                self._stop.wait(self.interval_s)
+                self._wake.wait(self.interval_s)
         self._thread = threading.Thread(target=loop, name="blocklist-resolver", daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
+        self._wake.set()
 
 
 def main(argv=None) -> int:

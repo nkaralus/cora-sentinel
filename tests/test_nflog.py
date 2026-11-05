@@ -1328,3 +1328,47 @@ def test_a_slow_nft_no_longer_stalls_the_event_loop(env, monkeypatch, tmp_path):
     assert len(_hits(events)) == sum(plan.values())
     assert nm.stats["tap_sync_ms_max"] >= 700            # nft really was slow ...
     assert nm.stats["poll_ms_max"] < 400                 # ... and the loop did not care
+
+
+@real
+def test_a_reload_changes_what_is_enforced_while_the_task_and_its_taps_keep_running(env):
+    """The point of SIGHUP: swap the lists under a LIVE task on the real kernel. The tap rules (same nft handles),
+    the sockets, the cgroup tracking and the task itself are untouched; the new list is enforced on the very next
+    flow, attributed to the same task; and the old one stops being enforced the moment it is swapped out."""
+    from cora_sentinel.reload import Reloader
+    cg, fw, made = env
+    events = []
+    s, nm = monitor(cg, fw, made, events, lines=["203.0.113.0/24"])               # LOCAL is not listed yet
+    code = ("import socket,time\nend=time.time()+14\nwhile time.time()<end:\n"
+            f"    s=socket.socket(2,2); s.sendto(b'x',('{LOCAL}',5353)); s.close(); time.sleep(0.05)\n")
+    p = task(cg, fw, "reltask", code)
+    assert _until(lambda: nm.udp_by_task["reltask"] > 20, 8)                      # the tap sees the task's flows
+    assert _hits(events) == [] and p.poll() is None                               # none of them listed
+    rules_before, installed, errors = nm.tap.rules.rules(), nm.stats["tap_installed"], nm.stats["errors"]
+    pid_before = p.pid
+
+    def listed(*lines):
+        b = Blocklist()
+        for ln in lines:
+            b.add_line(ln, "rogue")
+        return b, []
+    log = []
+    r = Reloader(s, lambda: listed(f"{LOCAL}/32"), log=log.append)
+    assert r.reload_now() == "ok"
+    assert _until(lambda: len(_hits(events)) >= 30, 10), "the new list was not enforced on the next flows"
+    assert {e["subject"]["cgroup"] for e in _hits(events)} == {"reltask"}         # same task, same cgroup tracking
+    assert p.poll() is None and p.pid == pid_before                                # the task was never disturbed
+    assert nm.tap.rules.rules() == rules_before                                    # same nft rule handles: untouched
+    assert nm.stats["tap_installed"] == installed and nm.stats["errors"] == errors and nm.lost() == 0
+
+    flagged_by_b = len(_hits(events))
+    r2 = Reloader(s, lambda: listed("203.0.113.0/24"), log=log.append)             # and back: the old entry is gone
+    assert r2.reload_now() == "ok"
+    time.sleep(0.4)
+    settled = len(_hits(events))
+    time.sleep(1.5)
+    assert len(_hits(events)) == settled, "flows kept being flagged after the entry was removed"
+    assert p.poll() is None and nm.tap.rules.rules() == rules_before
+    print(f"\nreload under a live task: {flagged_by_b} flows flagged while list B was live, then {settled - flagged_by_b} "
+          f"after swapping back to list A; "
+          f"rule handles identical; poll_ms_max={nm.stats['poll_ms_max']}")

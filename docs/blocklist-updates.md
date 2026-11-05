@@ -30,7 +30,7 @@ cora-sentinel --blocklist-store /var/lib/cora-sentinel/blocklists ...
 
 `--dir` defaults to `$CORA_BLOCKLIST_DIR`, else `/var/lib/cora-sentinel/blocklists` as root, else
 `~/.local/share/cora-sentinel/blocklists`. `pull` exits **0** (nothing to review), **10** (changes staged, review
-them) or **1** (an error). `accept` activates a list but the daemon reads lists at startup: **restart it** to apply.
+them) or **1** (an error). `accept` activates a list; the running daemon picks it up on `kill -HUP` (below) or at its next start.
 
 ## What `diff` flags (and what blocks `accept`)
 
@@ -82,7 +82,36 @@ SuccessExitStatus=10
 - **A reasonable-looking bad change passes** if you approve it. The flags catch the loud failures, not the subtle ones.
 - **A malicious first fetch** is trusted if you approve it: read the first diff.
 - **Root can edit the lock.** This protects against the network and against other users, not against root.
-- **No hot reload:** restart the daemon after `accept`. Stale lists (older than 30 days) are warned about at startup.
+- **Staleness is only noticed at startup** (a list approved more than 30 days ago is warned about then).
+
+## Applying an update without restarting: `SIGHUP`
+
+```bash
+cora-blocklist accept ads --sha256 <first 12 hex>
+kill -HUP <cora-sentinel pid>          # systemd: ExecReload=/bin/kill -HUP $MAINPID, then `systemctl reload`
+```
+
+The daemon re-reads **the same `--blocklist`, `--blocklist-store` and `--blocklist-allow` arguments it started with**
+(a store is verified exactly as at startup). **Only the lists change**: the tap rules (the very same nft rule
+handles), the netlink sockets, cgroup tracking, firewall rules and the model are untouched, so no flow is missed
+and no task is forgotten. Every other option needs a restart.
+
+| Situation | What happens | Why |
+|---|---|---|
+| The new lists cannot be loaded (store fails verification, unreadable file) | `reload FAILED, keeping the previous lists` | a reload never leaves you with no list, or half of one |
+| The new lists are **empty** and the current ones are not | `reload REFUSED`; restart if you really want none | deleted files or a missing mount must not silently disable detection |
+| New domains | resolved **at once**, not at the next hourly cycle | otherwise their addresses go unmatched for up to an hour |
+| Domains kept | their resolved addresses carry over **before** the swap | a plain swap would drop every CDN-address match until the next cycle |
+| Domains removed | stop matching immediately | |
+| Several HUPs in a row | one more reload, not a pile-up | |
+
+Each reload logs a line such as `reloaded blocklists: domains 15 -> 16 (+1/-0), subnets/IPs 3 -> 3 (+0/-0), 58
+resolved addresses carried over`.
+
+**Behavior change:** `SIGHUP` used to terminate the daemon. Now it reloads (or, with no lists configured, is logged
+and ignored). Closing the terminal of a foreground daemon therefore no longer stops it; run it under systemd, or
+stop it with SIGINT/SIGTERM. A reload of a large list makes the resolver look up its new names straight away
+(up to `--resolve-max`, through your system resolver).
 
 ## Publishing the starter lists to `cora-security`
 

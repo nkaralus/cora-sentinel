@@ -138,7 +138,10 @@ no owner, and **UDP is invisible entirely.** See [docs/architecture.md](docs/arc
 update is only *staged*, you review the diff, and you approve that exact content by its sha256. TLS is verified,
 downloads are size- and time-limited, a list that is emptied or starts blocking your LAN is flagged, and
 `cora-sentinel --blocklist-store DIR` refuses to start if any active list is not what was approved. Prefer URLs
-pinned to a commit. There are no signatures. See [docs/blocklist-updates.md](docs/blocklist-updates.md).
+pinned to a commit. There are no signatures. After `accept`, `kill -HUP <pid>` applies the update **without
+restarting**: only the lists change (taps, cgroup tracking and firewall rules are untouched), a failed or empty
+reload keeps the current lists, and resolved addresses carry over so detection has no gap. See
+[docs/blocklist-updates.md](docs/blocklist-updates.md).
 
 ## Measured behaviour
 
@@ -191,13 +194,13 @@ python -m pytest -q                              # unprivileged: kernel tests sk
 sudo -E ./venv/bin/python -m pytest -q           # everything (CORA_GGUF=path adds the real-model test)
 ```
 
-At 0.2.0: **315 passed, 1 skipped** as root against the installed wheel (the skip is an IPv6 loopback; the
-real-model test ran), and **256 passed, 60 skipped** unprivileged. The unprivileged run is what CI executes.
+At 0.3.0: **337 passed, 1 skipped** as root against the installed wheel (the skip is an IPv6 loopback; the
+real-model test ran), and **277 passed, 61 skipped** unprivileged. The unprivileged run is what CI executes.
 
 ## Layout
 
 ```
-src/cora_sentinel/   daemon  netmon  nflog  sockdiag  firewall  cgroup  blocklist  report  verdict  run  demo  selfcheck
+src/cora_sentinel/   daemon  netmon  nflog  sockdiag  firewall  cgroup  blocklist  blocklist_store  reload  report  verdict  run  demo  selfcheck
 tests/               unit tests, plus kernel tests that skip without root
 schema/              violation.schema.json (cora.security.violation/v1)
 examples/            starter blocklists, an allow list, an example report

@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Callable, Deque, Dict, List, Optional, Tuple
 
 from cora_sentinel.blocklist import Blocklist, DomainResolver
+from cora_sentinel.reload import ListError, Reloader, load_lists
 from cora_sentinel.cgroup import CgroupRoot
 
 try:
@@ -299,8 +300,9 @@ class ConnDetector:
         name is only 'medium': a lookup is not a connection."""
         addr = self.policy.normalize(remote_ip)
         bl = None
-        if self.blocklist:                          # a blocklist hit beats the allowlist: listed means listed
-            bl = (self.blocklist.match_name(qname) if qname else None) or self.blocklist.match_ip(addr)
+        lists = self.blocklist                      # read ONCE: a hot reload may swap it between two reads
+        if lists is not None:                       # a blocklist hit beats the allowlist: listed means listed
+            bl = (lists.match_name(qname) if qname else None) or lists.match_ip(addr)
         hit = self.policy.check(remote_ip)
         if bl is None and hit is None:
             return None
@@ -446,6 +448,11 @@ class Sentinel:
             if argv and self.match in argv:
                 found[pid] = " ".join(argv)
         return found
+
+    def set_blocklist(self, bl: Optional[Blocklist]) -> None:
+        """The one atomic swap behind a hot reload (see cora_sentinel.reload). The allowlist hangs off the
+        list, so both change together."""
+        self.conn.blocklist = bl
 
     def _fire(self, key: Tuple, now: float, payload: dict) -> None:
         with self._fire_lock:
@@ -630,33 +637,26 @@ def main() -> int:
             return 1
         print(f"[cora-sentinel] cgroup mode: {a.cgroup_root} controllers={ctl or 'none'}",
               file=sys.stderr)
+    def make_resolver(target: Blocklist) -> DomainResolver:
+        r = DomainResolver(target, max_per_cycle=a.resolve_max)
+        # r.bl, not `target`: after a hot reload the resolver is aimed at the new list
+        r.on_cycle = lambda n: print(f"[cora-sentinel] resolver cycle done: {r.bl.summary()}",
+                                     file=sys.stderr, flush=True)
+        return r
+
+    has_lists = bool(a.blocklist or a.blocklist_store)
     bl = resolver = None
-    if a.blocklist or a.blocklist_store:
-        bl = Blocklist()
+    if has_lists:
         try:
-            if a.blocklist_store:
-                from cora_sentinel.blocklist_store import StoreError, load_verified
-                try:
-                    for w in load_verified(Path(a.blocklist_store), bl):
-                        print(f"[cora-sentinel] warning: {w}", file=sys.stderr)
-                except StoreError as e:
-                    print(f"[cora-sentinel] {e}", file=sys.stderr)
-                    return 1
-            for p in a.blocklist or []:
-                bl.load(p)
-            if a.blocklist_allow:
-                bl.allow = Blocklist()
-                for p in a.blocklist_allow:
-                    bl.allow.load(p)
-        except (OSError, ValueError) as e:
-            print(f"[cora-sentinel] cannot load blocklist: {e}", file=sys.stderr)
+            bl, warns = load_lists(a.blocklist, a.blocklist_store, a.blocklist_allow)
+        except ListError as e:
+            print(f"[cora-sentinel] {e}", file=sys.stderr)
             return 1
+        for w in warns:
+            print(f"[cora-sentinel] warning: {w}", file=sys.stderr)
         print(f"[cora-sentinel] blocklist: {bl.summary()}", file=sys.stderr)
         if bl.domains and not a.no_resolve:
-            resolver = DomainResolver(
-                bl, max_per_cycle=a.resolve_max,
-                on_cycle=lambda n: print(f"[cora-sentinel] resolver cycle done: {bl.summary()}",
-                                         file=sys.stderr, flush=True))
+            resolver = make_resolver(bl)
             resolver.start()
             print(f"[cora-sentinel] resolving up to {a.resolve_max} listed domains/hour in the "
                   f"background (their names go to your system resolver; --no-resolve to disable)",
@@ -665,6 +665,10 @@ def main() -> int:
             print("[cora-sentinel] domain entries are INERT without resolution", file=sys.stderr)
     s = Sentinel(a.match, a.allow or ["/tmp", "/var/tmp"], a.spike_mb, a.window, emit,
                  net_allow=a.net_allow, cgroups=cg, blocklist=bl)
+    reloader = Reloader(s, (lambda: load_lists(a.blocklist, a.blocklist_store, a.blocklist_allow))
+                        if has_lists else None,
+                        resolver=resolver, make_resolver=None if a.no_resolve else make_resolver)
+    reloader.start()
     fw = None
     if a.nft:
         if cg is None:
@@ -742,6 +746,10 @@ def main() -> int:
     stop = {"v": False}
     signal.signal(signal.SIGINT, lambda *_: stop.update(v=True))
     signal.signal(signal.SIGTERM, lambda *_: stop.update(v=True))
+    signal.signal(signal.SIGHUP, lambda *_: reloader.request())     # only sets a flag; a thread does the work
+    if has_lists:
+        print("[cora-sentinel] SIGHUP re-reads the blocklists without restarting (kill -HUP <pid>)",
+              file=sys.stderr)
     print(f"[cora-sentinel] watching '{a.match}' every {a.interval}s -> {a.out}",
           file=sys.stderr)
     n = 0
@@ -758,8 +766,9 @@ def main() -> int:
         netmon.stop()
     if adj:
         adj.stop()
-    if resolver:
-        resolver.stop()
+    reloader.stop()
+    if reloader.resolver:
+        reloader.resolver.stop()
     return 0
 
 

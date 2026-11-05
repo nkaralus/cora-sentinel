@@ -26,6 +26,7 @@ FEATURES: List[Tuple[str, str, Callable]] = [
     ("firewall", "cgroup-id rules (stale-rule fix)", lambda m: hasattr(m.Firewall, "cgroup_match")),
     ("blocklist", "DNS name matching", lambda m: hasattr(m.Blocklist, "match_name")),
     ("blocklist_store", "pinned, reviewed blocklist updates", lambda m: hasattr(m, "accept") and hasattr(m, "load_verified")),
+    ("reload", "SIGHUP blocklist hot reload", lambda m: hasattr(m, "Reloader") and hasattr(m, "load_lists")),
     ("report", "anonymized violation reports", lambda m: hasattr(m, "Reporter") and hasattr(m, "validate_report")),
     ("sockdiag", "sock_diag dump + destroy events", lambda m: hasattr(m, "SockDiag") and hasattr(m, "DestroyListener")),
     ("nflog", "TCP + UDP/QUIC/DNS flow tap", lambda m: all(hasattr(m, n) for n in ("TapService", "classify_udp", "parse_dns_query"))),

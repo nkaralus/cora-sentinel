@@ -517,7 +517,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             return EXIT_OK
         if args.cmd == "accept":
             accept(store, args.name, args.sha256, args.allow_large_change)
-            print(f"{args.name}: accepted and pinned. Restart cora-sentinel to use it.")
+            print(f"{args.name}: accepted and pinned. Apply it with `kill -HUP <cora-sentinel pid>` (or restart).")
             return EXIT_OK
         if args.cmd == "verify":
             problems = verify(store)
