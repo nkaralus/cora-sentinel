@@ -552,6 +552,9 @@ def main() -> int:
                     "cgroup v2 path (start them with cora-run); --match is ignored")
     ap.add_argument("--blocklist", action="append", metavar="PATH",
                     help="tracker/rogue list file or directory (repeatable)")
+    ap.add_argument("--blocklist-store", metavar="DIR",
+                    help="a pinned, reviewed store (see `cora-blocklist pull`): refuses to start unless every "
+                         "active list is exactly what was approved")
     ap.add_argument("--blocklist-allow", action="append", metavar="PATH",
                     help="exceptions that always win over the blocklist (repeatable)")
     ap.add_argument("--no-resolve", action="store_true",
@@ -628,10 +631,18 @@ def main() -> int:
         print(f"[cora-sentinel] cgroup mode: {a.cgroup_root} controllers={ctl or 'none'}",
               file=sys.stderr)
     bl = resolver = None
-    if a.blocklist:
+    if a.blocklist or a.blocklist_store:
         bl = Blocklist()
         try:
-            for p in a.blocklist:
+            if a.blocklist_store:
+                from cora_sentinel.blocklist_store import StoreError, load_verified
+                try:
+                    for w in load_verified(Path(a.blocklist_store), bl):
+                        print(f"[cora-sentinel] warning: {w}", file=sys.stderr)
+                except StoreError as e:
+                    print(f"[cora-sentinel] {e}", file=sys.stderr)
+                    return 1
+            for p in a.blocklist or []:
                 bl.load(p)
             if a.blocklist_allow:
                 bl.allow = Blocklist()

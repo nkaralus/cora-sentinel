@@ -176,6 +176,11 @@ class Blocklist:
     def set_resolved(self, mapping: Dict[str, Tuple[str, str]]) -> None:
         self._resolved = mapping  # atomic swap; readers never see a half-built map
 
+    def entries(self) -> Tuple[set, set]:
+        """(domains, networks as normalized strings): what a diff compares."""
+        nets = {e for v in self._nets.values() for per_len in v.values() for (_, e) in per_len.values()}
+        return set(self.domains), nets
+
     def summary(self) -> str:
         rej = dict(self.rejects) or "none"
         return (f"{len(self.domains)} domains, {self.n_nets} subnets/IPs, "
@@ -257,15 +262,20 @@ class DomainResolver:
         self._stop.set()
 
 
-def main() -> int:
+def main(argv=None) -> int:
     import sys
-    if len(sys.argv) < 3:
-        print("usage: cora-blocklist check PATH [ip-or-domain ...]")
+    a = sys.argv[1:] if argv is None else list(argv)
+    if a[:1] and a[0] in ("pull", "diff", "accept", "status", "verify") or (a[:1] == ["--dir"]):
+        from cora_sentinel.blocklist_store import main as store_main
+        return store_main(a)
+    if len(a) < 2 or a[0] != "check":
+        print("usage: cora-blocklist check PATH [ip-or-domain ...]\n"
+              "       cora-blocklist [--dir D] pull | status | diff [NAME] | accept NAME --sha256 HEX | verify")
         return 2
     bl = Blocklist()
-    bl.load(sys.argv[2])
+    bl.load(a[1])
     print(bl.summary())
-    for q in sys.argv[3:]:
+    for q in a[2:]:
         try:
             h = bl.match_net(q)
         except ValueError:

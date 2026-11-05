@@ -132,6 +132,14 @@ no owner, and **UDP is invisible entirely.** See [docs/architecture.md](docs/arc
   ports, private addresses or the model's free text. Reports are **never sent**: review, then file them.
   The report does not currently say which protocol was involved. See [docs/violation-reports.md](docs/violation-reports.md).
 
+### Keeping lists current
+
+`cora-blocklist pull` fetches lists from a URL, but **never changes what the sentinel enforces by itself**: an
+update is only *staged*, you review the diff, and you approve that exact content by its sha256. TLS is verified,
+downloads are size- and time-limited, a list that is emptied or starts blocking your LAN is flagged, and
+`cora-sentinel --blocklist-store DIR` refuses to start if any active list is not what was approved. Prefer URLs
+pinned to a commit. There are no signatures. See [docs/blocklist-updates.md](docs/blocklist-updates.md).
+
 ## Measured behaviour
 
 Environment matters, so each number says where it came from.
@@ -183,8 +191,8 @@ python -m pytest -q                              # unprivileged: kernel tests sk
 sudo -E ./venv/bin/python -m pytest -q           # everything (CORA_GGUF=path adds the real-model test)
 ```
 
-At 0.1.3: **250 passed, 1 skipped** as root against the installed wheel (the skip is an IPv6 loopback; the
-real-model test ran), and **192 passed, 59 skipped** unprivileged. The unprivileged run is what CI executes.
+At 0.2.0: **315 passed, 1 skipped** as root against the installed wheel (the skip is an IPv6 loopback; the
+real-model test ran), and **256 passed, 60 skipped** unprivileged. The unprivileged run is what CI executes.
 
 ## Layout
 

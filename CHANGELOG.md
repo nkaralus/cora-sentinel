@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.0
+
+### Added
+- **Pinned, reviewed blocklist updates** (`cora-blocklist pull | diff | accept | status | verify`, and
+  `cora-sentinel --blocklist-store DIR`). An upstream change is only ever *staged*: it reaches the active list when you
+  approve that exact content by its sha256. Fetching is https-only with TLS verified, redirects may not leave https,
+  and size and time are bounded (a trickling or endless server is cut off). `diff` flags a list that is emptied or
+  gutted, that starts blocking your LAN, that is mostly rejected junk, or whose URL moved. The daemon refuses to start
+  on a store whose active files do not match their pins. See `docs/blocklist-updates.md`.
+- `cora-selfcheck` measures `nft` process-start and transaction latency, to show where time goes.
+- `Blocklist.entries()`.
+
+### Note
+- The `cora-security` repo does not currently contain the starter blocklists (its history has four files).
+  `docs/blocklist-updates.md` has the commands to publish them.
+
 ## 0.1.3
 
 ### Fixed

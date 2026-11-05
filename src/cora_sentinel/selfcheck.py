@@ -25,6 +25,7 @@ FEATURES: List[Tuple[str, str, Callable]] = [
     ("cgroup", "freeze_requested (async-freeze fix) + reset_limits", lambda m: hasattr(m.CgroupRoot, "freeze_requested") and hasattr(m.CgroupRoot, "reset_limits")),
     ("firewall", "cgroup-id rules (stale-rule fix)", lambda m: hasattr(m.Firewall, "cgroup_match")),
     ("blocklist", "DNS name matching", lambda m: hasattr(m.Blocklist, "match_name")),
+    ("blocklist_store", "pinned, reviewed blocklist updates", lambda m: hasattr(m, "accept") and hasattr(m, "load_verified")),
     ("report", "anonymized violation reports", lambda m: hasattr(m, "Reporter") and hasattr(m, "validate_report")),
     ("sockdiag", "sock_diag dump + destroy events", lambda m: hasattr(m, "SockDiag") and hasattr(m, "DestroyListener")),
     ("nflog", "TCP + UDP/QUIC/DNS flow tap", lambda m: all(hasattr(m, n) for n in ("TapService", "classify_udp", "parse_dns_query"))),
@@ -36,6 +37,30 @@ FEATURES: List[Tuple[str, str, Callable]] = [
 
 def _line(status: str, what: str, note: str = "") -> None:
     print(f"  {status:<7} {what}" + (f"\n          -> {note}" if note else ""))
+
+
+def nft_latency(root: bool) -> Optional[dict]:
+    """Where does an nft call spend its time? Process start (fork/exec, library load) versus a transaction
+    (the kernel commit, which waits on RCU). Measured with a scratch table, never touching real rules."""
+    import statistics
+    import subprocess
+    import time
+    nft = shutil.which("nft")
+    if not nft:
+        return None
+
+    def med(cmd, stdin=None):
+        v = []
+        for _ in range(5):
+            t = time.perf_counter()
+            subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=60)
+            v.append((time.perf_counter() - t) * 1000)
+        return statistics.median(v)
+    out = {"start_ms": med([nft, "--version"])}
+    if root:
+        t = f"coraselfcheck{os.getpid()}"
+        out["txn_ms"] = med([nft, "-f", "-"], f"add table inet {t}\ndelete table inet {t}\n")
+    return out
 
 
 def main() -> int:
@@ -88,6 +113,14 @@ def main() -> int:
               f"{why}: no connect-time tap, so zero-lifetime TCP and ALL UDP/QUIC are invisible")
     else:
         _line("skip", "NFLOG (nfnetlink_log) bindable", "needs root to test")
+    lat = nft_latency(root)
+    if lat:
+        slow = lat.get("txn_ms", 0) > 200
+        _line("note" if slow else "ok",
+              f"nft: process start {lat['start_ms']:.0f} ms" + (f", one transaction {lat['txn_ms']:.0f} ms" if "txn_ms" in lat else "")
+              + " (median of 5)",
+              "a transaction this slow delays `cora-run` (tap-rule install) and rule syncs; detection is unaffected "
+              "since 0.1.3" if slow else "")
     try:
         importlib.import_module("llama_cpp")
         _line("ok", "llama-cpp-python")

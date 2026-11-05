@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "lists": {
+    "trackers-starter": {
+      "url": "https://raw.githubusercontent.com/nkaralus/cora-security/<COMMIT-SHA>/blocklists/trackers-starter.txt"
+    },
+    "rogue-subnets": {
+      "url": "https://raw.githubusercontent.com/nkaralus/cora-security/<COMMIT-SHA>/blocklists/rogue-subnets.txt",
+      "max_bytes": 1048576
+    }
+  }
+}
