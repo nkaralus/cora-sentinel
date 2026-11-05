@@ -28,7 +28,7 @@ sc() { [ -n "$root" ] || systemctl "$@"; }
 
 if [ "$mode" = uninstall ]; then
   sc disable --now cora-sentinel 2>/dev/null || true
-  rm -f "$unit_dir/cora-sentinel.service"
+  rm -f "$unit_dir/cora-sentinel.service" "$root/etc/logrotate.d/cora-sentinel"
   sc daemon-reload
   if [ "$remove_floor" = yes ]; then
     floor="$(command -v cora-floor || true)"
@@ -50,6 +50,8 @@ bindir="$(cd "$bindir" && pwd)"
 install -d -m 0755 "$unit_dir" "$conf_dir"
 sed "s|@BINDIR@|$bindir|g" "$here/cora-sentinel.service" > "$unit_dir/cora-sentinel.service"
 chmod 0644 "$unit_dir/cora-sentinel.service"
+install -d -m 0755 "$root/etc/logrotate.d"
+install -m 0644 "$here/cora-sentinel.logrotate" "$root/etc/logrotate.d/cora-sentinel"
 if [ -e "$conf_dir/cora-sentinel.conf" ]; then
   echo "kept your existing $conf_dir/cora-sentinel.conf"
 else
@@ -57,7 +59,7 @@ else
 fi
 sc daemon-reload
 cat <<MSG
-Installed $unit_dir/cora-sentinel.service (binaries in $bindir).
+Installed $unit_dir/cora-sentinel.service (binaries in $bindir) and the log rotation in $root/etc/logrotate.d/.
 Next:
   1. Edit $conf_dir/cora-sentinel.conf
   2. systemctl enable --now cora-sentinel

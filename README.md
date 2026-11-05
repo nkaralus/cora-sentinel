@@ -279,6 +279,10 @@ need a cgroup v2 mount, or `CORA_TEST_CGROUP_MOUNT`).
 restored by the policy's decisions; they use a public address aliased inside the lab, because the policy refuses private
 ones). `tools/dyn_bench.py` measures the per-decision cost.
 
+0.6.1 adds `tests/test_daemon_dyn.py` (2: the real daemon with a stub model and real `cora-run` tasks; shadow records
+`would_block`, and in enforce a brand-new task's first packet to an isolated task's destination is dropped).
+Daemon tests launch with `nsenter`, not `ip netns exec`, which would hide the host's cgroup mount.
+
 ## Layout
 
 ```

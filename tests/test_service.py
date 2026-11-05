@@ -102,6 +102,7 @@ def test_install_renders_the_unit_keeps_your_config_and_uninstall_removes_only_t
     unit = (root / "etc/systemd/system/cora-sentinel.service").read_text()
     assert "@BINDIR@" not in unit and f"ExecStart={stubbin}/cora-sentinel $CORA_ARGS" in unit
     assert f"ExecStopPost=-{stubbin}/cora-floor rollback" in unit
+    assert (root / "etc/logrotate.d/cora-sentinel").exists()
     conf = root / "etc/cora-sentinel/cora-sentinel.conf"
     assert conf.exists()
     conf.write_text("CORA_ARGS=--my-edit\n")
@@ -109,6 +110,7 @@ def test_install_renders_the_unit_keeps_your_config_and_uninstall_removes_only_t
     assert conf.read_text() == "CORA_ARGS=--my-edit\n"                          # a reinstall does not clobber your edits
     u = run_install(root, "--uninstall")
     assert u.returncode == 0 and not (root / "etc/systemd/system/cora-sentinel.service").exists() and conf.exists()
+    assert not (root / "etc/logrotate.d/cora-sentinel").exists()
     assert "cora-floor remove" in u.stdout                                       # tells you the floor is still there
 
 
@@ -127,3 +129,28 @@ def test_systemd_accepts_the_rendered_unit(tmp_path, stubbin):
     r = subprocess.run(["systemd-analyze", "verify", "--man=no", str(root / "etc/systemd/system/cora-sentinel.service")],
                        capture_output=True, text=True)
     assert r.returncode == 0 and r.stderr.strip() == "", r.stderr
+
+
+LOGROTATE = DEPLOY / "cora-sentinel.logrotate"
+
+
+def test_the_logrotate_config_truncates_in_place_because_the_daemon_never_reopens_its_logs():
+    t = LOGROTATE.read_text()
+    assert "copytruncate" in t and "/var/log/cora-sentinel/*.jsonl" in t
+    assert "size " in t and "weekly" not in t and "daily" not in t             # never cut a week of shadow data at a clock tick
+    assert "compress" in t and "delaycompress" in t                            # the newest rotated file stays readable as-is
+
+
+@pytest.mark.skipif(not shutil.which("logrotate"), reason="needs logrotate")
+def test_logrotate_accepts_the_config(tmp_path):
+    conf = tmp_path / "cora.conf"
+    conf.write_text(Path(LOGROTATE).read_text())
+    conf.chmod(0o644)
+    r = subprocess.run(["logrotate", "-d", "-s", str(tmp_path / "state"), str(conf)], capture_output=True, text=True)
+    assert r.returncode == 0 and "error" not in (r.stdout + r.stderr).lower(), r.stdout + r.stderr
+
+
+def test_the_logs_the_unit_declares_are_the_ones_rotated():
+    assert keys("Service", "LogsDirectory") == ["cora-sentinel"]
+    for flag in ("--out", "--decisions"):
+        assert re.search(rf"{flag} /var/log/cora-sentinel/[\w-]+\.jsonl", CONF), flag

@@ -1,0 +1,16 @@
+cora-sentinel 0.6.1: fixes the 4 daemon-test failures, proves the daemon wiring end to end, adds log rotation
+
+Extract over the pushed v0.6.0 (1a90b7e):
+    cd ~/cora-sentinel
+    unzip -o /path/to/cora-sentinel-0.6.1.zip
+    pip install -e ".[dev]"        # version metadata is 0.6.1
+    sudo -E ./venv/bin/python -m pytest -q
+
+New:      tests/test_daemon_dyn.py  deploy/cora-sentinel.logrotate
+Modified: tests/test_floor_confirm.py (daemon tests use `nsenter --net=` instead of `ip netns exec`)
+          deploy/install-service.sh (installs/removes the logrotate config)  tests/test_service.py
+          docs/dyn-policy.md (shadow prerequisites, "Deploying in shadow")  README.md  CHANGELOG.md  __init__.py (0.6.1)
+0.6.1.patch is the same change as a `git apply` patch.
+
+Already-installed service: re-run  sudo deploy/install-service.sh --bindir "$PWD/venv/bin"
+  (it keeps your /etc/cora-sentinel/cora-sentinel.conf and adds /etc/logrotate.d/cora-sentinel).

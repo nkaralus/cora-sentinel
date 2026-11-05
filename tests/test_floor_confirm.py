@@ -7,6 +7,7 @@ Run: sudo -E $(which python) -m pytest -q tests/test_floor_confirm.py
 """
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -165,8 +166,18 @@ def _cg_mount():
             continue
 
 
-CG = _cg_mount() if os.geteuid() == 0 else None
-daemon_kernel = pytest.mark.skipif(not CG, reason="needs a writable cgroup v2 mount (CORA_TEST_CGROUP_MOUNT)")
+def enter(ns):
+    """Run a command inside a network namespace WITHOUT remounting /sys.
+
+    `ip netns exec` gives the command a fresh sysfs, which hides the host's /sys/fs/cgroup mount; the daemon then cannot
+    create its cgroup root there ("cannot prepare cgroup root: No such file or directory") even though the probe above,
+    run outside the namespace, found a perfectly good cgroup v2. nsenter joins the namespace and leaves the mounts alone,
+    which is also how the real service sees the world. (Tests that never touch cgroups can keep using `ip netns exec`.)"""
+    return ["nsenter", f"--net=/run/netns/{ns}"]
+
+
+CG = _cg_mount() if os.geteuid() == 0 and shutil.which("nsenter") else None
+daemon_kernel = pytest.mark.skipif(not CG, reason="needs nsenter and a writable cgroup v2 mount (CORA_TEST_CGROUP_MOUNT)")
 
 
 class Daemon:
@@ -175,7 +186,7 @@ class Daemon:
         self.root = f"{CG}/cfconf-{os.getpid()}-{time.monotonic_ns() % 100000}"
         env = dict(os.environ, PYTHONPATH=os.pathsep.join(p for p in sys.path if p))
         self.p = subprocess.Popen(
-            ["ip", "netns", "exec", lab.c, sys.executable, "-m", "cora_sentinel.daemon", "--cgroup-root", self.root,
+            [*enter(lab.c), sys.executable, "-m", "cora_sentinel.daemon", "--cgroup-root", self.root,
              "--cgroup-mount", CG, "--nft", "--nft-table", TABLE, "--floor", "--floor-confirm", str(confirm),
              "--state-dir", str(tmp_path / "st"), "--blocklist", str(tmp_path / "bl.txt"), "--no-resolve",
              "--net-source", "proc", "--out", str(tmp_path / "events.jsonl"), *extra],
@@ -263,7 +274,7 @@ def test_the_daemon_refuses_a_floor_that_would_drop_the_ssh_peer(lab, tmp_path):
                SSH_CONNECTION=f"{C_IP} 40000 {S_IP} 22")        # the daemon was started from a session from C_IP
     (tmp_path / "bl2.txt").write_text(f"{C_IP}/32\n")
     root = f"{CG}/cfrefuse-{os.getpid()}"
-    r = subprocess.run(["ip", "netns", "exec", lab.s, sys.executable, "-m", "cora_sentinel.daemon", "--cgroup-root", root,
+    r = subprocess.run([*enter(lab.s), sys.executable, "-m", "cora_sentinel.daemon", "--cgroup-root", root,
                         "--cgroup-mount", CG, "--nft", "--nft-table", TABLE, "--floor", "--state-dir", str(tmp_path / "st"),
                         "--blocklist", str(tmp_path / "bl2.txt"), "--no-resolve", "--net-source", "proc",
                         "--out", str(tmp_path / "e.jsonl")], env=env, capture_output=True, text=True, timeout=30)

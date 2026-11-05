@@ -27,7 +27,11 @@ always comes from the event's evidence, never from the model.
 | `shadow` (default) | untouched | `dyn-ledger-shadow.json` | computes budgets, escalation and promotion exactly as enforce would, and records `would_block` etc. |
 | `enforce` | writes | `dyn-ledger-enforce.json` | needs `--model`, `--enforce`, `--floor`. Stays in shadow for any decision the adjudicator only dry-ran. |
 
-Shadow only does anything when there is an adjudicator (`--model`).
+Shadow only does anything when there is an adjudicator (`--model`), and only for tasks it can actually isolate: ISOLATE
+needs a cgroup **and** nft, so the daemon must have `--nft --cgroup-root` (the shipped config does). Without them every
+ISOLATE becomes an ESCALATE and the log simply has no `dyn` records. It does not need `--enforce`: a dry-running
+adjudicator records `would_*` too. Collect shadow data in the adjudicator mode you will actually run, because an enforcing
+one stops a task's further events (it is isolated) and a dry-running one does not (more repeat hits, more `dedupe`).
 
 ## Who is eligible
 
@@ -89,3 +93,17 @@ Read it for: **targets on web ports** (the shared-address risk: would any of the
 `skipped` reasons (a lot of `low_confidence` means the threshold is doing the work; `budget` or `task_cap` means a
 noisy task), and how often a repeat offense escalated. Switch to `enforce` when nothing in the would-block list is an
 address you would be unhappy to lose.
+
+## Deploying in shadow
+
+Add the model (and your lists) to `CORA_ARGS` in `/etc/cora-sentinel/cora-sentinel.conf`, then `systemctl restart`:
+
+```
+CORA_ARGS=--cgroup-root /sys/fs/cgroup/cora --nft --nflog --floor --floor-confirm 120 --model /var/lib/cora-sentinel/models/qwen2.5-3b-instruct-q4_k_m.gguf --blocklist /etc/cora-sentinel/blocklists --out /var/log/cora-sentinel/events.jsonl --decisions /var/log/cora-sentinel/decisions.jsonl --report-dir /var/lib/cora-sentinel/reports
+```
+
+`--dyn-policy` is not needed: shadow is the default. The line `dyn policy: shadow` appears in the journal at start.
+The decision log is `/var/log/cora-sentinel/decisions.jsonl`, rotated by size (the installer adds the logrotate config);
+across rotations: `zcat -f /var/log/cora-sentinel/decisions.jsonl* | cora-floor dyn-report /dev/stdin`.
+Anything in the report with `no_destination` or `bad_flow` means an event had a shape the policy did not expect: report it.
+`--floor` is separate from the dynamic policy (it enforces your static lists); drop it for a purely observational run.

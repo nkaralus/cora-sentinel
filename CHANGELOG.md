@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.6.1
+
+### Fixed
+- `tests/test_floor_confirm.py`: the four daemon tests failed on a host with cgroup v2 at `/sys/fs/cgroup` with
+  `cannot prepare cgroup root`. They launched the daemon with `ip netns exec`, which gives the command a fresh sysfs and
+  hides every cgroup mount, while the test's probe (run outside the namespace) saw a perfectly good one. They now use
+  `nsenter --net=`, which joins the namespace and leaves the mounts alone (as the real service sees them). Reproduced
+  and verified in a hybrid layout (cgroup2 under `/sys/fs/cgroup/unified`).
+
+### Added
+- `tests/test_daemon_dyn.py`: the dynamic policy through the REAL daemon (stub model, real `cora-run` tasks, real nft). Shadow
+  records `would_block` and leaves the kernel alone; in enforce, task B, which has done nothing wrong, cannot get its
+  first packet to the address task A was isolated for. Mutation-checked (dropping the Adjudicator's `dyn=` or the
+  kernel handle fails them).
+- `deploy/cora-sentinel.logrotate` (size-based, `copytruncate`: the daemon never reopens its logs; a week of shadow data
+  must not be cut at a clock tick), installed and removed by `install-service.sh`.
+- docs/dyn-policy.md: shadow's prerequisites (ISOLATE needs a cgroup and nft, so shadow needs `--nft --cgroup-root`; it does
+  not need `--enforce`) and a "Deploying in shadow" recipe.
+
 ## 0.6.0
 
 ### Added
