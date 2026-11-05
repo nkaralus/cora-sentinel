@@ -1,0 +1,50 @@
+# cora-sentinel.service
+#
+# Installed by deploy/install-service.sh, which fills in @BINDIR@ (where `cora-sentinel` and `cora-floor` live,
+# e.g. /opt/cora-sentinel/venv/bin). Arguments come from /etc/cora-sentinel/cora-sentinel.conf, so you edit that file
+# and not this one.
+#
+# Lifecycle, on purpose:
+#   * Restart=on-failure, capped (5 starts in 5 minutes), so a refused config does not spin forever.
+#   * The kernel floor OUTLIVES the service. Stopping, restarting or crashing the daemon leaves a CONFIRMED floor
+#     in place (that is the point of a floor). Only an UNCONFIRMED floor is removed on stop (ExecStopPost), because
+#     nobody has vouched for it yet. `cora-floor remove` or `cora-firewall purge` takes a confirmed one out.
+#   * Per-task ISOLATE rules and task cgroups also stay, as they do without systemd.
+
+[Unit]
+Description=cora-sentinel: out-of-band task sentinel (cgroups, nftables, NFLOG tap, kernel blocklist floor)
+Documentation=https://github.com/nkaralus/cora-sentinel
+Wants=network-online.target
+# nftables.service, if you use it, loads /etc/nftables.conf (often starting with `flush ruleset`). Start after it so
+# it cannot wipe the floor at boot.
+After=network-online.target nftables.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/cora-sentinel/cora-sentinel.conf
+ExecStart=@BINDIR@/cora-sentinel $CORA_ARGS
+# systemd kills the whole service cgroup on stop, including the floor's rollback watchdog. If the floor is still
+# unconfirmed, remove it now (a no-op once it is confirmed). The leading "-" ignores a failure.
+ExecStopPost=-@BINDIR@/cora-floor rollback
+# `systemctl reload cora-sentinel` re-reads the blocklists (SIGHUP); nothing else changes.
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+KillSignal=SIGTERM
+
+# /var/lib/cora-sentinel (floor confirmation state, reports) and /var/log/cora-sentinel (events, decisions).
+StateDirectory=cora-sentinel
+StateDirectoryMode=0700
+LogsDirectory=cora-sentinel
+WorkingDirectory=/var/lib/cora-sentinel
+
+# Light hardening only: the daemon needs broad root powers (cgroups, nftables, netlink, killing tasks), so it is not
+# sandboxed further. Raise it yourself if your setup allows.
+NoNewPrivileges=yes
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

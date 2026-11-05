@@ -109,6 +109,22 @@ sudo ./venv/bin/cora-floor remove                 # take the floor out (the per-
 - A list reload (`kill -HUP`) updates the sets as one transaction per set pair: an address that stays listed is
   never unblocked while the list changes.
 
+**Not locking yourself out.** The daemon refuses a floor (or a reload) that would drop the default gateway or a live
+SSH peer unless you allow them (`--floor-allow-detected`, `--no-floor-precheck`), and `--floor-confirm 120` installs it
+with a dead-man: it removes itself unless `sudo cora-floor confirm` arrives in time. The timer is a separate process,
+armed before the floor goes in, so a crashed daemon cannot strand it. You are asked once per allow set, so unattended
+restarts and reboots do not prompt. See [docs/service.md](docs/service.md).
+
+### As a service
+
+```bash
+sudo deploy/install-service.sh --bindir "$PWD/venv/bin"   # writes the unit; enables and starts nothing
+sudo systemctl enable --now cora-sentinel && sudo cora-floor confirm
+```
+
+`Restart=on-failure` (capped), `systemctl reload` re-reads the blocklists, and stopping leaves a confirmed floor in
+place while an unconfirmed one is removed. Details, the lifecycle table and the caveats: [docs/service.md](docs/service.md).
+
 ## How a decision is made
 
 1. **Detect** (deterministic). A flow is a violation if it is on a blocklist, or outside the allowlist. A
@@ -189,6 +205,10 @@ Environment matters, so each number says where it came from.
 | the same | median 34 µs, p99 565 µs, max 3.1 ms | author's bare metal |
 | sock_diag dump at ~2,000 sockets | 11 ms (vs 21 ms for `/proc` parse + fd scan) | VM |
 | Model verdict, Qwen 2.5 3B | 2.1 to 4.1 s | author's bare metal |
+| 50 SYNs sent right after a `dyn` element is added, each hook | 0 reached the listener, all 50 counted as dropped | author's bare metal, 2 netns |
+| 300-connection flood far past the 10/s log limit | 0 got through, all 300 dropped | same |
+| Re-syncing a 1,500-address list for 4 s while probing a listed address | 0 probes got through | same |
+| SIGKILL mid-sync, 8 rounds | the set was always the old list or the new one, never a mix | same |
 
 Latencies are upper bounds and are *receipt* times: the kernel supplies no timestamp for locally generated
 packets.
@@ -199,6 +219,8 @@ packets.
 - **TCP and UDP only.** Encrypted DNS (DoH, DoT, DoQ) hides query names. QUIC **hostnames are not
   recoverable** (that needs AES, may span two packets, and ECH hides it); QUIC is labelled and matched by
   address.
+- **The lockout guard is best effort.** The pre-check sees the default gateway and SSH on port 22 (or the port in
+  `$SSH_CONNECTION`); other management paths need `--floor-allow`. The dead-man is the net underneath it.
 - **The kernel floor is address-level.** It cannot match names, and a listed address shared with something you use is
   dropped for everything on the host (`--floor-allow` is the remedy). Fed from the lists' addresses and subnets only,
   unless you opt in to `--floor-dns`.
@@ -232,18 +254,24 @@ At 0.4.0: **453 passed, 5 skipped** as root against the installed wheel (the ski
 only apply when not root, and two IPv6 tap tests that have never been run on a kernel with IPv6; the real-model
 test ran), and **382 passed, 76 skipped** unprivileged. The unprivileged run is what CI executes.
 
-0.5.0 adds `tests/test_nftsets.py` (30 tests, no kernel needed) and `tests/test_floor_gate.py` (7 tests with real packets
-between two network namespaces; they skip without root, nft and `ip netns`). Those namespaces hold their own throwaway
-table, so the gate never touches the host's network.
+At 0.5.0: **492 passed, 3 skipped** as root on bare metal (28 cores, 2:57), including `tests/test_floor_gate.py`: real
+TCP between two network namespaces, each with its own throwaway table, so the host ruleset is never touched.
+`tests/test_nftsets.py` (30 tests) needs no kernel and runs in CI.
+
+0.5.1 adds `tests/test_floorguard.py` (40, no kernel), `tests/test_service.py` (10, validates the unit with
+`systemd-analyze` when present) and `tests/test_floor_confirm.py` (9: a real watchdog process, a SIGKILLed daemon, the
+real `/proc` decoding, and the daemon end to end; they skip without root, nft and `ip netns`, and the daemon ones also
+need a cgroup v2 mount, or `CORA_TEST_CGROUP_MOUNT`).
 
 ## Layout
 
 ```
-src/cora_sentinel/   daemon  netmon  nflog  nftdump  nftsets  sockdiag  firewall  cgroup  blocklist  blocklist_store  reload  report  verdict  run  demo  selfcheck
+src/cora_sentinel/   daemon  netmon  nflog  nftdump  nftsets  floorguard  sockdiag  firewall  cgroup  blocklist  blocklist_store  reload  report  verdict  run  demo  selfcheck
 tests/               unit tests, plus kernel tests that skip without root
 schema/              violation.schema.json (cora.security.violation/v1)
 examples/            starter blocklists, an allow list, an example report
-docs/                architecture.md, violation-reports.md
+docs/                architecture.md, service.md, violation-reports.md
+deploy/              cora-sentinel.service, cora-sentinel.conf, install-service.sh
 ```
 
 Commands: `cora-sentinel`, `cora-run`, `cora-demo`, `cora-cgroup`, `cora-firewall`, `cora-floor`, `cora-blocklist`,

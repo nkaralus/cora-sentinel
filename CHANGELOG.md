@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.5.1
+
+### Added
+- **Lockout pre-check.** Before installing the floor, and before every hot reload, the daemon finds the default
+  gateway(s) and the live SSH peers (from `/proc`: established connections to port 22, and the client and port in
+  `$SSH_CONNECTION`) and refuses if the lists would drop one of them. A refused reload keeps the previous sets.
+  `--floor-allow-detected` allows them instead; `--no-floor-precheck` turns it off. Resolved-domain addresses never
+  include a protected address.
+- **Dead-man switch (`--floor-confirm SECONDS`, `cora-floor confirm`).** The floor is removed unless confirmed in
+  time. The timer is a detached watchdog process, started and seen to report in BEFORE the floor is installed (if it
+  cannot start, the floor is not installed), so a crashed or killed daemon cannot strand an unconfirmed floor. Confirm,
+  rollback and the deadline decide under one lock; a failed removal is retried and the pending record kept until the
+  floor is really gone. The daemon logs the outcome once and, after a rollback, stops touching the floor.
+- **Asked once per allow set.** The confirmed fingerprint (table, priorities, and the allow set you configured:
+  loopback, `--floor-allow`, the blocklist allow list) is kept in `--state-dir` (default `/var/lib/cora-sentinel`), so a
+  restart or reboot with the same allow set does not prompt. Resolvers (DHCP) and detected peers are not part of it. A
+  pending record from before a reboot is ignored (boot id).
+- `cora-floor confirm | unconfirm | pending | rollback`, and `status` now shows a pending confirmation. `remove` is
+  best-effort (tolerates parts that are already gone).
+- **systemd packaging** (`deploy/`): `cora-sentinel.service` (`Restart=on-failure`, capped; `ExecReload` = SIGHUP;
+  `ExecStopPost=cora-floor rollback`, which removes only an UNCONFIRMED floor; ordered after `nftables.service`;
+  state and log directories), `cora-sentinel.conf` (the arguments, in one `CORA_ARGS` line) and `install-service.sh`
+  (renders the unit, never overwrites your config, never enables or starts anything, `--uninstall [--remove-floor]`).
+  See `docs/service.md`.
+- Tests: `test_floorguard.py` (40), `test_service.py` (10) and `test_floor_confirm.py` (9, real kernel).
+
+### Changed
+- README: the 0.5.0 bare-metal results (492 passed, 3 skipped; the gate's measured behaviour).
+
+### Not done
+- Hot-reload is guarded by the pre-check but not by a dead-man (a reload only narrows protection if the lists change).
+- `systemctl reload nftables` (a `flush ruleset`) removes the floor; restart the service afterwards. A self-heal was
+  left out on purpose: it would also undo `cora-firewall purge`, the panic button.
+- Non-SSH management paths and SSH on a port other than 22 (unless started from that session) are not detected.
+
 ## 0.5.0
 
 ### Added

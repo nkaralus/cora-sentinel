@@ -45,6 +45,7 @@ import threading
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+from cora_sentinel import floorguard
 from cora_sentinel.firewall import TABLE_RE, FirewallError, Runner, _default_runner
 
 FLOOR_IN, FLOOR_OUT = "floor_in", "floor_out"
@@ -73,6 +74,10 @@ ADDR_SETS = (("static4", "ip"), ("static6", "ip6"), ("dns4", "ip"), ("dns6", "ip
              ("dyn4", "ip"), ("dyn6", "ip6"))
 FLOW_SETS = (("dynflow4", "ip"), ("dynflow6", "ip6"))
 PROTOS = {"tcp": "tcp", "udp": "udp", "6": "tcp", "17": "udp"}
+
+
+class FloorRefused(FirewallError):
+    """The pre-check refused: the lists would drop the gateway or a live SSH peer."""
 
 
 # --------------------------------------------------------------------------
@@ -197,14 +202,27 @@ class NftSets:
         the same transaction. If an existing chain has a different priority nft refuses: `cora-floor remove` first."""
         self._script(self.ensure_script())
 
-    def remove(self) -> None:
-        """Take out only the floor (chains, then sets). The per-task egress chain and the tap are untouched."""
+    def remove(self, best_effort: bool = False) -> None:
+        """Take out only the floor (chains, then sets). The per-task egress chain and the tap are untouched.
+        `best_effort` tolerates parts that are already gone (a purge, a half-built floor) and still removes the rest."""
         t = f"inet {self.table}"
-        lines: List[str] = []
-        for chain in (FLOOR_IN, FLOOR_OUT):
-            lines += [f"flush chain {t} {chain}", f"delete chain {t} {chain}"]
-        lines += [f"delete set {t} {name}" for name in SETS]
-        self._script("\n".join(lines) + "\n")
+        stmts = [f"flush chain {t} {c}\ndelete chain {t} {c}" for c in (FLOOR_IN, FLOOR_OUT)]
+        stmts += [f"delete set {t} {name}" for name in SETS]
+        try:
+            self._script("\n".join(stmts) + "\n")
+            return
+        except FirewallError:
+            if not best_effort:
+                raise
+        errors = []
+        for st in stmts:                                  # one object at a time: a missing one must not stop the rest
+            try:
+                self._script(st + "\n")
+            except FirewallError as e:
+                if "No such file" not in str(e):
+                    errors.append(str(e))
+        if errors:
+            raise FirewallError("; ".join(errors[:3]))
 
     # ---- delta sync of list sets -------------------------------------------
     def _plan(self, name: str, want: Set, live_tokens: Sequence[str]) -> Tuple[List[str], List[str], int, int]:
@@ -361,19 +379,40 @@ def resolv_conf_nameservers(path: str = "/etc/resolv.conf") -> List[str]:
 
 class FloorSync:
     """Keeps the kernel sets equal to the daemon's Blocklist. Called at start, on a hot reload and after each
-    resolver cycle (two different threads, so it serialises itself)."""
+    resolver cycle (two different threads, so it serialises itself).
+
+    Safety: every apply and reload runs the pre-check (the lists must not drop the default gateway or a live SSH
+    peer unless they are allowed), and `start(confirm_s=N)` arms the dead-man before the floor goes in."""
 
     def __init__(self, sets: NftSets, extra_allow: Sequence[str] = (), dns: bool = False,
                  log: Callable[[str], None] = lambda m: print(f"[cora-sentinel] {m}", file=sys.stderr, flush=True),
-                 resolv: Optional[Callable[[], List[str]]] = None):
+                 resolv: Optional[Callable[[], List[str]]] = None, precheck: bool = True,
+                 allow_detected: bool = False, protect: Optional[Callable[[], Dict[str, str]]] = None,
+                 guard: Optional["floorguard.FloorGuard"] = None):
         self.sets, self.extra_allow, self.dns, self.log = sets, list(extra_allow), dns, log
         self._resolv = resolv or resolv_conf_nameservers
+        self.precheck, self.allow_detected = precheck, allow_detected
+        self._protect = protect or floorguard.protected_addresses
+        self.guard, self.token, self.disabled, self._reported = guard, None, False, False
         self._lock = threading.Lock()
 
-    def allow_entries(self, bl) -> List[str]:
-        out = list(SAFE_ALLOW) + self._resolv() + self.extra_allow
+    # ---- what goes where ----
+    def configured_allow(self, bl) -> List[str]:
+        """What the OPERATOR configured: loopback, --floor-allow, the blocklist allow list. This is what a
+        confirmation vouches for. Resolvers (they follow DHCP) and detected peers are protective extras and are
+        deliberately not part of it, so an unattended reboot never asks a question nobody is there to answer."""
+        out = list(SAFE_ALLOW) + self.extra_allow
         if bl is not None and bl.allow is not None:
             out += sorted(bl.allow.entries()[1])
+        return out
+
+    def allow_entries(self, bl) -> List[str]:
+        return self.configured_allow(bl) + self._resolv()
+
+    def _allow_effective(self, bl) -> List[str]:
+        out = self.allow_entries(bl)
+        if self.allow_detected:
+            out += sorted(self._protect())
         return out
 
     @staticmethod
@@ -381,30 +420,117 @@ class FloorSync:
         return sorted(bl.entries()[1]) if bl is not None else []
 
     def dns_entries(self, bl) -> List[str]:
-        """Resolved addresses the userspace matcher would call a hit (so the allow list already won)."""
+        """Resolved addresses the userspace matcher would call a hit (so the allow list already won). Never the
+        gateway or an SSH peer: a domain that resolves to one must not cut it off."""
         if bl is None or not self.dns:
             return []
-        return [ip for ip in sorted(bl._resolved) if bl.match_ip(ip)]
+        keep = set(self._protect()) if self.precheck else set()
+        return [ip for ip in sorted(bl._resolved) if ip not in keep and bl.match_ip(ip)]
 
+    def fingerprint(self, bl) -> str:
+        return floorguard.fingerprint(self.sets.table, self.sets.in_priority, self.sets.out_priority,
+                                      self.configured_allow(bl))
+
+    # ---- the pre-check ----
+    def conflicts(self, bl) -> List[str]:
+        if not self.precheck:
+            return []
+        prot = self._protect()
+        if not prot:
+            return []
+        allow = floorguard.net_index(self._allow_effective(bl))
+        static = floorguard.net_index(self.static_entries(bl))
+        out = []
+        for addr, why in sorted(prot.items()):
+            if floorguard.covering(addr, allow):
+                continue
+            hit = floorguard.covering(addr, static)
+            if hit:
+                out.append(f"{addr} ({why}) is inside {hit}")
+        return out
+
+    def _refuse_on_conflicts(self, bl, what: str = "install") -> None:
+        c = self.conflicts(bl)
+        if c:
+            raise FloorRefused(f"refusing to {what} the floor, it would drop: " + "; ".join(c) +
+                               ". Allow them (--floor-allow ADDR or --floor-allow-detected), fix the list, "
+                               "or pass --no-floor-precheck")
+
+    # ---- lifecycle ----
     def apply(self, bl) -> str:
-        """Full reconcile. Raises FirewallError if nft refuses."""
+        """Full reconcile. Raises FirewallError (FloorRefused for a pre-check failure) if it cannot."""
         with self._lock:
+            self._refuse_on_conflicts(bl)
             if bl is not None and bl.allow is not None and bl.allow.domains:
                 self.log("floor: allow-list DOMAINS are not mirrored into the kernel (only subnets and addresses)")
-            r = self.sets.reconcile(self.static_entries(bl), self.allow_entries(bl),
+            r = self.sets.reconcile(self.static_entries(bl), self._allow_effective(bl),
                                     self.dns_entries(bl) if self.dns else None)
             msg = (f"kernel floor on: allow +{r['allow'][0]}/-{r['allow'][1]}, static +{r['static'][0]}/-{r['static'][1]}, "
                    f"dns +{r['dns'][0]}/-{r['dns'][1]}{'' if self.dns else ' (off)'}")
             self.log(msg)
             return msg
 
+    def start(self, bl, confirm_s: int = 0) -> str:
+        """Pre-check, then (if asked, and this allow set is not already confirmed) arm the dead-man, THEN install."""
+        token = None
+        if confirm_s and self.guard is not None:
+            fp = self.fingerprint(bl)
+            if self.guard.is_confirmed(fp):
+                self.log("floor: this allow set was confirmed before, so no confirmation window "
+                         "(`cora-floor unconfirm` brings it back)")
+            else:
+                self._refuse_on_conflicts(bl)                       # a refusal must not leave a timer behind
+                token = self.guard.arm(self.sets.table, int(confirm_s), fp)
+                self.token = token
+        try:
+            msg = self.apply(bl)
+        except BaseException:
+            if token:
+                self.guard.disarm(token)
+            raise
+        if token:
+            self.log(f"FLOOR NOT YET CONFIRMED: run `cora-floor confirm` within {int(confirm_s)}s or it is removed "
+                     f"(a watchdog outside this process will do it, even if this daemon dies)")
+        return msg
+
+    def _alive(self) -> bool:
+        if self.disabled:
+            return False
+        if self.guard is not None and self.token and self.guard.state(self.token) == "rolledback":
+            self.disabled = True
+            self.log("floor was rolled back (not confirmed in time); not touching it again until a restart")
+            return False
+        return True
+
+    def poll(self) -> None:
+        """Called from the daemon's loop: report the dead-man's outcome once."""
+        if self.guard is None or not self.token or self._reported:
+            return
+        st = self.guard.state(self.token)
+        if st == "pending":
+            return
+        self._reported = True
+        if st == "confirmed":
+            self.log("floor confirmed: it stays in the kernel")
+        elif st == "rolledback":
+            self.disabled = True
+            self.log("FLOOR ROLLED BACK: it was not confirmed in time, so it was removed. The daemon keeps running "
+                     "without it. Restart and run `cora-floor confirm` within the window to try again")
+        else:
+            self.log("floor confirmation state was cleared (disarmed or superseded)")
+
     def on_reload(self, bl) -> None:
-        """Hot reload: allow first, then static. Failure keeps the old sets (they only ever change atomically)."""
+        """Hot reload: pre-check, then allow first, then static. A refusal or failure keeps the old sets."""
         with self._lock:
+            if not self._alive():
+                return
             try:
-                a = self.sets.sync_allow(self.allow_entries(bl))
+                self._refuse_on_conflicts(bl, "reload")
+                a = self.sets.sync_allow(self._allow_effective(bl))
                 s = self.sets.sync_static(self.static_entries(bl))
                 self.log(f"floor reloaded: allow +{a[0]}/-{a[1]}, static +{s[0]}/-{s[1]}")
+            except FloorRefused as e:
+                self.log(f"floor reload REFUSED, keeping the previous sets: {e}")
             except (FirewallError, OSError, ValueError) as e:
                 self.log(f"floor reload FAILED, keeping the previous sets: {e}")
 
@@ -412,6 +538,8 @@ class FloorSync:
         if not self.dns:
             return
         with self._lock:
+            if not self._alive():
+                return
             try:
                 a, r = self.sets.sync_dns(self.dns_entries(bl))
                 if a or r:
@@ -426,8 +554,16 @@ class FloorSync:
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(prog="cora-floor", description="Inspect and drive the kernel-side blocklist floor.")
     ap.add_argument("--table", default=os.environ.get("CORA_NFT_TABLE", "cora"))
+    ap.add_argument("--state-dir", default=os.environ.get("CORA_STATE_DIR", floorguard.DEFAULT_STATE_DIR),
+                    help="where the confirmation state lives (default /var/lib/cora-sentinel)")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("status", help="element count per set and packets dropped per direction")
+    sub.add_parser("status", help="element count per set, packets dropped per direction, any pending confirmation")
+    sub.add_parser("confirm", help="keep the floor that --floor-confirm is waiting on")
+    sub.add_parser("unconfirm", help="forget the confirmed allow set, so the next start asks for confirmation again")
+    sub.add_parser("pending", help="seconds left to confirm, or 'none'")
+    sub.add_parser("rollback", help="remove the floor IF it is still awaiting confirmation (the unit's ExecStopPost)")
+    p = sub.add_parser("watchdog", help=argparse.SUPPRESS)           # internal: the detached rollback timer
+    p.add_argument("token"); p.add_argument("seconds", type=float)
     p = sub.add_parser("list", help="print one set's elements"); p.add_argument("set", choices=sorted(SETS))
     sub.add_parser("ensure", help="create the sets and chains (idempotent)")
     sub.add_parser("remove", help="remove the floor only (not the egress chain or the tap)")
@@ -447,12 +583,30 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print(f"{k:<10} {'(missing)' if v < 0 else v}")
             d = ns.drop_counts()
             print(f"dropped    in={d['in']} out={d['out']} packets")
+            left = floorguard.FloorGuard(a.state_dir).remaining()
+            print("confirm    " + ("not pending" if left is None else f"PENDING, {left:.0f}s left: run `cora-floor confirm`"))
+        elif a.cmd == "confirm":
+            ok, msg = floorguard.FloorGuard(a.state_dir).confirm()
+            print(msg)
+            return 0 if ok else 1
+        elif a.cmd == "unconfirm":
+            print("forgot the confirmed allow set" if floorguard.FloorGuard(a.state_dir).unconfirm()
+                  else "nothing was confirmed")
+        elif a.cmd == "pending":
+            left = floorguard.FloorGuard(a.state_dir).remaining()
+            print("none" if left is None else f"{left:.0f}s left to confirm")
+        elif a.cmd == "rollback":
+            g = floorguard.FloorGuard(a.state_dir)
+            print("floor removed (it was never confirmed)" if g.rollback(reason="rollback requested")
+                  else "nothing pending; the floor is left as it is")
+        elif a.cmd == "watchdog":
+            return floorguard.watchdog(a.state_dir, a.token, a.seconds)
         elif a.cmd == "list":
             print("\n".join(ns.list_set(a.set)))
         elif a.cmd == "ensure":
             ns.ensure(); print("floor ensured")
         elif a.cmd == "remove":
-            ns.remove(); print("floor removed")
+            ns.remove(best_effort=True); print("floor removed")
         elif a.cmd == "block":
             ns.block_ip(a.ip, a.ttl); print(f"blocked {a.ip} for {a.ttl}s")
         elif a.cmd == "unblock":

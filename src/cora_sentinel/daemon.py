@@ -603,6 +603,17 @@ def main() -> int:
     ap.add_argument("--floor-allow", action="append", metavar="CIDR", default=[],
                     help="always accepted by the floor (repeatable). Loopback and the resolvers in /etc/resolv.conf "
                          "are always included")
+    ap.add_argument("--floor-confirm", type=int, default=0, metavar="SECONDS",
+                    help="dead-man switch: the floor is removed unless `cora-floor confirm` arrives within SECONDS "
+                         "(10-3600). A watchdog OUTSIDE this process does the removal, so a crashed daemon cannot "
+                         "strand it. Asked only when the allow set changed since it was last confirmed")
+    ap.add_argument("--floor-allow-detected", action="store_true",
+                    help="add the default gateway(s) and live SSH peers to the floor's allow set, instead of "
+                         "refusing when the lists would drop them")
+    ap.add_argument("--no-floor-precheck", action="store_true",
+                    help="do not refuse a floor that would drop the default gateway or a live SSH peer")
+    ap.add_argument("--state-dir", default="/var/lib/cora-sentinel",
+                    help="where --floor-confirm keeps its state (default /var/lib/cora-sentinel)")
     ap.add_argument("--floor-log-group", type=int, default=72,
                     help="NFLOG group for floor drop records (default 72; the tap is 71; unbound = discarded)")
     ap.add_argument("--floor-out-priority", type=int, default=-5,
@@ -635,6 +646,9 @@ def main() -> int:
         return 1
     if (a.floor or a.floor_dns) and not (a.floor and a.nft and a.cgroup_root):
         print("[cora-sentinel] --floor needs --nft and --cgroup-root (and --floor-dns needs --floor)", file=sys.stderr)
+        return 1
+    if a.floor_confirm and (not a.floor or not 10 <= a.floor_confirm <= 3600):
+        print("[cora-sentinel] --floor-confirm needs --floor and a value between 10 and 3600 seconds", file=sys.stderr)
         return 1
     try:
         out = open(a.out, "a", buffering=1)
@@ -711,12 +725,16 @@ def main() -> int:
         except FirewallError as e:
             print(f"[cora-sentinel] nft not usable yet: {e}", file=sys.stderr)
         if a.floor:
+            from cora_sentinel.floorguard import FloorGuard
             from cora_sentinel.nftsets import FloorSync, NftSets
             try:
                 fs = FloorSync(NftSets.from_firewall(fw, log_group=a.floor_log_group,
                                                       out_priority=a.floor_out_priority),
-                               extra_allow=a.floor_allow, dns=a.floor_dns)
-                fs.apply(bl)                    # allow first, then static; the floor is live before the first tick
+                               extra_allow=a.floor_allow, dns=a.floor_dns,
+                               precheck=not a.no_floor_precheck, allow_detected=a.floor_allow_detected,
+                               guard=FloorGuard(a.state_dir) if a.floor_confirm else None)
+                # pre-check, arm the dead-man (if asked), THEN install; live before the first tick
+                fs.start(bl, a.floor_confirm)
             except (FirewallError, ValueError, OSError) as e:
                 print(f"[cora-sentinel] --floor unusable: {e}", file=sys.stderr)
                 return 1
@@ -795,12 +813,18 @@ def main() -> int:
     while not stop["v"]:
         s.tick()
         n += 1
+        if floor_ref["sync"] is not None:
+            floor_ref["sync"].poll()            # reports the dead-man's outcome once
         if fw and n % 60 == 0:  # housekeeping: drop rules whose task cgroup is gone
             try:                # Firewall serializes itself; holding the registry lock across nft stalled everyone
                 fw.gc(cg.names())
             except Exception as e:
                 print(f"[cora-sentinel] nft gc failed: {e}", file=sys.stderr)
         time.sleep(a.interval)
+    fsync = floor_ref["sync"]
+    if fsync is not None and fsync.guard is not None and fsync.token and fsync.guard.state(fsync.token) == "pending":
+        print("[cora-sentinel] exiting with the floor still unconfirmed: its watchdog will remove it when the "
+              "window ends (under systemd, ExecStopPost does it now)", file=sys.stderr)
     if netmon:
         netmon.stop()
     if adj:

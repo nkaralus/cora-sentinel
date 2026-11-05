@@ -1,0 +1,22 @@
+cora-sentinel 0.5.1 overlay: --floor-confirm (dead-man), lockout pre-check, systemd unit
+
+Extract over the pushed v0.5.0 (e944f13):
+    cd ~/cora-sentinel
+    unzip -o /path/to/cora-sentinel-0.5.1.zip
+    pip install -e ".[dev]"        # re-register: version metadata is 0.5.1
+    sudo -E ./venv/bin/python -m pytest -q                       # full suite
+    # the daemon tests need a cgroup v2 mount; /sys/fs/cgroup normally is one, else:
+    #   sudo CORA_TEST_CGROUP_MOUNT=/path/to/cgroup2 -E ./venv/bin/python -m pytest -q tests/test_floor_confirm.py
+
+New:      src/cora_sentinel/floorguard.py  docs/service.md
+          deploy/cora-sentinel.service  deploy/cora-sentinel.conf  deploy/install-service.sh
+          tests/test_floorguard.py  tests/test_service.py  tests/test_floor_confirm.py
+Modified: src/cora_sentinel/nftsets.py (pre-check, dead-man orchestration, cora-floor confirm|unconfirm|pending|rollback)
+          src/cora_sentinel/daemon.py (--floor-confirm, --floor-allow-detected, --no-floor-precheck, --state-dir)
+          src/cora_sentinel/__init__.py (0.5.1)  tests/test_nftsets.py  README.md (0.5.0 numbers folded in)  CHANGELOG.md
+0.5.1.patch is the same change as a `git apply` patch.
+
+Try the service (nothing is enabled or started for you):
+    sudo deploy/install-service.sh --bindir "$PWD/venv/bin"
+    sudoedit /etc/cora-sentinel/cora-sentinel.conf
+    sudo systemctl enable --now cora-sentinel ; sudo cora-floor confirm

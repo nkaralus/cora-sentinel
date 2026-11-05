@@ -16,6 +16,12 @@ from cora_sentinel.reload import Reloader
 from test_reload import sentinel  # reuse the Sentinel builder
 
 
+def mkfs(*a, **kw):
+    """FloorSync with the host's real gateway / SSH peers taken out of the picture (they differ per machine)."""
+    kw.setdefault("protect", lambda: {})
+    return FloorSync(*a, **kw)
+
+
 class FakeNft:
     """sets: name -> list of element tokens. A script is applied to a copy and kept only if every statement works."""
     ELEM = re.compile(r"^(add|delete) element inet (\S+) (\S+) \{ (.*) \}$")
@@ -246,7 +252,7 @@ def bl_with(lines, allow=(), resolved=None):
 
 
 def test_floor_sync_composes_allow_from_safe_resolvers_flags_and_the_allow_list():
-    fs = FloorSync(NftSets(run=FakeNft()), extra_allow=["192.168.0.0/16"], log=lambda m: None,
+    fs = mkfs(NftSets(run=FakeNft()), extra_allow=["192.168.0.0/16"], log=lambda m: None,
                    resolv=lambda: ["9.9.9.9"])
     got = fs.allow_entries(bl_with(["203.0.113.0/24"], allow=["198.51.100.0/24"]))
     assert {"127.0.0.0/8", "::1/128", "9.9.9.9", "192.168.0.0/16", "198.51.100.0/24"} <= set(got)
@@ -255,7 +261,7 @@ def test_floor_sync_composes_allow_from_safe_resolvers_flags_and_the_allow_list(
 def test_floor_sync_applies_static_from_the_blocklist_and_keeps_dns_off_by_default():
     f = FakeNft()
     logs = []
-    fs = FloorSync(NftSets(run=f), log=logs.append, resolv=lambda: [])
+    fs = mkfs(NftSets(run=f), log=logs.append, resolv=lambda: [])
     bl = bl_with(["203.0.113.0/24", "tracker.example.com"], resolved={"93.184.216.34": ("tracker.example.com", "t")})
     fs.apply(bl)
     assert sets_of(f, "static4") == {ipaddress.ip_network("203.0.113.0/24")}
@@ -266,13 +272,13 @@ def test_floor_sync_applies_static_from_the_blocklist_and_keeps_dns_off_by_defau
 def test_dns_entries_skip_what_the_allow_list_wins_and_need_the_flag():
     bl = bl_with(["tracker.example.com"], allow=["93.184.216.0/24"],
                  resolved={"93.184.216.34": ("tracker.example.com", "t"), "203.0.113.5": ("tracker.example.com", "t")})
-    assert FloorSync(NftSets(run=FakeNft()), dns=True).dns_entries(bl) == ["203.0.113.5"]
-    assert FloorSync(NftSets(run=FakeNft()), dns=False).dns_entries(bl) == []
+    assert mkfs(NftSets(run=FakeNft()), dns=True).dns_entries(bl) == ["203.0.113.5"]
+    assert mkfs(NftSets(run=FakeNft()), dns=False).dns_entries(bl) == []
 
 
 def test_on_reload_follows_the_new_list_and_failure_keeps_the_old_sets():
     f, logs = FakeNft(), []
-    fs = FloorSync(NftSets(run=f), log=logs.append, resolv=lambda: [])
+    fs = mkfs(NftSets(run=f), log=logs.append, resolv=lambda: [])
     fs.apply(bl_with(["203.0.113.0/24"]))
     fs.on_reload(bl_with(["198.51.100.0/24"]))
     assert sets_of(f, "static4") == {ipaddress.ip_network("198.51.100.0/24")}
