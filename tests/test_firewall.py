@@ -387,3 +387,25 @@ def test_concurrent_block_calls_never_duplicate_an_egress_rule(tmp_path):
     threads = [threading.Thread(target=blocker) for _ in range(8)]
     [t.start() for t in threads]; [t.join() for t in threads]
     assert len(fake.rules) == 1
+
+
+def test_nft_time_is_tallied_per_thread_so_the_sync_worker_is_not_mixed_with_the_adjudicator(tmp_path):
+    import threading
+    base = tmp_path / "cgroup"; root = base / "cora"; (root / "a").mkdir(parents=True)
+    fake = FakeNft()
+
+    def slow(args, stdin):
+        time.sleep(0.03)
+        return fake(args, stdin)
+    fw = Firewall(CgroupRoot(str(root), str(base)), table="tally", nft_base=str(base), run=slow)
+    seen = {}
+
+    def work(name, n):
+        fw.timing.reset()
+        for _ in range(n):
+            fw._run(["list", "tables"], None)
+        seen[name] = (fw.timing.calls, fw.timing.ms, fw.timing.slowest)
+    a, b = threading.Thread(target=work, args=("a", 3)), threading.Thread(target=work, args=("b", 1))
+    a.start(); b.start(); a.join(); b.join()
+    assert seen["a"][0] == 3 and seen["a"][1] >= 80 and seen["b"][0] == 1 and 25 <= seen["b"][1] < 80
+    assert seen["a"][2] >= 25 and seen["b"][2] >= 25

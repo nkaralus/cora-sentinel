@@ -22,6 +22,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -34,6 +35,20 @@ TABLE_RE = re.compile(r"[a-z][a-z0-9_]{0,31}", re.ASCII)
 
 class FirewallError(Exception):
     pass
+
+
+class NftTiming(threading.local):
+    """A per-THREAD tally of nft time, so the tap-sync worker's numbers are not mixed with the adjudicator's.
+    `lock_ms` is time spent waiting for the cross-process tap lock (filled in by nflog.TapRules)."""
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.ms = 0.0          # wall time inside nft subprocesses
+        self.calls = 0
+        self.slowest = 0.0     # the slowest single nft call
+        self.lock_ms = 0.0
 
 
 def _serialized(fn):
@@ -70,7 +85,19 @@ class Firewall:
         if not TABLE_RE.fullmatch(table):
             raise FirewallError(f"bad table name {table!r}")
         self.cg, self.table, self.nft_base = cgroups, table, nft_base
-        self._run = run or _default_runner(nft)
+        self.timing = NftTiming()
+        raw = run or _default_runner(nft)
+
+        def timed(args: List[str], stdin: Optional[str]) -> Tuple[int, str, str]:
+            t = time.monotonic()
+            try:
+                return raw(args, stdin)
+            finally:
+                ms, tm = (time.monotonic() - t) * 1000.0, self.timing
+                tm.ms += ms
+                tm.calls += 1
+                tm.slowest = max(tm.slowest, ms)
+        self._run = timed
         self._lock = threading.RLock()
 
     # ---- plumbing ---------------------------------------------------------

@@ -321,6 +321,8 @@ class TapRules:
         """udp=True/False forces it; udp=None auto-detects from the live table (used by cora_run)."""
         self.fw, self.group, self.udp, self.udp_timeout = fw, group, udp, udp_timeout
 
+    last_timing: Dict[str, float] = {}
+
     @contextlib.contextmanager
     def _locked(self):
         """Serialize the read-rules-then-add step across processes. cora_run (pre-install) and the
@@ -337,7 +339,9 @@ class TapRules:
             yield                                    # nowhere to lock (never as root); proceed unlocked
             return
         try:
+            t = time.monotonic()
             fcntl.flock(fd, fcntl.LOCK_EX)
+            self.fw.timing.lock_ms += (time.monotonic() - t) * 1000.0     # how long WE waited for another holder
             yield
         finally:
             os.close(fd)                             # closing releases the flock
@@ -439,9 +443,16 @@ class TapRules:
         return lines
 
     def sync(self, live: Dict[str, int]) -> Tuple[List[str], List[str]]:
-        """Make the rules match `live` ({task name: cgroup id}) in ONE atomic nft transaction."""
-        with self._locked():
-            return self._sync(live)
+        """Make the rules match `live` ({task name: cgroup id}) in ONE atomic nft transaction.
+        `last_timing` then says where the time went: waiting for the cross-process lock, or inside nft."""
+        tm = self.fw.timing
+        tm.reset()
+        try:
+            with self._locked():
+                return self._sync(live)
+        finally:
+            self.last_timing = {"lock_ms": tm.lock_ms, "nft_ms": tm.ms, "nft_calls": tm.calls,
+                                "nft_slowest_ms": tm.slowest}
 
     def _sync(self, live: Dict[str, int]) -> Tuple[List[str], List[str]]:
         have = self.rules()
@@ -493,6 +504,10 @@ class TapService:
 
     def sync(self, live: Dict[str, int]) -> Tuple[List[str], List[str]]:
         return self.rules.sync(live)
+
+    @property
+    def last_timing(self) -> Dict[str, float]:
+        return self.rules.last_timing
 
     def close(self) -> None:
         self.listener.close()

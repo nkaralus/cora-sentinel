@@ -122,6 +122,9 @@ the loop's worst poll was **4 ms** (2,418 ms before the change) while the sync w
 still attributed. Steady-state `ensure(pid)` takes no lock, and `Firewall` serializes its own read-then-write steps
 instead of relying on a caller holding the registry lock across `nft`.
 
+Since 0.3.1 each tap sync is also split into lock wait / nft / other plus a no-op-child control, and a slow one is
+explained in the log: see [tap-latency.md](tap-latency.md).
+
 ## Containment
 
 * **Freeze** is `cgroup.freeze`: reversible and covers the whole tree. It is asynchronous (see above).

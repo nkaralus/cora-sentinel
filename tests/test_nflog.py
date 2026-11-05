@@ -1216,7 +1216,7 @@ class FeedQ:
         self.s.close(); self._w.close()
 
 
-def _threaded_monitor(tmp_path, sync=lambda cur: (list(cur), [])):
+def _threaded_monitor(tmp_path, sync=lambda cur: (list(cur), []), timing=None):
     """A monitor whose threads run for real, over a fake cgroup dir and fake netlink sockets."""
     from cora_sentinel.netmon import NetMonitor
     root = tmp_path / "cgroup" / "cora"
@@ -1226,6 +1226,7 @@ def _threaded_monitor(tmp_path, sync=lambda cur: (list(cur), [])):
 
     class Tap:
         listener = tapq
+        last_timing = timing or {}
         def sync(self, cur): return sync(cur)
         def close(self): pass
 
@@ -1372,3 +1373,165 @@ def test_a_reload_changes_what_is_enforced_while_the_task_and_its_taps_keep_runn
     print(f"\nreload under a live task: {flagged_by_b} flows flagged while list B was live, then {settled - flagged_by_b} "
           f"after swapping back to list A; "
           f"rule handles identical; poll_ms_max={nm.stats['poll_ms_max']}")
+
+
+# ============ where does a slow tap sync spend its time: the lock, or nft? ============
+def _slow_tap(tmp_path, delay):
+    base = tmp_path / "cgroup"; root = base / "cora"; root.mkdir(parents=True)
+    n = FakeTapNft()
+
+    def slow(args, stdin):
+        time.sleep(delay)
+        return n(args, stdin)
+    cg = CgroupRoot(str(root), str(base))
+    table = f"unit{os.getpid()}t{abs(hash(str(tmp_path))) % 10**6}"
+    return TapRules(Firewall(cg, table=table, nft_base=str(base), run=slow), group=88, udp=False), cg
+
+
+def test_nft_time_is_attributed_to_nft_and_not_to_the_lock(tmp_path):
+    t, cg = _slow_tap(tmp_path, 0.05)
+    try:
+        t.ensure_chain(); cg.create("a")
+        t.sync({"a": 1})
+        lt = t.last_timing
+        assert lt["nft_calls"] == 2 and lt["nft_ms"] >= 90 and lt["nft_slowest_ms"] >= 45
+        assert lt["lock_ms"] < 30
+    finally:
+        _drop_lock(t.fw.table)
+
+
+def test_time_spent_waiting_for_the_cross_process_lock_is_attributed_to_the_lock(tmp_path):
+    t, cg = _slow_tap(tmp_path, 0.0)
+    try:
+        t.ensure_chain(); cg.create("a")
+        held = threading.Event()
+
+        def hog():
+            with t._locked():
+                held.set()
+                time.sleep(0.5)
+        th = threading.Thread(target=hog, daemon=True)
+        th.start()
+        assert held.wait(5)
+        t.sync({"a": 1})                                         # has to wait for the hog
+        th.join()
+        lt = t.last_timing
+        assert lt["lock_ms"] >= 350 and lt["nft_ms"] < 100
+    finally:
+        _drop_lock(t.fw.table)
+
+
+@pytest.mark.parametrize("total,lock,nft,slowest,ctl,cb,sb,says", [
+    # the lock wait is measured directly
+    (1000, 900, 50, 40, 1, None, None, "waiting for the cross-process tap lock"),
+    # no idle baseline yet: absolute rules only
+    (1600, 10, 1580, 1500, 2, None, None, "inside nft or the kernel"),
+    (1600, 10, 1580, 1500, 400, None, None, "host is too busy"),
+    (1600, 10, 1580, 1500, 60, None, None, "host is too busy"),
+    (1600, 10, 1580, 1500, -1, None, None, "could not be measured"),
+    (900, 10, 20, 15, 1, None, None, "neither the tap lock nor nft"),
+    (22, 0, 22, 12, 3, None, None, "not slow"),                        # an idle, healthy sync is not "a busy host"
+    # with a baseline (each against its own fastest), judged by EXTRA ms: the child barely delayed -> nft alone
+    (1600, 10, 1580, 1500, 6, 2, 10, "points at nft or the kernel"),
+    (1600, 10, 1580, 1500, 8, 2, 10, "points at nft or the kernel"),
+    (600, 0, 600, 300, 2, 2, 10, "points at nft or the kernel"),
+    (253, 0, 253, 223, 4, 0.9, 3.2, "points at nft or the kernel"),   # measured: 16 low-CPU loaders hammering nft
+    (336, 0, 336, 273, 6, 2, 11, "points at nft or the kernel"),       # measured: 30k-rule loads, run 1
+    # ... the child delayed by a comparable share -> the whole host
+    (112, 0, 112, 77, 13, 2, 11, "whole host is slow"),                # measured: 6 spinning processes, 1 core
+    (592, 0, 591, 364, 91, 0.9, 3.2, "whole host is slow"),            # measured: 40 spinning processes, 1 core
+    (336, 0, 336, 273, 63, 2, 11, "whole host is slow"),               # measured: 30k-rule loads, run 2 (1 core)
+    (1600, 10, 1580, 1500, 400, 2, 10, "whole host is slow"),
+    # ... host slow in its own right (>= 30 ms for a no-op!) AND nft far slower still: do not blame either alone
+    (1600, 10, 1580, 1500, 60, 2, 10, "mixed")])
+def test_the_diagnosis_says_what_the_numbers_suggest(total, lock, nft, slowest, ctl, cb, sb, says):
+    from cora_sentinel.netmon import diagnose
+    assert says in diagnose(total, lock, nft, slowest, ctl, cb, sb)
+
+
+def test_a_slow_sync_is_split_recorded_and_explained_in_the_log(tmp_path, monkeypatch, capsys):
+    from cora_sentinel import netmon
+    monkeypatch.setattr(netmon, "_fork_exec_ms", lambda: 3.0)
+    monkeypatch.setattr(netmon, "STALL_WARN_MS", 100)
+    timing = {"lock_ms": 200.0, "nft_ms": 40.0, "nft_calls": 4, "nft_slowest_ms": 25.0}
+    nm, events, _ = _threaded_monitor(tmp_path, sync=lambda cur: (time.sleep(0.25), (list(cur), []))[1], timing=timing)
+    nm.start()
+    live = []
+    try:
+        assert _until(lambda: nm.stats["tap_sync_ms_max"] >= 200, 5)
+        # the note must appear WHILE it runs, not only in the end-of-run summary (which repeats the same text)
+        assert _until(lambda: (live.append(capsys.readouterr().err), "tap sync took" in "".join(live))[1], 5)
+    finally:
+        nm.stop()
+    during = "".join(live)
+    st, w = nm.stats, nm.worst_sync
+    assert (st["tap_lock_wait_ms_max"], st["tap_nft_ms_max"], st["tap_nft_call_ms_max"], st["tap_ctl_ms_max"]) == (200, 40, 25, 3)
+    assert w["lock_ms"] == 200 and w["nft_ms"] == 40 and w["calls"] == 4 and w["ctl_ms"] == 3
+    assert "lock wait 200 + nft 40 (4 calls, slowest 25)" in during and "a no-op child took 3 ms" in during
+    assert "waiting for the cross-process tap lock" in during and "worst_tap_sync" not in during
+    end = capsys.readouterr().err                            # and the summary at stop() carries the same facts
+    assert "lock_wait_max=200 nft_max=40 slowest_nft_call=25 noop_child_max=3" in end and "worst_tap_sync:" in end
+
+
+def test_a_fast_sync_is_recorded_but_not_shouted_about(tmp_path, monkeypatch, capsys):
+    from cora_sentinel import netmon
+    monkeypatch.setattr(netmon, "_fork_exec_ms", lambda: 1.0)
+    nm, _, _ = _threaded_monitor(tmp_path, timing={"lock_ms": 1.0, "nft_ms": 2.0, "nft_calls": 2, "nft_slowest_ms": 1.0})
+    nm.start()
+    try:
+        assert _until(lambda: nm.stats["tap_ctl_ms_max"] == 1, 5)
+    finally:
+        nm.stop()
+    err = capsys.readouterr().err
+    assert "tap sync took" not in err and "worst_tap_sync" not in err
+
+
+@real
+def test_a_held_tap_lock_shows_up_as_lock_wait_on_the_real_kernel(env):
+    """A real nft, a real flock, a real task: another holder keeps the tap lock for 1.6 s. The sentinel's sync must
+    be reported as WAITING FOR THE LOCK, with nft itself fast, and the log must say so."""
+    from cora_sentinel.netmon import NetMonitor
+    cg, fw, made = env
+    events = []
+    s, nm = monitor(cg, fw, made, events)
+    time.sleep(0.5)                                        # the initial (empty) sync is done
+    held = threading.Event()
+
+    def hog():
+        with nm.tap.rules._locked():
+            held.set()
+            time.sleep(1.6)
+    th = threading.Thread(target=hog, daemon=True)
+    th.start()
+    assert held.wait(5)
+    p = task(cg, fw, "hogged", "import time; time.sleep(2)")        # cora-run also waits; so must the sentinel
+    p.wait(timeout=60)
+    th.join()
+    assert _until(lambda: nm.stats["tap_lock_wait_ms_max"] >= 1000, 5)
+    w = nm.worst_sync
+    print(f"\nheld lock: {NetMonitor._describe(w)}")
+    assert w["lock_ms"] > w["nft_ms"] and nm.stats["tap_nft_ms_max"] < 500
+    assert "waiting for the cross-process tap lock" in NetMonitor._describe(w)
+
+
+_TOOL = Path(__file__).resolve().parents[1] / "tools" / "nft_latency_experiments.py"
+
+
+@real
+def test_the_experiment_tool_names_idle_and_a_lock_hog_correctly_and_cleans_up():
+    """The shipped tool, run for real: idle is 'not slow', a lock hog is named as lock wait, exit code 0, and no
+    scratch table, cgroup or lock file is left behind."""
+    r = subprocess.run([sys.executable, str(_TOOL), "idle", "lock", "--check", "--syncs", "8"],
+                       capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "not slow" in r.stdout and "waiting for the cross-process tap lock" in r.stdout
+    tables = subprocess.run(["nft", "list", "tables"], capture_output=True, text=True).stdout
+    assert "coraexp" not in tables
+    assert not [n for n in os.listdir(MOUNT) if n.startswith("coraexp-")]
+    assert not [n for n in os.listdir("/run/lock") if n.startswith("cora-tap-coraexp")]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="as root the tool would actually run")
+def test_the_experiment_tool_refuses_to_run_without_root():
+    r = subprocess.run([sys.executable, str(_TOOL), "idle"], capture_output=True, text=True, timeout=60)
+    assert r.returncode != 0 and "run as root" in r.stderr

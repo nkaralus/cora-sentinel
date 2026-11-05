@@ -143,6 +143,10 @@ restarting**: only the lists change (taps, cgroup tracking and firewall rules ar
 reload keeps the current lists, and resolved addresses carry over so detection has no gap. See
 [docs/blocklist-updates.md](docs/blocklist-updates.md).
 
+Slow tap installs are explained, not guessed at: each sync is split into lock wait / nft / other with a no-op-process
+control, and `tools/nft_latency_experiments.py` checks the verdict against causes it produces on purpose. See
+[docs/tap-latency.md](docs/tap-latency.md).
+
 ## Measured behaviour
 
 Environment matters, so each number says where it came from.
@@ -194,8 +198,8 @@ python -m pytest -q                              # unprivileged: kernel tests sk
 sudo -E ./venv/bin/python -m pytest -q           # everything (CORA_GGUF=path adds the real-model test)
 ```
 
-At 0.3.0: **337 passed, 1 skipped** as root against the installed wheel (the skip is an IPv6 loopback; the
-real-model test ran), and **277 passed, 61 skipped** unprivileged. The unprivileged run is what CI executes.
+At 0.3.1: **361 passed, 2 skipped** as root against the installed wheel (the skips are an IPv6 loopback and a test
+that only applies when not root; the real-model test ran), and **300 passed, 63 skipped** unprivileged. The unprivileged run is what CI executes.
 
 ## Layout
 

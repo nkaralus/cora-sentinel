@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.1
+
+### Added
+- **Where a slow tap sync spends its time.** Each sync is split into lock wait (the cross-process tap lock), nft
+  (wall time in nft subprocesses, with call count and slowest call) and other, plus a no-op child process as a control
+  for "is starting any process slow right now". A sync over 500 ms is logged at once with the breakdown and what it
+  suggests (the lock; nft or the kernel's transaction path; or the whole host). The monitor summary gains
+  `lock_wait_max`, `nft_max`, `slowest_nft_call`, `noop_child_max` and `worst_tap_sync`. See `docs/tap-latency.md`.
+- `tools/nft_latency_experiments.py`: produces each cause on purpose (lock hog, busy host, nftables commit contention)
+  and shows whether the verdict names it correctly on your machine.
+- `Firewall.timing` (a per-thread tally of nft time), `TapRules.last_timing`, `netmon.diagnose()`.
+
+### Changed
+- Every tap sync forks one extra no-op child (`true`, about 1 ms) on the sync worker, as the control.
+- The nft verdict compares extra milliseconds against the fastest seen, not ratios or absolute times; two earlier
+  versions of the rule were wrong in experiments (an idle sync called "a busy host"; a CPU-starved host blamed on nft).
+
+### Not changed (known)
+- The tap lock still has no timeout, so a hung holder would hang the sync worker.
+
 ## 0.3.0
 
 ### Added

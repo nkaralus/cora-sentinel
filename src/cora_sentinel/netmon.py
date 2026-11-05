@@ -38,7 +38,9 @@ import json
 import os
 import queue
 import select
+import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -53,6 +55,7 @@ SLIP_RATE_S = 60.0     # log each (ip, port) slip at most once per minute; all a
 TUPLE_TTL_S = 150.0    # how long a tapped connection's identity is remembered
 TAP_RECHECK_S = 10.0   # re-verify the tap rules this often even if no task came or went
 STALL_WARN_MS = 500    # warn once if a poll takes longer than this: events queue up behind it
+_NOOP = shutil.which("true") or "/bin/true"
 DISPATCH_QUEUE_MAX = 4096   # events waiting for delivery; beyond this they are DROPPED, loudly
 
 
@@ -67,6 +70,52 @@ def _norm(ip: str) -> str:
         return str(a.ipv4_mapped) if a.version == 6 and a.ipv4_mapped else str(a)
     except ValueError:
         return ip
+
+
+def _fork_exec_ms() -> float:
+    """Wall time of a child process that does nothing, measured under the same load as the nft calls. It separates
+    'nft is slow' from 'starting ANY process is slow' (-1 if it could not be measured)."""
+    t = time.monotonic()
+    try:
+        subprocess.run([_NOOP], capture_output=True, timeout=10)
+    except Exception:
+        return -1.0
+    return (time.monotonic() - t) * 1000.0
+
+
+def diagnose(total_ms: float, lock_ms: float, nft_ms: float, slowest_ms: float, ctl_ms: float,
+             ctl_base: Optional[float] = None, slow_base: Optional[float] = None) -> str:
+    """Where a slow tap sync spent its time, in words. A heuristic: it says what the numbers SUGGEST.
+
+    The lock wait is measured directly, so that verdict is firm. For nft the question is "what slowed it", and a
+    bare comparison with the no-op child cannot answer it (an nft call costs several no-op processes even on an
+    idle host). So compare how much each SLOWED DOWN against its own fastest this run: host load slows both
+    together; a problem inside nft or the kernel's nftables path slows only nft. It is the EXTRA milliseconds that
+    count (a no-op child going from 1 ms to 4 ms is a x4 "slowdown" that is only jitter): what share of nft's extra
+    delay does the no-op child also suffer? Under 10% (and under 30 ms): nft alone. Over 15%: the whole host."""
+    if total_ms < 100:
+        return "not slow: nothing to explain"
+    if lock_ms >= 0.5 * total_ms:
+        return ("mostly waiting for the cross-process tap lock: another holder (e.g. cora-run installing rules) "
+                "kept it that long")
+    if nft_ms < 0.5 * total_ms:
+        return "mostly neither the tap lock nor nft (Python, the GIL, or disk)"
+    if ctl_ms < 0:
+        return "nft is slow (the no-op control could not be measured, so host load cannot be ruled out)"
+    if ctl_base and slow_base:
+        ce, ne = max(ctl_ms - ctl_base, 0.0), max(slowest_ms - slow_base, 1.0)     # EXTRA delay, in ms, vs best seen
+        if ce < 30 and ce <= 0.10 * ne:
+            return (f"nft's slowest call lost {ne:.0f} ms against its best, a no-op process only {ce:.0f} ms: this "
+                    f"points at nft or the kernel's nftables transaction path, not general host load")
+        if ce >= 0.15 * ne:
+            return (f"a no-op process lost {ce:.0f} ms along with nft ({ne:.0f} ms): the whole host is slow "
+                    f"(CPU or fork pressure), which is not a netlink problem")
+        return (f"mixed: nft lost {ne:.0f} ms and a no-op process {ce:.0f} ms; host load is part of it but does "
+                f"not explain all of it")
+    if ctl_ms >= 50:                                 # no baseline yet: an absolute rule is all there is
+        return "nft is slow AND so is starting a no-op process: the host is too busy to fork or schedule"
+    return ("nft is slow while a no-op process started promptly (no idle baseline yet to compare against): "
+            "inside nft or the kernel's nftables transaction path")
 
 
 class NetMonitor:
@@ -98,6 +147,9 @@ class NetMonitor:
         self._sync_lock = threading.Lock()
         self._sync_want: Optional[Dict[str, int]] = None
         self._sync_requested: Optional[Dict[str, int]] = None
+        self.worst_sync: dict = {}                                          # the breakdown of the slowest sync
+        self._ctl_base = self._slow_base = float('inf')                     # fastest no-op child / nft call seen
+        self._sync_warn_at = 0.0
         self._tap_synced: Dict[str, int] = {}
         self._tap_err_at = -1e9
         self.listen_ports: set = set()
@@ -315,6 +367,7 @@ class NetMonitor:
         self._sync_req.set()
 
     def _sync_now(self, cur: Dict[str, int]) -> None:
+        ctl = _fork_exec_ms()                        # control: is starting a process slow right now?
         t = time.monotonic()
         try:
             added, removed = self.tap.sync(cur)      # runs nft under a cross-process lock; also repairs damage
@@ -327,9 +380,37 @@ class NetMonitor:
                 self._tap_err_at = time.monotonic()
                 _note(f"tap rule sync failed: {e}")
         finally:
-            ms = int((time.monotonic() - t) * 1000)
-            if ms > self.stats["tap_sync_ms_max"]:
-                self.stats["tap_sync_ms_max"] = ms
+            self._record_sync((time.monotonic() - t) * 1000.0, ctl, dict(getattr(self.tap, "last_timing", None) or {}))
+
+    def _record_sync(self, ms: float, ctl: float, tm: dict) -> None:
+        """Split one sync into lock wait / nft / other, keep the maxima and the worst case, and say so loudly
+        when it was slow: that is the evidence for WHY a tap rule was late."""
+        lock, nft, slow = tm.get("lock_ms", 0.0), tm.get("nft_ms", 0.0), tm.get("nft_slowest_ms", 0.0)
+        for k, v in (("tap_sync_ms_max", ms), ("tap_lock_wait_ms_max", lock), ("tap_nft_ms_max", nft),
+                     ("tap_nft_call_ms_max", slow), ("tap_ctl_ms_max", ctl)):
+            if int(v) > self.stats[k]:
+                self.stats[k] = int(v)
+        if ctl > 0:
+            self._ctl_base = min(self._ctl_base, ctl)
+        if slow > 0:
+            self._slow_base = min(self._slow_base, slow)
+        this = {"total_ms": ms, "lock_ms": lock, "nft_ms": nft, "calls": tm.get("nft_calls", 0),
+                "slowest_ms": slow, "ctl_ms": ctl,
+                "ctl_base": self._ctl_base if self._ctl_base != float("inf") else None,
+                "slow_base": self._slow_base if self._slow_base != float("inf") else None}
+        if ms >= self.worst_sync.get("total_ms", -1.0):
+            self.worst_sync = this
+        if ms > STALL_WARN_MS and time.monotonic() - self._sync_warn_at > 30:
+            self._sync_warn_at = time.monotonic()
+            _note(self._describe(this))                 # the sync that WAS slow, not merely the worst so far
+
+    @staticmethod
+    def _describe(w: dict) -> str:
+        other = max(w["total_ms"] - w["lock_ms"] - w["nft_ms"], 0.0)
+        return (f"tap sync took {w['total_ms']:.0f} ms = lock wait {w['lock_ms']:.0f} + nft {w['nft_ms']:.0f} "
+                f"({w['calls']} calls, slowest {w['slowest_ms']:.0f}) + other {other:.0f}; a no-op child took "
+                f"{w['ctl_ms']:.0f} ms. Suggests: "
+                f"{diagnose(w['total_ms'], w['lock_ms'], w['nft_ms'], w['slowest_ms'], w['ctl_ms'], w.get('ctl_base'), w.get('slow_base'))}")
 
     def _sync_loop(self) -> None:
         while not self._stop.is_set():
@@ -474,7 +555,12 @@ class NetMonitor:
         return (f"polls={s['polls']} live_hits={s['live_hits']}{tap} slips={s['slips']} "
                 f"destroyed_seen={s['destroyed']} owner_gone={s['owner_gone']} "
                 f"owner_cached={s['owner_cached']} dispatch_dropped={s['dispatch_dropped']} errors={s['errors']} "
-                f"poll_ms_max={s['poll_ms_max']} tap_sync_ms_max={s['tap_sync_ms_max']} LOST={self.lost()}")
+                f"poll_ms_max={s['poll_ms_max']} tap_sync_ms_max={s['tap_sync_ms_max']} "
+                f"(lock_wait_max={s['tap_lock_wait_ms_max']} nft_max={s['tap_nft_ms_max']} "
+                f"slowest_nft_call={s['tap_nft_call_ms_max']} noop_child_max={s['tap_ctl_ms_max']}) "
+                f"LOST={self.lost()}"
+                + (f" | worst_tap_sync: {self._describe(self.worst_sync)}"
+                   if self.worst_sync.get("total_ms", 0) > STALL_WARN_MS else ""))
 
     def stop(self) -> None:
         self._stop.set()
