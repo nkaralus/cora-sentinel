@@ -1,0 +1,23 @@
+cora-sentinel 0.6.0 overlay: dynamic policy (model ISOLATE -> short-lived kernel drops), shadow by default
+
+Extract over the pushed v0.5.1 (6af7216):
+    cd ~/cora-sentinel
+    unzip -o /path/to/cora-sentinel-0.6.0.zip
+    pip install -e ".[dev]"        # re-register: version metadata is 0.6.0
+    sudo -E ./venv/bin/python -m pytest -q
+    sudo ./venv/bin/python tools/dyn_bench.py                      # per-decision cost, shadow and enforce
+
+New:      src/cora_sentinel/dynpolicy.py  docs/dyn-policy.md  tools/dyn_bench.py
+          tests/test_dynpolicy.py  tests/test_dyn_kernel.py
+Modified: src/cora_sentinel/daemon.py   (--dyn-policy, --dyn-min-conf, --dyn-write-budget, --dyn-max-live, --dyn-task-cap)
+          src/cora_sentinel/verdict.py  (Adjudicator(dyn=...): records decision["dyn"])
+          src/cora_sentinel/firewall.py (release_task(..., dyn=...): `cora-firewall release` also drops that task's dynamic entries)
+          src/cora_sentinel/nftsets.py  (unblock_flow, live_flows/live_ips, exempt_reason, cora-floor dyn / dyn-report)
+          tests/test_floor_gate.py (Lab: bind=, connect(ip=)), deploy/cora-sentinel.conf, README.md, CHANGELOG.md, __init__.py
+0.6.0.patch is the same change as a `git apply` patch.
+tools/dyn_bench.py needs `chmod +x` in git if you want the executable bit: git update-index --chmod=+x tools/dyn_bench.py
+
+Nothing changes unless a model is configured: with --model the default is --dyn-policy shadow, which only adds a "dyn"
+field to sentinel_decisions.jsonl. Kernel writes need --dyn-policy enforce AND --enforce AND --floor.
+
+Review shadow data:   cora-floor dyn-report sentinel_decisions.jsonl     |     cora-floor dyn

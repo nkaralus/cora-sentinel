@@ -1,0 +1,1764 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index a612262..f619e55 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,49 @@
+ # Changelog
+ 
++## 0.6.0
++
++### Added
++- **Dynamic policy (`--dyn-policy off|shadow|enforce`, default `shadow`; `cora_sentinel.dynpolicy`).** A model ISOLATE
++  can now also drop the destination in the kernel (`dyn*` sets, timeouts expire them), so the next task's first packet to
++  that address does not escape. In **shadow** it computes everything, budgets and escalation included, and writes
++  `dyn: {result: would_block|would_refresh|would_promote|skipped, ...}` into each decision; the kernel is untouched.
++  `enforce` needs `--model`, `--enforce` and `--floor`, and stays in shadow for decisions the adjudicator only dry-ran.
++- **Policy:** only a final ISOLATE the MODEL chose, at confidence >= 0.9, whose gate passed and whose action ran;
++  ESCALATE never writes; never non-public addresses, allowed or protected ones (gateway, SSH peers, resolvers), or DNS/NTP
++  ports. **Web ports (80/443, tcp and udp) are flow-only** (address, proto, port), 10 min, x4 per repeat offense up to
++  24 h, **never promoted** to a whole-address block. **Other ports:** flow first; whole address (30 min, x4, up to 24 h)
++  once two distinct tasks have hit non-web ports of it within an hour.
++- **Limits:** 20 kernel writes/min (token bucket), 512 live elements, 8 distinct targets per task per hour
++  (`--dyn-write-budget`, `--dyn-max-live`, `--dyn-task-cap`, `--dyn-min-conf`).
++- **A persistent ledger** per mode in `--state-dir` (flock-guarded: `cora-firewall release` is another process).
++  Offense memory lasts 7 days; the daemon reconciles it against the kernel at start and hourly, so an element removed by
++  hand is not remembered as blocked.
++- **`cora-firewall release TASK` also drops that task's dynamic entries** (a whole-address block that loses its second
++  distinct task is demoted; blocks another task caused stay; a failed unblock keeps the entry and says so).
++- `cora-floor dyn` (the ledger) and `cora-floor dyn-report decisions.jsonl` (what shadow would have done: the data for the
++  shadow-to-enforce call). `tools/dyn_bench.py` (cost per decision, enforce in a throwaway namespace).
++- `NftSets.unblock_flow`, `live_flows`, `live_ips`; `FloorSync.exempt_reason` / `track`; `Adjudicator(dyn=...)`;
++  `release_task(..., dyn=...)`.
++- Tests: `test_dynpolicy.py` (67) and `test_dyn_kernel.py` (7, real traffic). Re-adding a timed element refreshes its
++  timeout on the kernel (checked), so a repeat offense is a plain `add`.
++
++### Design notes
++- The model is a 3B network and a task controls the address it touches and the text the model reads, so a model-only
++  verdict that writes host-wide drops is an injection surface. Hence: shadow by default, the limits above, no ESCALATE,
++  the target taken from the event, and web ports flow-only (nft cannot see SNI or Host, so a flow block on 443 still hits
++  everything behind a shared address; the safety there is TTL, budgets and shadow, and a web address is promoted through
++  the blocklist path, with a human).
++- Documentation ranges (192.0.2/24, 198.51.100/24, 203.0.113/24) are not global addresses, so the policy refuses them.
++
++### Changed
++- `tests/test_floor_gate.py`'s `Lab` takes `bind=` and `connect(..., ip=)` (backward compatible).
++
++### Not done
++- After a demotion the promoting hit has no flow entry of its own, so its destination is re-blocked on its next event.
++- The ledger is rewritten on every decision; its cost grows with its size (about 1 ms empty, 7 ms at 500 entries here).
++- `cora-floor unblock` / `unblock-flow` do not edit the ledger; reconcile (start, hourly) catches the difference.
++- IPv6 targets are covered by unit tests, not by a kernel test.
++
+ ## 0.5.1
+ 
+ ### Added
+diff --git a/README.md b/README.md
+index 2124360..e77c6cc 100644
+--- a/README.md
++++ b/README.md
+@@ -115,6 +115,16 @@ with a dead-man: it removes itself unless `sudo cora-floor confirm` arrives in t
+ armed before the floor goes in, so a crashed daemon cannot strand it. You are asked once per allow set, so unattended
+ restarts and reboots do not prompt. See [docs/service.md](docs/service.md).
+ 
++### Dynamic policy (`--dyn-policy`)
++
++When the model isolates a task for talking to a public address, the next task to reach it would still get its first
++packet out. `--dyn-policy` can turn that verdict into a short-lived kernel drop of the destination. It is **off in
++effect by default: the default is `shadow`**, which records what it *would* do in the decision log and touches nothing.
++Web ports (80/443) are blocked per flow only, never the whole address; other ports escalate to the whole address after
++two distinct tasks; there are budgets (20 writes/min, 512 live, 8 targets per task per hour); and `cora-firewall release
++TASK` drops what that task caused. See [docs/dyn-policy.md](docs/dyn-policy.md), and review a week of shadow data with
++`cora-floor dyn-report sentinel_decisions.jsonl` before you consider `--dyn-policy enforce`.
++
+ ### As a service
+ 
+ ```bash
+@@ -221,6 +231,8 @@ packets.
+   address.
+ - **The lockout guard is best effort.** The pre-check sees the default gateway and SSH on port 22 (or the port in
+   `$SSH_CONNECTION`); other management paths need `--floor-allow`. The dead-man is the net underneath it.
++- **Dynamic policy is only as good as the model's verdicts.** It is bounded (see docs/dyn-policy.md) but a block on a
++  web address is still a block on everything behind it, which is why web ports are flow-only and why shadow is the default.
+ - **The kernel floor is address-level.** It cannot match names, and a listed address shared with something you use is
+   dropped for everything on the host (`--floor-allow` is the remedy). Fed from the lists' addresses and subnets only,
+   unless you opt in to `--floor-dns`.
+@@ -263,14 +275,18 @@ TCP between two network namespaces, each with its own throwaway table, so the ho
+ real `/proc` decoding, and the daemon end to end; they skip without root, nft and `ip netns`, and the daemon ones also
+ need a cgroup v2 mount, or `CORA_TEST_CGROUP_MOUNT`).
+ 
++0.6.0 adds `tests/test_dynpolicy.py` (67, no kernel) and `tests/test_dyn_kernel.py` (7: real traffic is cut and
++restored by the policy's decisions; they use a public address aliased inside the lab, because the policy refuses private
++ones). `tools/dyn_bench.py` measures the per-decision cost.
++
+ ## Layout
+ 
+ ```
+-src/cora_sentinel/   daemon  netmon  nflog  nftdump  nftsets  floorguard  sockdiag  firewall  cgroup  blocklist  blocklist_store  reload  report  verdict  run  demo  selfcheck
++src/cora_sentinel/   daemon  netmon  nflog  nftdump  nftsets  floorguard  dynpolicy  sockdiag  firewall  cgroup  blocklist  blocklist_store  reload  report  verdict  run  demo  selfcheck
+ tests/               unit tests, plus kernel tests that skip without root
+ schema/              violation.schema.json (cora.security.violation/v1)
+ examples/            starter blocklists, an allow list, an example report
+-docs/                architecture.md, service.md, violation-reports.md
++docs/                architecture.md, service.md, dyn-policy.md, violation-reports.md
+ deploy/              cora-sentinel.service, cora-sentinel.conf, install-service.sh
+ ```
+ 
+diff --git a/deploy/cora-sentinel.conf b/deploy/cora-sentinel.conf
+index d5d1683..dd915e5 100644
+--- a/deploy/cora-sentinel.conf
++++ b/deploy/cora-sentinel.conf
+@@ -14,4 +14,6 @@
+ #   --floor-allow 192.168.0.0/16   your LAN, always accepted by the floor
+ #   --floor-allow-detected         allow the default gateway and live SSH peers instead of refusing
+ #   --model /var/lib/cora-sentinel/models/model.gguf   (and later --enforce, once you trust it)
++#   --dyn-policy shadow            the default with --model: records what dynamic kernel drops WOULD happen
++#   --dyn-policy enforce           only after reading `cora-floor dyn-report` (needs --model --enforce --floor)
+ CORA_ARGS=--cgroup-root /sys/fs/cgroup/cora --nft --nflog --floor --floor-confirm 120 --out /var/log/cora-sentinel/events.jsonl --decisions /var/log/cora-sentinel/decisions.jsonl --report-dir /var/lib/cora-sentinel/reports
+diff --git a/docs/dyn-policy.md b/docs/dyn-policy.md
+new file mode 100644
+index 0000000..b62a7a5
+--- /dev/null
++++ b/docs/dyn-policy.md
+@@ -0,0 +1,91 @@
++# Dynamic policy: model verdicts into kernel drops
++
++When the model isolates a task for talking to a public address, the next task to reach that address would still get its
++first packet out. `--dyn-policy` turns the verdict into a short-lived, host-wide kernel drop of that **destination**
++(the `dyn4/6` and `dynflow4/6` sets from the kernel floor). It is the riskiest thing the daemon does, so it ships in
++**shadow** and is boring and bounded on purpose.
++
++```bash
++cora-sentinel ... --model m.gguf                          # shadow is the default: decisions.jsonl gains a "dyn" field
++cora-floor dyn-report sentinel_decisions.jsonl            # after a week: what it WOULD have blocked
++cora-floor dyn                                            # the ledger: active blocks (or would-be blocks) and why
++cora-sentinel ... --model m.gguf --enforce --floor --dyn-policy enforce
++```
++
++## Why it is cautious
++
++The model is a 3B network of text, and a task controls both the address it connects to and the text the model reads
++(DNS names, its command line). A hostile task could try to talk the model into isolating it *because* it touched a
++victim address, and cutting that address off for the whole host. Everything below limits that blast radius. The target
++always comes from the event's evidence, never from the model.
++
++## Modes
++
++| Mode | Kernel | Ledger | Notes |
++|---|---|---|---|
++| `off` | untouched | none | |
++| `shadow` (default) | untouched | `dyn-ledger-shadow.json` | computes budgets, escalation and promotion exactly as enforce would, and records `would_block` etc. |
++| `enforce` | writes | `dyn-ledger-enforce.json` | needs `--model`, `--enforce`, `--floor`. Stays in shadow for any decision the adjudicator only dry-ran. |
++
++Shadow only does anything when there is an adjudicator (`--model`).
++
++## Who is eligible
++
++All of these, or the decision gets a `skipped` record with the reason and nothing is written:
++
++- the **model** chose ISOLATE (not the blocklist floor: those addresses are already in the static sets), at confidence
++  of at least `--dyn-min-conf` (0.9), the gate passed and the action ran. **ESCALATE never writes**: "needs a human"
++  must not become a host-wide kernel drop;
++- the destination is public and global, not allowed (`--floor-allow`, resolvers, the blocklist allow list) and not
++  protected (default gateway, live SSH peers);
++- the port is not infrastructure: DNS (53, 853) and NTP (123). A task using another public resolver must not make the
++  host lose DNS.
++
++## What it blocks
++
++| | First sighting | Repeat offense | Whole address (`dyn4/6`) |
++|---|---|---|---|
++| **80 / 443** (tcp and udp) | the flow, 10 min | x4, up to 24 h | **never** |
++| **other ports** | the flow, 10 min | x4, up to 24 h | after **2 distinct tasks** on non-web ports of it within an hour: 30 min, x4, up to 24 h |
++
++A *flow* is (address, protocol, port). A *repeat offense* is a hit after the block expired, or a different task hitting
++it while active (the same task again is a no-op). On web ports a flow block is nearly as wide as an address block: nft
++cannot see SNI or Host, and QUIC names are not recoverable, so it hits every site behind a shared address. The safety
++there is the TTL, the budgets and shadow mode. To block a web address for good, use the blocklist path with a human in
++the loop.
++
++## Limits
++
++20 kernel writes per minute (token bucket; a repeat offense spends one too), 512 live elements, 8 distinct targets per
++task per hour (so one noisy task cannot block the internet one verdict at a time). A denied decision records why
++(`budget`, `standing_cap`, `task_cap`). Tune with `--dyn-write-budget`, `--dyn-max-live`, `--dyn-task-cap`.
++The kernel expires every element itself; there is no cleanup thread.
++
++## Undo
++
++`cora-firewall release TASK` also drops what that task alone caused: its flow blocks, and a whole-address block that no
++longer has two distinct tasks behind it (it is demoted). Blocks another task independently caused stay. A false positive
++leaves no offense history. The promoting hit never had a flow entry of its own, so after a demotion its destination is
++blocked again (flow level, offense 1) on its next event. If the kernel refuses an unblock the entry is kept and the
++output says `dyn-unblock-FAILED`.
++
++## The ledger
++
++JSON in `--state-dir` (default `/var/lib/cora-sentinel`, mode 0700), one file per mode, under a `flock` because
++`cora-firewall release` is a different process from the daemon. It holds the blocks, the offense memory (7 days), the
++promotion window, the budget bucket and the per-task counters. An unwritable state directory falls back to memory with
++a warning; a corrupt file is set aside as `.corrupt` and replaced. The daemon reconciles it against the kernel at start
++and hourly, so an element an operator removed by hand is not remembered as blocked. It is rewritten on every decision,
++so its cost grows with its size (about 1 ms empty, about 7 ms at 500 entries on the development machine:
++`python tools/dyn_bench.py`), which is small next to a 2-4 s model call.
++
++## Reviewing shadow data before enforcing
++
++```bash
++cora-floor dyn-report sentinel_decisions.jsonl
++```
++
++Read it for: **targets on web ports** (the shared-address risk: would any of them have been a CDN you use?), the
++`skipped` reasons (a lot of `low_confidence` means the threshold is doing the work; `budget` or `task_cap` means a
++noisy task), and how often a repeat offense escalated. Switch to `enforce` when nothing in the would-block list is an
++address you would be unhappy to lose.
+diff --git a/src/cora_sentinel/__init__.py b/src/cora_sentinel/__init__.py
+index 9e0d095..f931162 100644
+--- a/src/cora_sentinel/__init__.py
++++ b/src/cora_sentinel/__init__.py
+@@ -5,4 +5,4 @@ local model (grammar-constrained) proposes a verdict; deterministic gates decide
+ See README.md.
+ """
+ 
+-__version__ = "0.5.1"
++__version__ = "0.6.0"
+diff --git a/src/cora_sentinel/daemon.py b/src/cora_sentinel/daemon.py
+index 246e204..6bc660a 100644
+--- a/src/cora_sentinel/daemon.py
++++ b/src/cora_sentinel/daemon.py
+@@ -614,6 +614,15 @@ def main() -> int:
+                     help="do not refuse a floor that would drop the default gateway or a live SSH peer")
+     ap.add_argument("--state-dir", default="/var/lib/cora-sentinel",
+                     help="where --floor-confirm keeps its state (default /var/lib/cora-sentinel)")
++    ap.add_argument("--dyn-policy", choices=("off", "shadow", "enforce"), default="shadow",
++                    help="turn the model's ISOLATE verdicts into short-lived kernel drops of the destination "
++                         "(default shadow: record what it WOULD do in the decision log, touch nothing). "
++                         "enforce needs --model, --enforce and --floor")
++    ap.add_argument("--dyn-min-conf", type=float, default=0.9, help="model confidence needed (default 0.9)")
++    ap.add_argument("--dyn-write-budget", type=int, default=20, metavar="PER_MIN",
++                    help="kernel writes per minute (default 20)")
++    ap.add_argument("--dyn-max-live", type=int, default=512, help="live dynamic elements (default 512)")
++    ap.add_argument("--dyn-task-cap", type=int, default=8, help="distinct targets per task per hour (default 8)")
+     ap.add_argument("--floor-log-group", type=int, default=72,
+                     help="NFLOG group for floor drop records (default 72; the tap is 71; unbound = discarded)")
+     ap.add_argument("--floor-out-priority", type=int, default=-5,
+@@ -647,6 +656,13 @@ def main() -> int:
+     if (a.floor or a.floor_dns) and not (a.floor and a.nft and a.cgroup_root):
+         print("[cora-sentinel] --floor needs --nft and --cgroup-root (and --floor-dns needs --floor)", file=sys.stderr)
+         return 1
++    if a.dyn_policy == "enforce" and not (a.floor and a.enforce and a.model):
++        print("[cora-sentinel] --dyn-policy enforce needs --model, --enforce and --floor "
++              "(use shadow to see what it would do first)", file=sys.stderr)
++        return 1
++    if not 0.5 <= a.dyn_min_conf <= 1.0 or min(a.dyn_write_budget, a.dyn_max_live, a.dyn_task_cap) < 1:
++        print("[cora-sentinel] bad --dyn-* limits (--dyn-min-conf 0.5-1.0, the rest at least 1)", file=sys.stderr)
++        return 1
+     if a.floor_confirm and (not a.floor or not 10 <= a.floor_confirm <= 3600):
+         print("[cora-sentinel] --floor-confirm needs --floor and a value between 10 and 3600 seconds", file=sys.stderr)
+         return 1
+@@ -672,7 +688,13 @@ def main() -> int:
+             return 1
+         print(f"[cora-sentinel] cgroup mode: {a.cgroup_root} controllers={ctl or 'none'}",
+               file=sys.stderr)
+-    floor_ref: dict = {"sync": None}       # filled in once the firewall exists (the resolver may cycle first)
++    floor_ref: dict = {"sync": None, "track": None}   # filled in once the firewall exists (the resolver may cycle first)
++
++    def reloaded(new: Blocklist) -> None:
++        if floor_ref["sync"] is not None:
++            floor_ref["sync"].on_reload(new)
++        elif floor_ref["track"] is not None:
++            floor_ref["track"].track(new)             # dyn policy in shadow without the floor: exemptions only
+ 
+     def make_resolver(target: Blocklist) -> DomainResolver:
+         r = DomainResolver(target, max_per_cycle=a.resolve_max)
+@@ -709,7 +731,7 @@ def main() -> int:
+     reloader = Reloader(s, (lambda: load_lists(a.blocklist, a.blocklist_store, a.blocklist_allow))
+                         if has_lists else None,
+                         resolver=resolver, make_resolver=None if a.no_resolve else make_resolver,
+-                        on_reload=lambda new: floor_ref["sync"] and floor_ref["sync"].on_reload(new))
++                        on_reload=reloaded)
+     reloader.start()
+     fw = None
+     if a.nft:
+@@ -739,7 +761,26 @@ def main() -> int:
+                 print(f"[cora-sentinel] --floor unusable: {e}", file=sys.stderr)
+                 return 1
+             floor_ref["sync"] = fs
+-    adj = None
++    adj = dyn = None
++    if a.model and a.dyn_policy != "off":
++        from cora_sentinel.dynpolicy import DynConfig, DynPolicy
++        fsx = floor_ref["sync"]
++        if fsx is None:                         # shadow without --floor: only the exemption checks are needed
++            from cora_sentinel.nftsets import FloorSync, NftSets
++            fsx = FloorSync(NftSets(table=a.nft_table), extra_allow=a.floor_allow,
++                            allow_detected=a.floor_allow_detected, precheck=not a.no_floor_precheck,
++                            log=lambda m: None)
++            fsx.track(bl)
++            floor_ref["track"] = fsx
++        dyn = DynPolicy(a.dyn_policy, sets=floor_ref["sync"].sets if floor_ref["sync"] else None,
++                        exempt=fsx.exempt_reason, state_dir=a.state_dir,
++                        cfg=DynConfig(min_conf=a.dyn_min_conf, write_per_min=a.dyn_write_budget,
++                                      max_live=a.dyn_max_live, task_cap=a.dyn_task_cap))
++        if a.dyn_policy == "enforce":
++            dyn.reconcile()
++        print(f"[cora-sentinel] dyn policy: {a.dyn_policy} "
++              f"({'kernel drops of model-ISOLATEd destinations, flow-level on web ports' if a.dyn_policy == 'enforce' else 'recording what it WOULD block in the decision log; nothing is written to the kernel'})",
++              file=sys.stderr)
+     if a.model:
+         from cora_sentinel.verdict import Adjudicator, Executor, Qwen3B  # lazy: heavy deps
+         reporter = None
+@@ -749,7 +790,8 @@ def main() -> int:
+         adj = Adjudicator(s.net, Qwen3B(a.model, n_threads=a.threads),
+                           Executor(enforce=a.enforce, cgroups=cg, firewall=fw), a.decisions,
+                           a.min_conf, reporter=reporter,
+-                          blocklist_floor=not a.no_blocklist_floor, contain_first=not a.no_contain_first)
++                          blocklist_floor=not a.no_blocklist_floor, contain_first=not a.no_contain_first,
++                          dyn=dyn)
+         adj.start()
+         base_emit = emit
+         emit = lambda p: (base_emit(p), adj.submit(p))  # noqa: E731
+@@ -815,6 +857,8 @@ def main() -> int:
+         n += 1
+         if floor_ref["sync"] is not None:
+             floor_ref["sync"].poll()            # reports the dead-man's outcome once
++        if dyn is not None and a.dyn_policy == "enforce" and n % 3600 == 0:
++            dyn.reconcile()                     # an operator unblock must not leave the ledger claiming a block
+         if fw and n % 60 == 0:  # housekeeping: drop rules whose task cgroup is gone
+             try:                # Firewall serializes itself; holding the registry lock across nft stalled everyone
+                 fw.gc(cg.names())
+diff --git a/src/cora_sentinel/dynpolicy.py b/src/cora_sentinel/dynpolicy.py
+new file mode 100644
+index 0000000..ff62d4a
+--- /dev/null
++++ b/src/cora_sentinel/dynpolicy.py
+@@ -0,0 +1,457 @@
++#!/usr/bin/env python3
++"""
++cora_sentinel.dynpolicy - model verdicts into the kernel's dyn sets, conservatively. Stdlib only.
++
++When the model isolates a task for talking to a public address, the NEXT task to reach that address would still
++get its first packet out. This module turns such a verdict into a short-lived, host-wide kernel drop. It is the
++riskiest thing in the daemon, because the model is a 3B network of text and a task controls both the address it
++connects to and the text the model reads: a hostile task could try to talk the model into cutting off a victim
++address. So the policy is boring and bounded on purpose.
++
++  MODES        off | shadow | enforce. SHADOW (the default) computes everything, including budgets and escalation,
++               and writes what it WOULD do into the decision log; the kernel is not touched. ENFORCE writes only when
++               the adjudicator is itself enforcing; otherwise it stays in shadow.
++
++  WHO          Only a final ISOLATE that the MODEL chose (not the blocklist floor: those addresses are already in
++               the static sets), at confidence >= 0.9, whose gate passed and whose action ran. ESCALATE ("needs a
++               human") never writes. The target comes from the event's evidence, never from the model.
++
++  NEVER        non-public addresses, anything the allow set or the lockout guard protects (gateway, SSH peers,
++               resolvers), and infrastructure ports (DNS 53/853, NTP 123): a task using another public resolver must
++               not make the host lose DNS.
++
++  WHAT         The observed flow (address, proto, port), 10 minutes, x4 on each repeat offense up to 24 h.
++               WEB PORTS (80/443): flow only, never the whole address. nft cannot see SNI or Host and QUIC names are
++               not recoverable, so a flow block on 443 hits every site behind a shared address; the safety there
++               is the TTL, the budgets and shadow mode. Promote a web address through the blocklist path, with a human.
++               OTHER PORTS: flow first; the whole address (30 min, x4 up to 24 h) once two distinct tasks have hit
++               non-web ports of it within an hour.
++
++  LIMITS       20 kernel writes per minute (token bucket), 512 live elements, 8 distinct targets per task per hour.
++               A task that goes quiet-but-noisy cannot block the internet one verdict at a time.
++
++  UNDO         `cora-firewall release TASK` drops the elements that task alone caused (and demotes a whole-address
++               block that no longer has two distinct tasks behind it). The kernel expires everything else.
++
++The ledger lives in the state directory (one file per mode, flock-guarded, because `release` is a different process
++from the daemon). It remembers offenses for 7 days so a repeat offender escalates across days.
++"""
++from __future__ import annotations
++
++import contextlib
++import fcntl
++import ipaddress
++import json
++import os
++import sys
++import threading
++import time
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Callable, Dict, Iterable, List, Optional
++
++from cora_sentinel.firewall import FirewallError
++
++WEB_PORTS = frozenset({80, 443})
++INFRA_PORTS = frozenset({53, 853, 123})
++FLOW_BASE_S, IP_BASE_S, ESCALATE, TTL_CAP_S = 600, 1800, 4, 86400
++WINDOW_S, MEMORY_S, MAX_ENTRIES = 3600, 7 * 86400, 8192
++ACTED = ("done:", "dry-run:")
++MODES = ("off", "shadow", "enforce")
++
++
++@dataclass
++class DynConfig:
++    min_conf: float = 0.9
++    write_per_min: int = 20
++    max_live: int = 512
++    task_cap: int = 8
++    promote_tasks: int = 2
++    flow_base_s: int = FLOW_BASE_S
++    ip_base_s: int = IP_BASE_S
++
++
++def _unwrap(a):
++    return a.ipv4_mapped if a.version == 6 and a.ipv4_mapped else a
++
++
++def _esc(base: int, offenses: int) -> int:
++    return int(min(base * ESCALATE ** max(0, offenses - 1), TTL_CAP_S))
++
++
++def _active(e: Optional[dict], now: float) -> bool:
++    return bool(e) and e["expires"] > now
++
++
++# --------------------------------------------------------------------------
++# the ledger
++# --------------------------------------------------------------------------
++class DynLedger:
++    """A small JSON document under a flock. path=None keeps it in memory (an unwritable state directory)."""
++
++    def __init__(self, path: Optional[str]):
++        self.path = Path(path) if path else None
++        self._mem: dict = {}
++        self._tlock = threading.RLock()
++
++    @staticmethod
++    def empty() -> dict:
++        return {"v": 1, "flows": {}, "ips": {}, "watch": {}, "targets": {}}
++
++    def _load(self) -> dict:
++        if self.path is None:
++            return self._mem or self.empty()
++        try:
++            doc = json.loads(self.path.read_text())
++            if isinstance(doc, dict) and doc.get("v") == 1:
++                for k, v in self.empty().items():
++                    doc.setdefault(k, v)
++                return doc
++        except FileNotFoundError:
++            pass
++        except (OSError, ValueError):
++            with contextlib.suppress(OSError):
++                os.replace(self.path, str(self.path) + ".corrupt")          # keep it for a human; start clean
++        return self.empty()
++
++    def _save(self, doc: dict) -> None:
++        if self.path is None:
++            self._mem = doc
++            return
++        tmp = Path(str(self.path) + ".tmp")
++        tmp.write_text(json.dumps(doc, separators=(",", ":")))
++        os.chmod(tmp, 0o600)
++        os.replace(tmp, self.path)
++
++    @contextlib.contextmanager
++    def txn(self):
++        with self._tlock:
++            fd = None
++            if self.path is not None:
++                self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
++                fd = os.open(str(self.path) + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
++                fcntl.flock(fd, fcntl.LOCK_EX)
++            try:
++                doc = self._load()
++                yield doc
++                self._save(doc)                 # not reached if the body raised: nothing half-written
++            finally:
++                if fd is not None:
++                    os.close(fd)
++
++    def read(self) -> dict:
++        with self._tlock:
++            return self._load()
++
++
++def _ledger_path(state_dir: Optional[str], eff: str) -> Optional[str]:
++    return str(Path(state_dir) / f"dyn-ledger-{eff}.json") if state_dir else None
++
++
++# --------------------------------------------------------------------------
++# the policy
++# --------------------------------------------------------------------------
++class DynPolicy:
++    def __init__(self, mode: str = "shadow", sets=None, exempt: Optional[Callable[[str], Optional[str]]] = None,
++                 state_dir: Optional[str] = None, cfg: Optional[DynConfig] = None,
++                 clock: Callable[[], float] = time.time,
++                 log: Callable[[str], None] = lambda m: print(f"[cora-sentinel] {m}", file=sys.stderr, flush=True)):
++        if mode not in MODES:
++            raise ValueError(f"bad dyn policy {mode!r}")
++        self.mode, self.sets, self.exempt, self.cfg, self.clock, self.log = mode, sets, exempt, cfg or DynConfig(), clock, log
++        self.state_dir = state_dir
++        self._ledgers: Dict[str, DynLedger] = {}
++        self.stats = {"blocked": 0, "would_block": 0, "skipped": 0, "failed": 0}
++
++    def _ledger(self, eff: str) -> DynLedger:
++        if eff not in self._ledgers:
++            path = _ledger_path(self.state_dir, eff)
++            try:
++                if path:
++                    Path(path).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
++            except OSError as e:
++                self.log(f"dyn policy: state directory not writable ({e}); keeping the {eff} ledger in memory only")
++                path = None
++            self._ledgers[eff] = DynLedger(path)
++        return self._ledgers[eff]
++
++    # ---- the one entry point ----
++    def consider(self, ev: dict, d: dict) -> Optional[dict]:
++        """Called by the adjudicator with the event and its decision. Returns the record to store under
++        decision['dyn'], or None when this decision is not the policy's business. Raises nothing the caller must
++        handle beyond what it already catches."""
++        if self.mode == "off" or d.get("final") != "ISOLATE":
++            return None
++        m = d.get("model") or {}
++        if m.get("verdict") != "ISOLATE":
++            return None                                   # the floor or a fallback isolated it, not the model
++        skip = self._skip
++        act = str(d.get("action", ""))
++        if not act.startswith(ACTED):
++            return skip("not_acted")                      # the gate refused, or the action failed
++        evd = (ev.get("anomaly") or {}).get("evidence") or {}
++        if evd.get("blocklist"):
++            return skip("blocklist")                      # already in the static sets
++        if float(m.get("confidence", 0.0)) < self.cfg.min_conf:
++            return skip("low_confidence")
++        try:
++            ip = _unwrap(ipaddress.ip_address(str(evd.get("remote_ip", ""))))
++            port = int(evd.get("remote_port"))
++        except (ValueError, TypeError):
++            return skip("no_destination")
++        if evd.get("dest_class", "public") != "public" or not ip.is_global:
++            return skip(f"dest_class:{evd.get('dest_class', 'non-global')}")
++        proto = str(evd.get("proto", "tcp")).lower()
++        if proto not in ("tcp", "udp") or not 0 < port < 65536:
++            return skip("bad_flow")
++        if port in INFRA_PORTS:
++            return skip("infra_port")
++        why = self.exempt(str(ip)) if self.exempt else None
++        if why:
++            return skip(why)
++        subj = ev.get("subject") or {}
++        task = subj.get("cgroup") or subj.get("name") or str(subj.get("pid"))
++        eff = "enforce" if (self.mode == "enforce" and act.startswith("done:") and self.sets is not None) else "shadow"
++        led = self._ledger(eff)
++        with led.txn() as L:
++            rec = self._decide(L, eff, ip, proto, port, str(task))
++        self.stats[{"blocked": "blocked", "refreshed": "blocked", "promoted": "blocked", "would_block": "would_block",
++                    "would_refresh": "would_block", "would_promote": "would_block", "failed": "failed"}
++                   .get(rec["result"], "skipped")] += 1
++        return rec
++
++    def _skip(self, reason: str) -> dict:
++        self.stats["skipped"] += 1
++        return {"mode": self.mode, "result": "skipped", "reason": reason}
++
++    # ---- budgets ----
++    def _take(self, L: dict, now: float) -> bool:
++        cap = float(self.cfg.write_per_min)
++        b = L.setdefault("bucket", {"tokens": cap, "ts": now})
++        b["tokens"] = min(cap, b["tokens"] + max(0.0, now - b["ts"]) * cap / 60.0)
++        b["ts"] = now
++        if b["tokens"] >= 1.0:
++            b["tokens"] -= 1.0
++            return True
++        return False
++
++    @staticmethod
++    def _live(L: dict, now: float) -> int:
++        return sum(1 for k in ("flows", "ips") for e in L[k].values() if _active(e, now))
++
++    def _task_ok(self, L: dict, task: str, key: str, now: float) -> bool:
++        lst = [x for x in L["targets"].get(task, []) if x[0] > now - WINDOW_S]
++        L["targets"][task] = lst
++        keys = {k for _, k in lst}
++        return key in keys or len(keys) < self.cfg.task_cap
++
++    @staticmethod
++    def _note(L: dict, task: str, key: str, now: float) -> None:
++        L["targets"].setdefault(task, []).append([now, key])
++
++    # ---- the kernel write (enforce only) ----
++    def _write(self, eff: str, kind: str, ip, proto: str, port: int, ttl: int) -> Optional[str]:
++        if eff != "enforce":
++            return None
++        try:
++            if kind == "ip":
++                self.sets.block_ip(str(ip), ttl)
++            else:
++                self.sets.block_flow(str(ip), proto, port, ttl)       # re-adding an element refreshes its timeout
++        except (FirewallError, ValueError, OSError) as e:
++            return f"{e.__class__.__name__}: {e}"[:140]
++        return None
++
++    # ---- the decision ----
++    def _decide(self, L: dict, eff: str, ip, proto: str, port: int, task: str) -> dict:
++        now, cfg = self.clock(), self.cfg
++        self._prune(L, now)                            # first: a week-old offense must not be read as memory
++        ip_s, web = str(ip), port in WEB_PORTS
++        fkey = f"{ip_s}|{proto}|{port}"
++        flows, ips = L["flows"], L["ips"]
++        verb = (lambda a, w: a if eff == "enforce" else w)                                 # noqa: E731
++        base = {"mode": eff, "web": web, "port": port, "proto": proto}
++
++        ntasks = 0
++        if not web:                                    # only non-web hits count towards a whole-address block
++            w = {t: ts for t, ts in L["watch"].get(ip_s, {}).items() if ts > now - WINDOW_S}
++            w[task] = now
++            L["watch"][ip_s] = w
++            ntasks = len(w)
++        ie, fe = ips.get(ip_s), flows.get(fkey)
++        ip_active = _active(ie, now)
++
++        def finish(rec: dict) -> dict:
++            self._prune(L, now)
++            return {**base, **rec}
++
++        # a block that already covers this flow: dedupe, or a repeat offense by a NEW task
++        covering = ie if ip_active else (fe if _active(fe, now) else None)
++        if covering is not None and not (not web and not ip_active and ntasks >= cfg.promote_tasks):
++            kind, key = ("ip", ip_s) if ip_active else ("flow", fkey)
++            covering["last"] = now
++            covering["hits"] += 1
++            if task in covering["tasks"]:
++                covering["tasks"][task] = now
++                return finish({"result": "dedupe", "kind": kind, "key": key, "tasks": len(covering["tasks"])})
++            covering["tasks"][task] = now
++            if not self._take(L, now):
++                return finish({"result": "skipped", "reason": "budget", "kind": kind, "key": key})
++            off = covering["offenses"] + 1
++            ttl = _esc(cfg.ip_base_s if kind == "ip" else cfg.flow_base_s, off)
++            err = self._write(eff, kind, ip, proto, port, ttl)
++            if err:
++                return finish({"result": "failed", "error": err, "kind": kind, "key": key})
++            covering.update(offenses=off, ttl_s=ttl, expires=now + ttl)
++            self._note(L, task, key, now)
++            return finish({"result": verb("refreshed", "would_refresh"), "kind": kind, "key": key, "ttl_s": ttl,
++                           "offense": off, "tasks": len(covering["tasks"])})
++
++        # a new element: promote to the whole address, or block the flow
++        promote = (not web) and ntasks >= cfg.promote_tasks
++        kind, key, table, prev = (("ip", ip_s, ips, ie) if promote else ("flow", fkey, flows, fe))
++        if self._live(L, now) >= cfg.max_live:
++            return finish({"result": "skipped", "reason": "standing_cap", "kind": kind, "key": key})
++        if not self._task_ok(L, task, key, now):
++            return finish({"result": "skipped", "reason": "task_cap", "kind": kind, "key": key})
++        if not self._take(L, now):
++            return finish({"result": "skipped", "reason": "budget", "kind": kind, "key": key})
++        off = (prev["offenses"] if prev else 0) + 1
++        ttl = _esc(cfg.ip_base_s if promote else cfg.flow_base_s, off)
++        err = self._write(eff, kind, ip, proto, port, ttl)
++        if err:
++            return finish({"result": "failed", "error": err, "kind": kind, "key": key})
++        tasks = dict(L["watch"][ip_s]) if promote else {task: now}
++        entry = {"ip": ip_s, "tasks": tasks, "first": prev["first"] if prev else now, "last": now,
++                 "hits": (prev["hits"] if prev else 0) + 1, "offenses": off, "ttl_s": ttl, "expires": now + ttl}
++        if kind == "flow":
++            entry.update(proto=proto, port=port)
++        table[key] = entry
++        self._note(L, task, key, now)
++        return finish({"result": verb("promoted" if promote else "blocked",
++                                      "would_promote" if promote else "would_block"),
++                       "kind": kind, "key": key, "ttl_s": ttl, "offense": off, "tasks": len(tasks)})
++
++    def _prune(self, L: dict, now: float) -> None:
++        for name in ("flows", "ips"):
++            t = L[name]
++            for k in [k for k, e in t.items() if e["expires"] <= now and e["last"] < now - MEMORY_S]:
++                del t[k]
++        total = len(L["flows"]) + len(L["ips"])
++        if total > MAX_ENTRIES:                                # bound the file: oldest EXPIRED entries go first
++            dead = sorted(((e["last"], name, k) for name in ("flows", "ips") for k, e in L[name].items()
++                           if e["expires"] <= now))
++            for _, name, k in dead[:total - MAX_ENTRIES]:
++                del L[name][k]
++        for ipk in list(L["watch"]):
++            L["watch"][ipk] = {t: ts for t, ts in L["watch"][ipk].items() if ts > now - WINDOW_S}
++            if not L["watch"][ipk]:
++                del L["watch"][ipk]
++        for t in list(L["targets"]):
++            L["targets"][t] = [x for x in L["targets"][t] if x[0] > now - WINDOW_S]
++            if not L["targets"][t]:
++                del L["targets"][t]
++
++    # ---- keeping the ledger honest ----
++    def reconcile(self) -> int:
++        """Mark ledger entries whose kernel element has vanished (an operator unblocked it, the floor was removed) as
++        expired, so a new hit blocks again instead of being deduplicated against a block that is not there."""
++        if self.sets is None:
++            return 0
++        try:
++            live_f, live_i = self.sets.live_flows(), self.sets.live_ips()
++        except FirewallError:
++            return 0                                                                  # no floor: nothing to compare
++        now, n = self.clock(), 0
++        with self._ledger("enforce").txn() as L:
++            for table, live in ((L["flows"], live_f), (L["ips"], live_i)):
++                for key, e in table.items():
++                    if _active(e, now) and key not in live:
++                        e["expires"], e["vanished"], n = now, True, n + 1
++        if n:
++            self.log(f"dyn policy: {n} ledger entr{'y' if n == 1 else 'ies'} no longer in the kernel; will block again on a new hit")
++        return n
++
++
++# --------------------------------------------------------------------------
++# undo and review
++# --------------------------------------------------------------------------
++def release_entries(task: str, state_dir: Optional[str], sets=None, promote_tasks: int = 2,
++                    clock: Callable[[], float] = time.time) -> List[str]:
++    """Drop what `task` alone caused. Used by `cora-firewall release`. Returns what it undid, for printing."""
++    undone: List[str] = []
++    now = clock()
++    for eff in ("enforce", "shadow"):
++        path = _ledger_path(state_dir, eff)
++        if not path or not Path(path).exists():
++            continue
++        with DynLedger(path).txn() as L:
++            def drop(table: dict, key: str, e: dict, label: str, task_ts: float) -> None:
++                """Remove one entry. If the kernel refuses, put the task back so a retry still finds it."""
++                if _active(e, now) and eff == "enforce" and sets is not None:
++                    try:
++                        if label == "ip":
++                            sets.unblock_ip(e["ip"])
++                        else:
++                            sets.unblock_flow(e["ip"], e["proto"], e["port"])
++                    except (FirewallError, ValueError, OSError) as err:
++                        e["tasks"][task] = task_ts
++                        undone.append(f"dyn-unblock-FAILED:{key}:{err}")
++                        return
++                    undone.append(f"dyn-{label}-unblocked:{key}")
++                elif _active(e, now) and eff == "shadow":
++                    undone.append(f"dyn-{label}-dropped(shadow):{key}")
++                del table[key]
++            for key, e in list(L["flows"].items()):
++                if task in e["tasks"]:
++                    ts = e["tasks"].pop(task)
++                    if not e["tasks"]:
++                        drop(L["flows"], key, e, "flow", ts)
++            for key, e in list(L["ips"].items()):
++                if task in e["tasks"]:
++                    ts = e["tasks"].pop(task)
++                    if len(e["tasks"]) < promote_tasks:        # its promotion no longer has two distinct tasks behind it
++                        drop(L["ips"], key, e, "ip", ts)
++            for ipk in list(L["watch"]):
++                L["watch"][ipk].pop(task, None)
++            L["targets"].pop(task, None)
++    return undone
++
++
++def make_release(fw, state_dir: Optional[str]) -> Callable[[str], List[str]]:
++    from cora_sentinel.nftsets import NftSets
++    sets = NftSets.from_firewall(fw)
++    return lambda name: release_entries(name, state_dir, sets)
++
++
++def summarize_decisions(lines: Iterable[str]) -> dict:
++    """What shadow mode would have done, from decisions.jsonl: the data for the shadow-to-enforce call."""
++    res: Dict[str, int] = {}
++    reasons: Dict[str, int] = {}
++    keys: Dict[str, dict] = {}
++    n_dyn = n_isolate = 0
++    for line in lines:
++        try:
++            d = json.loads(line)
++        except ValueError:
++            continue
++        if d.get("final") == "ISOLATE":
++            n_isolate += 1
++        r = d.get("dyn")
++        if not r:
++            continue
++        n_dyn += 1
++        res[r["result"]] = res.get(r["result"], 0) + 1
++        if r["result"] == "skipped":
++            reasons[r.get("reason", "?")] = reasons.get(r.get("reason", "?"), 0) + 1
++        if "key" in r:
++            k = keys.setdefault(r["key"], {"n": 0, "web": r.get("web"), "kind": r.get("kind"), "max_ttl_s": 0})
++            k["n"] += 1
++            k["max_ttl_s"] = max(k["max_ttl_s"], r.get("ttl_s", 0))
++    top = sorted(keys.items(), key=lambda kv: -kv[1]["n"])
++    return {"isolate_decisions": n_isolate, "with_dyn_record": n_dyn, "results": res, "skipped_reasons": reasons,
++            "targets": len(keys), "web_targets": sum(1 for _, v in top if v["web"]), "top": top[:20]}
++
++
++if __name__ == "__main__":
++    sys.exit("run `cora-floor dyn` or `cora-floor dyn-report` instead")
+diff --git a/src/cora_sentinel/firewall.py b/src/cora_sentinel/firewall.py
+index b7e8688..d911d99 100644
+--- a/src/cora_sentinel/firewall.py
++++ b/src/cora_sentinel/firewall.py
+@@ -261,8 +261,10 @@ class Firewall:
+         # rc != 0 just means the table was not there
+ 
+ 
+-def release_task(cg: CgroupRoot, fw: Firewall, name: str) -> List[str]:
+-    """The review action: undo every containment measure on a task."""
++def release_task(cg: CgroupRoot, fw: Firewall, name: str,
++                 dyn: Optional[Callable[[str], List[str]]] = None) -> List[str]:
++    """The review action: undo every containment measure on a task. `dyn` (cora_sentinel.dynpolicy.make_release)
++    also drops the dynamic kernel entries that task alone caused."""
+     undone: List[str] = []
+     if cg.freeze_requested(name) or cg.is_frozen(name):   # requested, not just completed: freezing is async
+         cg.thaw(name)
+@@ -270,6 +272,11 @@ def release_task(cg: CgroupRoot, fw: Firewall, name: str) -> List[str]:
+     if fw.unblock(name):
+         undone.append("egress-unblocked")
+     undone += cg.reset_limits(name)
++    if dyn is not None:
++        try:
++            undone += dyn(name)
++        except Exception as e:                      # the task is already released; say what did not happen
++            undone.append(f"dyn-release-FAILED:{e.__class__.__name__}")
+     return undone
+ 
+ 
+@@ -297,7 +304,13 @@ def main() -> int:
+             print("unblocked" if fw.unblock(a[1]) else "was not blocked")
+             return 0
+         if len(a) == 2 and a[0] == "release":
+-            print("released:", release_task(cg, fw, a[1]) or "nothing to undo")
++            dyn = None
++            try:
++                from cora_sentinel.dynpolicy import make_release
++                dyn = make_release(fw, os.environ.get("CORA_STATE_DIR", "/var/lib/cora-sentinel"))
++            except Exception:
++                pass
++            print("released:", release_task(cg, fw, a[1], dyn) or "nothing to undo")
+             return 0
+     except (FirewallError, CgroupError, OSError) as e:
+         print(f"error: {e}", file=sys.stderr)
+diff --git a/src/cora_sentinel/nftsets.py b/src/cora_sentinel/nftsets.py
+index 3940b5f..1230ae5 100644
+--- a/src/cora_sentinel/nftsets.py
++++ b/src/cora_sentinel/nftsets.py
+@@ -42,6 +42,7 @@ import os
+ import re
+ import sys
+ import threading
++import time
+ from pathlib import Path
+ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+ 
+@@ -323,6 +324,31 @@ class NftSets:
+         self._script(f"add element inet {self.table} dynflow{a.version} "
+                      f"{{ {a} . {p} . {int(port)} timeout {t}s }}\n")
+ 
++    def unblock_flow(self, ip: str, proto: str, port: int) -> bool:
++        a, p = self._addr(ip), PROTOS.get(str(proto).lower())
++        if p is None or not 0 < int(port) < 65536:
++            raise ValueError("bad flow")
++        try:
++            self._script(f"delete element inet {self.table} dynflow{a.version} {{ {a} . {p} . {int(port)} }}\n")
++        except FirewallError as e:
++            if "No such file" in str(e) or "does not exist" in str(e):
++                return False
++            raise
++        return True
++
++    def live_flows(self) -> Set[str]:
++        """'ip|proto|port' for every live dynflow element (the ledger's key format)."""
++        out: Set[str] = set()
++        for v in (4, 6):
++            for tok in self.list_set(f"dynflow{v}"):
++                parts = [x.strip() for x in tok.split(" . ")]
++                if len(parts) == 3:
++                    out.add(f"{_unwrap(ipaddress.ip_address(parts[0]))}|{parts[1]}|{parts[2]}")
++        return out
++
++    def live_ips(self) -> Set[str]:
++        return {str(_unwrap(ipaddress.ip_address(t))) for v in (4, 6) for t in self.list_set(f"dyn{v}")}
++
+     # ---- reading back ------------------------------------------------------
+     def drop_counts(self) -> Dict[str, int]:
+         """Packets dropped by the floor, per direction, from the drop rules' counters."""
+@@ -395,6 +421,7 @@ class FloorSync:
+         self._protect = protect or floorguard.protected_addresses
+         self.guard, self.token, self.disabled, self._reported = guard, None, False, False
+         self._lock = threading.Lock()
++        self.bl, self._exempt_cache = None, None             # the list in force, for exempt_reason()
+ 
+     # ---- what goes where ----
+     def configured_allow(self, bl) -> List[str]:
+@@ -431,6 +458,24 @@ class FloorSync:
+         return floorguard.fingerprint(self.sets.table, self.sets.in_priority, self.sets.out_priority,
+                                       self.configured_allow(bl))
+ 
++    # ---- what the dynamic policy must never block ----
++    def track(self, bl) -> None:
++        """Remember the list in force without touching the kernel (dyn policy in shadow, no --floor)."""
++        self.bl, self._exempt_cache = bl, None
++
++    def exempt_reason(self, ip: str) -> Optional[str]:
++        """Why a dynamic verdict must NOT block this address: protected (gateway, SSH peer) or allowed (loopback,
++        resolvers, --floor-allow, the blocklist allow list). None = not exempt. Cached for 5 s."""
++        now = time.monotonic()
++        c = self._exempt_cache
++        if c is None or now - c[0] > 5.0 or c[3] is not self.bl:
++            c = self._exempt_cache = (now, floorguard.net_index(self._allow_effective(self.bl)), self._protect(), self.bl)
++        _, idx, prot, _ = c
++        if ip in prot:
++            return f"protected:{prot[ip]}"
++        hit = floorguard.covering(ip, idx)
++        return f"allowed:{hit}" if hit else None
++
+     # ---- the pre-check ----
+     def conflicts(self, bl) -> List[str]:
+         if not self.precheck:
+@@ -461,6 +506,7 @@ class FloorSync:
+         """Full reconcile. Raises FirewallError (FloorRefused for a pre-check failure) if it cannot."""
+         with self._lock:
+             self._refuse_on_conflicts(bl)
++            self.track(bl)
+             if bl is not None and bl.allow is not None and bl.allow.domains:
+                 self.log("floor: allow-list DOMAINS are not mirrored into the kernel (only subnets and addresses)")
+             r = self.sets.reconcile(self.static_entries(bl), self._allow_effective(bl),
+@@ -528,6 +574,7 @@ class FloorSync:
+                 self._refuse_on_conflicts(bl, "reload")
+                 a = self.sets.sync_allow(self._allow_effective(bl))
+                 s = self.sets.sync_static(self.static_entries(bl))
++                self.track(bl)
+                 self.log(f"floor reloaded: allow +{a[0]}/-{a[1]}, static +{s[0]}/-{s[1]}")
+             except FloorRefused as e:
+                 self.log(f"floor reload REFUSED, keeping the previous sets: {e}")
+@@ -561,6 +608,10 @@ def main(argv: Optional[List[str]] = None) -> int:
+     sub.add_parser("confirm", help="keep the floor that --floor-confirm is waiting on")
+     sub.add_parser("unconfirm", help="forget the confirmed allow set, so the next start asks for confirmation again")
+     sub.add_parser("pending", help="seconds left to confirm, or 'none'")
++    p = sub.add_parser("dyn", help="the dynamic-policy ledger: what is blocked (or would be, in shadow) and why")
++    p.add_argument("--mode", choices=("shadow", "enforce"), action="append")
++    p = sub.add_parser("dyn-report", help="summarise what the dynamic policy did or would have done, from decisions.jsonl")
++    p.add_argument("decisions")
+     sub.add_parser("rollback", help="remove the floor IF it is still awaiting confirmation (the unit's ExecStopPost)")
+     p = sub.add_parser("watchdog", help=argparse.SUPPRESS)           # internal: the detached rollback timer
+     p.add_argument("token"); p.add_argument("seconds", type=float)
+@@ -595,6 +646,31 @@ def main(argv: Optional[List[str]] = None) -> int:
+         elif a.cmd == "pending":
+             left = floorguard.FloorGuard(a.state_dir).remaining()
+             print("none" if left is None else f"{left:.0f}s left to confirm")
++        elif a.cmd == "dyn":
++            from cora_sentinel import dynpolicy
++            now = time.time()
++            for eff in (a.mode or ["enforce", "shadow"]):
++                path = dynpolicy._ledger_path(a.state_dir, eff)
++                if not path or not Path(path).exists():
++                    print(f"[{eff}] no ledger")
++                    continue
++                L = dynpolicy.DynLedger(path).read()
++                live = [(k, e, t) for t, tbl in (("flow", L["flows"]), ("ip", L["ips"])) for k, e in tbl.items()
++                        if dynpolicy._active(e, now)]
++                print(f"[{eff}] {len(live)} active of {len(L['flows']) + len(L['ips'])} remembered")
++                for k, e, t in sorted(live, key=lambda x: -x[1]["expires"]):
++                    print(f"  {t:<4} {k:<46} {e['expires'] - now:>7.0f}s left  offense {e['offenses']}  "
++                          f"tasks {len(e['tasks'])}  hits {e['hits']}")
++        elif a.cmd == "dyn-report":
++            from cora_sentinel import dynpolicy
++            with open(a.decisions) as fh:
++                r = dynpolicy.summarize_decisions(fh)
++            print(f"ISOLATE decisions {r['isolate_decisions']}, with a dyn record {r['with_dyn_record']}")
++            print("results  " + (", ".join(f"{k} {v}" for k, v in sorted(r['results'].items())) or "none"))
++            print("skipped  " + (", ".join(f"{k} {v}" for k, v in sorted(r['skipped_reasons'].items())) or "none"))
++            print(f"targets  {r['targets']} ({r['web_targets']} on web ports)")
++            for k, v in r["top"]:
++                print(f"  {v['n']:>4}x {v['kind']:<4} {k:<46} {'web' if v['web'] else '   '} max ttl {v['max_ttl_s']}s")
+         elif a.cmd == "rollback":
+             g = floorguard.FloorGuard(a.state_dir)
+             print("floor removed (it was never confirmed)" if g.rollback(reason="rollback requested")
+diff --git a/src/cora_sentinel/verdict.py b/src/cora_sentinel/verdict.py
+index 0aedce5..c1cd4e2 100644
+--- a/src/cora_sentinel/verdict.py
++++ b/src/cora_sentinel/verdict.py
+@@ -168,8 +168,9 @@ class Adjudicator:
+     def __init__(self, net: VirtualNet, model, executor: Executor,
+                  decisions_path: Optional[str] = None, min_conf: float = 0.6,
+                  sink: Optional[Callable[[dict], None]] = None,
+-                 reporter=None, blocklist_floor: bool = True, contain_first: bool = True):
++                 reporter=None, blocklist_floor: bool = True, contain_first: bool = True, dyn=None):
+         self.reporter, self.blocklist_floor = reporter, blocklist_floor
++        self.dyn = dyn                                    # cora_sentinel.dynpolicy.DynPolicy, or None
+         # Contain a blocklist hit at submit() time, before it queues behind the model. The floor in handle()
+         # guarantees at least ISOLATE for these whatever the model says, so this changes WHEN, not whether.
+         self.contain_first = contain_first
+@@ -257,6 +258,13 @@ class Adjudicator:
+                     d["contained_ms"] = first
+         elif final == "ESCALATE":
+             d["action"] = "needs-human"
++        if self.dyn is not None:                          # shadow or enforce; a failure here must never break adjudication
++            try:
++                rec = self.dyn.consider(ev, d)
++                if rec:
++                    d["dyn"] = rec
++            except Exception as e:
++                d["dyn"] = {"result": "error", "error": f"{e.__class__.__name__}: {str(e)[:100]}"}
+         self._record(d)
+         if bl and self.reporter:
+             try:
+diff --git a/tests/test_dyn_kernel.py b/tests/test_dyn_kernel.py
+new file mode 100644
+index 0000000..3c27183
+--- /dev/null
++++ b/tests/test_dyn_kernel.py
+@@ -0,0 +1,108 @@
++"""0.6.0 on a real kernel: the dynamic policy's decisions really cut (and stop cutting) real traffic.
++
++The lab is test_floor_gate's (two namespaces, a throwaway table). The target must be a GLOBAL address, because the policy
++refuses private ones by design, so the server namespace also answers for 45.33.32.156 (a public address, aliased on its
++veth and routed to from the client); the listener binds 0.0.0.0 so both it and the lab's private address work.
++Skips without root, nft and `ip netns`. Run: sudo -E $(which python) -m pytest -q tests/test_dyn_kernel.py
++"""
++import time
++
++import pytest
++
++from cora_sentinel import dynpolicy
++from cora_sentinel.dynpolicy import DynConfig, DynPolicy
++
++from test_dynpolicy import mk
++from test_floor_gate import PORT, S_IP, TABLE, Lab, kernel, ns_runner, sh
++
++G = "45.33.32.156"
++KEY = lambda port, proto="tcp": f"{G}|{proto}|{port}"            # noqa: E731
++
++
++@pytest.fixture
++def lab(tmp_path):
++    lb = Lab(tmp_path, ports=(PORT, 80, 443, 8080, 9090), bind="0.0.0.0")
++    sh("ip", "-n", lb.s, "addr", "add", f"{G}/32", "dev", lb.vs)
++    sh("ip", "-n", lb.c, "route", "add", f"{G}/32", "via", S_IP)
++    yield lb
++    lb.close()
++
++
++def setup(lab, tmp_path, mode="enforce", **cfg):
++    floor = lab.floor(lab.c)
++    pol = DynPolicy(mode, sets=floor, state_dir=str(tmp_path / "st"), log=lambda m: None,
++                    cfg=DynConfig(write_per_min=1000, task_cap=1000, **cfg))
++    return floor, pol
++
++
++def hit(pol, task="t0", port=443, **kw):
++    return pol.consider(*mk(task=task, ip=G, port=port, **kw))
++
++
++@kernel
++def test_the_lab_reaches_the_public_address(lab):
++    assert lab.connect(3, 8080, ip=G) == 3                            # the control for everything below
++
++
++@kernel
++def test_a_model_isolate_cuts_the_flow_only_and_the_kernel_expires_it(lab, tmp_path):
++    floor, pol = setup(lab, tmp_path, flow_base_s=3)
++    assert hit(pol, port=8080)["result"] == "blocked"
++    assert lab.connect(5, 8080, ip=G) == 0                            # the first packet to the flow is already dropped
++    assert lab.connect(5, 9090, ip=G) == 5                            # the same address, another port: untouched
++    assert lab.connect(5, 8080, ip=S_IP) == 5                         # the lab's other address: untouched
++    assert floor.live_flows() == {KEY(8080)}                          # the real nft JSON round-trips into the ledger's key
++    time.sleep(3.6)
++    assert lab.connect(5, 8080, ip=G) == 5, "the kernel did not expire the element"
++
++
++@kernel
++def test_web_ports_stay_flow_only_even_with_several_tasks_and_a_repeat_offense_extends_the_ttl(lab, tmp_path):
++    floor, pol = setup(lab, tmp_path, flow_base_s=2)
++    t0 = time.time()
++    assert hit(pol, "a", 443)["ttl_s"] == 2
++    time.sleep(1.0)
++    r = hit(pol, "b", 443)                                            # a new task on the active block: offense 2, ttl x4
++    assert r["result"] == "refreshed" and r["ttl_s"] == 8 and r["kind"] == "flow"
++    hit(pol, "c", 443)
++    assert floor.status()["dyn4"] == 0, "a web address was promoted to a whole-address block"
++    time.sleep(max(0.0, 3.0 - (time.time() - t0)))                    # past the ORIGINAL 2 s: only the refresh keeps it
++    assert lab.connect(5, 443, ip=G) == 0, "the refreshed element expired at its old deadline"
++    assert lab.connect(5, 80, ip=G) == 5                              # port 80 of the same address was never listed
++
++
++@kernel
++def test_two_distinct_tasks_on_non_web_ports_block_the_whole_address(lab, tmp_path):
++    floor, pol = setup(lab, tmp_path)
++    assert hit(pol, "a", 8080)["kind"] == "flow"
++    assert hit(pol, "b", 9090)["result"] == "promoted"
++    assert floor.live_ips() == {G}
++    assert lab.connect(5, PORT, ip=G) == 0 and lab.connect(5, 80, ip=G) == 0     # every port of it, even ones nobody hit
++    assert lab.connect(5, PORT, ip=S_IP) == 5                                    # but not the lab's other address
++
++
++@kernel
++def test_release_restores_traffic_at_once(lab, tmp_path):
++    floor, pol = setup(lab, tmp_path)
++    hit(pol, "a", 8080)
++    assert lab.connect(5, 8080, ip=G) == 0
++    assert dynpolicy.release_entries("a", str(tmp_path / "st"), floor) == [f"dyn-flow-unblocked:{KEY(8080)}"]
++    assert lab.connect(5, 8080, ip=G) == 5 and floor.live_flows() == set()
++
++
++@kernel
++def test_an_operator_unblock_is_noticed_and_the_next_hit_blocks_again(lab, tmp_path):
++    floor, pol = setup(lab, tmp_path)
++    hit(pol, "a", 8080)
++    assert floor.unblock_flow(G, "tcp", 8080) is True                 # cora-floor / a flush, behind the ledger's back
++    assert lab.connect(3, 8080, ip=G) == 3
++    assert pol.reconcile() == 1
++    assert hit(pol, "a", 8080)["result"] == "blocked" and lab.connect(5, 8080, ip=G) == 0
++
++
++@kernel
++def test_shadow_decides_everything_and_changes_nothing(lab, tmp_path):
++    floor, pol = setup(lab, tmp_path, mode="shadow")
++    assert hit(pol, "a", 8080)["result"] == "would_block" and hit(pol, "b", 9090)["result"] == "would_promote"
++    assert lab.connect(5, 8080, ip=G) == 5 and lab.connect(5, 9090, ip=G) == 5
++    assert floor.live_flows() == set() and floor.live_ips() == set()
+diff --git a/tests/test_dynpolicy.py b/tests/test_dynpolicy.py
+new file mode 100644
+index 0000000..84c0a9f
+--- /dev/null
++++ b/tests/test_dynpolicy.py
+@@ -0,0 +1,510 @@
++"""The dynamic policy (model ISOLATE -> short-lived kernel drops) without a kernel: a fake nft, a fake clock, a real
++ledger file. Real-packet versions are in test_dyn_kernel.py. Run: pytest -q tests/test_dynpolicy.py"""
++import json
++
++import pytest
++
++from cora_sentinel import dynpolicy, nftsets
++from cora_sentinel.daemon import build_payload, read_starttime
++from cora_sentinel.dynpolicy import DynConfig, DynLedger, DynPolicy
++from cora_sentinel.firewall import FirewallError, release_task
++from cora_sentinel.nftsets import FloorSync, NftSets
++
++from test_nftsets import FakeNft, bl_with
++from test_verdict import FakeFw, GateModel, pipeline, procs, verdict      # noqa: F401  (procs is a fixture)
++
++
++class Clock:
++    def __init__(self, t=1_800_000_000.0):
++        self.t = t
++
++    def __call__(self):
++        return self.t
++
++    def advance(self, s):
++        self.t += s
++
++
++def mk(task="t0", ip="45.33.32.156", port=443, proto="tcp", conf=0.95, action="done:ISOLATE@cgroup:t0[nft-drop-egress]",
++       dest_class="public", blocklist=False, model="ISOLATE", final="ISOLATE"):
++    evd = {"remote_ip": ip, "remote_port": port, "local_port": 40000, "dest_class": dest_class}
++    if proto != "tcp":
++        evd["proto"] = proto
++    if blocklist:
++        evd["blocklist"] = {"list": "x", "kind": "rogue_subnet", "entry": ip}
++    ev = {"anomaly": {"kind": "unauthorized_connection", "evidence": evd},
++          "subject": {"cgroup": task, "name": "n", "pid": 1}}
++    d = {"final": final, "action": action, "model": {"verdict": model, "confidence": conf, "reason": "t"}}
++    return ev, d
++
++
++@pytest.fixture
++def env(tmp_path):
++    class E:
++        pass
++    e = E()
++    e.fake, e.clock, e.dir = FakeNft(), Clock(), str(tmp_path / "state")
++    e.sets = NftSets(run=e.fake)
++    e.policy = lambda mode="enforce", **kw: DynPolicy(mode, sets=e.sets, state_dir=e.dir, clock=e.clock,
++                                                       log=lambda m: None, **kw)
++    e.kernel = lambda: [s for s in e.fake.scripts if "element" in s]
++    return e
++
++
++def go(p, **kw):
++    return p.consider(*mk(**kw))
++
++
++# ================= who is eligible =================
++def test_off_and_non_isolate_and_non_model_isolates_are_none(env):
++    assert go(env.policy("off")) is None
++    assert go(env.policy(), final="ESCALATE") is None                     # "needs a human" never writes
++    assert go(env.policy(), final="THROTTLE", model="THROTTLE") is None
++    assert go(env.policy(), model="ESCALATE") is None                     # isolated by the floor, not the model
++
++
++@pytest.mark.parametrize("kw,reason", [
++    ({"action": "blocked"}, "not_acted"), ({"action": "needs-human"}, "not_acted"),
++    ({"action": "failed:FirewallError@cgroup:t0"}, "not_acted"),
++    ({"blocklist": True}, "blocklist"), ({"conf": 0.85}, "low_confidence"),
++    ({"dest_class": "private"}, "dest_class:private"), ({"dest_class": "link_local"}, "dest_class:link_local"),
++    ({"ip": "10.1.2.3"}, "dest_class:public"),                           # a lying class does not make it global
++    ({"port": 53}, "infra_port"), ({"port": 853}, "infra_port"), ({"port": 123, "proto": "udp"}, "infra_port"),
++    ({"proto": "icmp"}, "bad_flow"), ({"port": 0}, "bad_flow"), ({"port": 70000}, "bad_flow"),
++    ({"ip": ""}, "no_destination"), ({"ip": "not-an-ip"}, "no_destination")])
++def test_ineligible_decisions_are_skipped_with_a_reason_and_write_nothing(env, kw, reason):
++    r = go(env.policy(), **kw)
++    assert r["result"] == "skipped" and r["reason"].startswith(reason.split(":")[0]), r
++    assert env.kernel() == []
++
++
++def test_exempt_addresses_are_never_blocked(env):
++    p = env.policy(exempt=lambda ip: "allowed:1.2.3.0/24" if ip == "45.33.32.156" else None)
++    assert go(p)["reason"] == "allowed:1.2.3.0/24" and env.kernel() == []
++    assert go(p, ip="45.33.33.9")["result"] == "blocked"
++
++
++def test_confidence_threshold_is_configurable_and_inclusive(env):
++    assert go(env.policy(cfg=DynConfig(min_conf=0.95)), conf=0.95)["result"] == "blocked"
++    assert go(env.policy(cfg=DynConfig(min_conf=0.95)), ip="45.33.33.9", conf=0.94)["reason"] == "low_confidence"
++
++
++# ================= shadow is the default and touches nothing =================
++def test_shadow_records_would_block_and_leaves_the_kernel_alone(env):
++    p = env.policy("shadow")
++    r = go(p)
++    assert r == {"mode": "shadow", "web": True, "port": 443, "proto": "tcp", "result": "would_block", "kind": "flow",
++                 "key": "45.33.32.156|tcp|443", "ttl_s": 600, "offense": 1, "tasks": 1}
++    assert env.kernel() == []
++    assert (__import__("pathlib").Path(env.dir) / "dyn-ledger-shadow.json").exists()
++
++
++def test_enforce_stays_shadow_while_the_adjudicator_is_only_dry_running(env):
++    r = go(env.policy("enforce"), action="dry-run:ISOLATE@cgroup:t0")
++    assert r["mode"] == "shadow" and r["result"] == "would_block" and env.kernel() == []
++
++
++def test_enforce_without_a_kernel_handle_is_shadow(env):
++    p = DynPolicy("enforce", sets=None, state_dir=env.dir, clock=env.clock, log=lambda m: None)
++    assert go(p)["mode"] == "shadow"
++
++
++def test_enforce_writes_the_flow_with_its_ttl(env):
++    r = go(env.policy("enforce"))
++    assert r["result"] == "blocked" and r["mode"] == "enforce"
++    assert "add element inet cora dynflow4 { 45.33.32.156 . tcp . 443 timeout 600s }" in env.kernel()[-1]
++
++
++def test_ipv6_ipv4_mapped_and_udp_quic(env):
++    p = env.policy("enforce")
++    go(p, ip="2606:4700::1", port=443)
++    assert "dynflow6 { 2606:4700::1 . tcp . 443 timeout 600s }" in env.kernel()[-1]
++    go(p, ip="::ffff:45.33.33.4", port=443, proto="udp")
++    assert "dynflow4 { 45.33.33.4 . udp . 443 timeout 600s }" in env.kernel()[-1]
++
++
++# ================= flow, escalation, web ports =================
++def test_the_same_task_hitting_the_same_flow_again_is_deduplicated(env):
++    p = env.policy("enforce")
++    go(p)
++    r = go(p)
++    assert r["result"] == "dedupe" and len(env.kernel()) == 1
++
++
++def test_a_new_task_on_an_active_block_is_a_repeat_offense_and_escalates_x4_to_the_cap(env):
++    p = env.policy("enforce")
++    ttls = [go(p, task=f"t{i}")["ttl_s"] for i in range(6)]
++    assert ttls == [600, 2400, 9600, 38400, 86400, 86400]
++    assert all("dyn4" not in s and "timeout" in s for s in env.kernel())
++    assert "dynflow4" in env.kernel()[1] and "timeout 2400s" in env.kernel()[1]      # the refresh re-adds with the new ttl
++
++
++@pytest.mark.parametrize("port", [80, 443])
++def test_web_ports_never_become_a_whole_address_block(env, port):
++    p = env.policy("enforce")
++    for i in range(5):
++        r = go(p, task=f"t{i}", port=port)
++        assert r["kind"] == "flow"
++    assert not any(" dyn4 " in s or "dyn4 {" in s for s in env.kernel())
++
++
++def test_a_hit_after_expiry_escalates_and_the_memory_lasts_a_week(env):
++    p = env.policy("enforce")
++    go(p, task="a")
++    env.clock.advance(601)                                                # expired in the kernel and the ledger
++    r = go(p, task="b")
++    assert r["result"] == "blocked" and r["offense"] == 2 and r["ttl_s"] == 2400
++    env.clock.advance(2401 + 8 * 86400)                                   # long quiet: forgotten
++    assert go(p, task="c")["offense"] == 1
++
++
++# ================= non-web ports: flow first, whole address on two tasks =================
++def test_two_distinct_tasks_on_non_web_ports_promote_to_the_whole_address(env):
++    p = env.policy("enforce")
++    a = go(p, task="a", port=8080)
++    b = go(p, task="b", port=9090)
++    assert a["kind"] == "flow" and b["result"] == "promoted" and b["kind"] == "ip" and b["ttl_s"] == 1800 and b["tasks"] == 2
++    assert "add element inet cora dyn4 { 45.33.32.156 timeout 1800s }" in env.kernel()[-1]
++    c = go(p, task="c", port=22)                                          # a third task: a repeat offense on the address
++    assert c["result"] == "refreshed" and c["kind"] == "ip" and c["ttl_s"] == 7200
++
++
++def test_promotion_when_a_second_task_hits_the_same_active_non_web_flow(env):
++    p = env.policy("enforce")
++    go(p, task="a", port=8080)
++    assert go(p, task="b", port=8080)["result"] == "promoted"
++
++
++def test_web_hits_do_not_count_towards_promotion_and_neither_do_two_ports_of_one_task(env):
++    p = env.policy("enforce")
++    go(p, task="a", port=443)
++    assert go(p, task="b", port=8080)["kind"] == "flow"                   # a's web hit is not a second non-web task
++    p2 = env.policy("enforce")
++    go(p2, task="x", ip="45.33.33.1", port=8080)
++    assert go(p2, task="x", ip="45.33.33.1", port=9090)["kind"] == "flow"
++
++
++def test_the_promotion_window_is_an_hour(env):
++    p = env.policy("enforce")
++    go(p, task="a", port=8080)
++    env.clock.advance(3601)
++    assert go(p, task="b", port=9090)["kind"] == "flow"
++
++
++# ================= budgets and caps =================
++def test_the_write_budget_is_a_token_bucket_that_refills(env):
++    p = env.policy("enforce", cfg=DynConfig(write_per_min=3))
++    got = [go(p, task="t", ip=f"45.33.33.{i}", port=8000 + i) for i in range(5)]
++    assert [g["result"] for g in got] == ["blocked"] * 3 + ["skipped"] * 2 and got[3]["reason"] == "budget"
++    env.clock.advance(20)                                                 # 3/min -> one token per 20 s
++    assert go(p, task="u", ip="45.33.33.9", port=9000)["result"] == "blocked"
++    assert go(p, task="u", ip="45.33.33.10", port=9001)["reason"] == "budget"
++
++
++def test_a_clock_that_goes_backwards_does_not_break_the_bucket(env):
++    p = env.policy("enforce", cfg=DynConfig(write_per_min=2))
++    go(p, ip="45.33.33.1", task="t1")
++    env.clock.advance(-500)
++    assert go(p, ip="45.33.33.2", task="t2")["result"] == "blocked"
++
++
++def test_a_refresh_also_spends_a_token_and_is_skipped_when_empty(env):
++    p = env.policy("enforce", cfg=DynConfig(write_per_min=1))
++    go(p, task="a")
++    assert go(p, task="b")["reason"] == "budget"                          # the repeat offense could not be written
++    assert len(env.kernel()) == 1
++
++
++def test_the_standing_cap_limits_new_elements_but_not_refreshes(env):
++    p = env.policy("enforce", cfg=DynConfig(max_live=2))
++    go(p, ip="45.33.33.1", task="a")
++    go(p, ip="45.33.33.2", task="b")
++    assert go(p, ip="45.33.33.3", task="c")["reason"] == "standing_cap"
++    assert go(p, ip="45.33.33.1", task="d")["result"] == "refreshed"
++
++
++def test_one_task_cannot_block_more_than_its_cap_of_distinct_targets_an_hour(env):
++    p = env.policy("enforce", cfg=DynConfig(task_cap=3, write_per_min=100))
++    got = [go(p, task="noisy", ip=f"45.33.33.{i}")["result"] for i in range(5)]
++    assert got == ["blocked"] * 3 + ["skipped"] * 2
++    assert go(p, task="other", ip="45.33.33.77")["result"] == "blocked"
++    assert go(p, task="noisy", ip="45.33.33.0")["result"] == "dedupe"   # an existing target is not a new one
++    env.clock.advance(3601)
++    assert go(p, task="noisy", ip="45.33.33.50")["result"] == "blocked"
++
++
++def test_a_failed_kernel_write_is_reported_and_not_remembered(env):
++    p = env.policy("enforce")
++    good = env.fake.__call__
++    env.sets._run = lambda args, stdin: (1, "", "Error: Could not process rule: Operation not supported") \
++        if args == ["-f", "-"] else good(args, stdin)
++    r = go(p)
++    assert r["result"] == "failed" and "not supported" in r["error"]
++    env.sets._run = good
++    assert go(p)["result"] == "blocked"                                   # not deduplicated against a block never made
++
++
++# ================= the ledger =================
++def test_the_ledger_survives_a_restart_and_keeps_shadow_and_enforce_apart(env):
++    go(env.policy("enforce"))
++    assert go(env.policy("enforce"), task="t0")["result"] == "dedupe"     # a new process, same file
++    assert go(env.policy("shadow"), action="dry-run:ISOLATE@x")["result"] == "would_block"    # own ledger: not a dedupe
++    d = __import__("pathlib").Path(env.dir)
++    assert (d / "dyn-ledger-enforce.json").exists() and (d / "dyn-ledger-shadow.json").exists()
++
++
++def test_a_corrupt_ledger_is_set_aside_and_replaced_not_fatal(env):
++    d = __import__("pathlib").Path(env.dir)
++    d.mkdir(parents=True)
++    (d / "dyn-ledger-enforce.json").write_text("{not json")
++    assert go(env.policy("enforce"))["result"] == "blocked"
++    assert (d / "dyn-ledger-enforce.json.corrupt").exists()
++
++
++def test_an_unwritable_state_directory_falls_back_to_memory(tmp_path):
++    f = tmp_path / "afile"
++    f.write_text("x")
++    logs = []
++    p = DynPolicy("shadow", state_dir=str(f / "sub"), log=logs.append)
++    assert go(p)["result"] == "would_block" and go(p)["result"] == "dedupe" and any("memory" in m for m in logs)
++
++
++def test_the_ledger_file_is_bounded(env, monkeypatch):
++    monkeypatch.setattr(dynpolicy, "MAX_ENTRIES", 5)
++    p = env.policy("shadow", cfg=DynConfig(write_per_min=1000, task_cap=1000))
++    for i in range(12):
++        go(p, task=f"t{i}", ip=f"45.33.33.{i}", action="dry-run:ISOLATE")
++        env.clock.advance(700)                                            # each one expires before the next
++    L = DynLedger(str(__import__("pathlib").Path(env.dir) / "dyn-ledger-shadow.json")).read()
++    assert len(L["flows"]) <= 6
++
++
++# ================= release =================
++def test_release_removes_what_the_task_alone_caused_and_resets_its_memory(env):
++    p = env.policy("enforce")
++    go(p, task="a")
++    out = dynpolicy.release_entries("a", env.dir, env.sets, clock=env.clock)
++    assert out == ["dyn-flow-unblocked:45.33.32.156|tcp|443"]
++    assert "delete element inet cora dynflow4 { 45.33.32.156 . tcp . 443 }" in env.kernel()[-1]
++    assert go(p, task="b")["offense"] == 1                                # a false positive leaves no history
++
++
++def test_release_keeps_a_block_another_task_independently_caused(env):
++    p = env.policy("enforce")
++    go(p, task="a")
++    go(p, task="b")
++    n = len(env.kernel())
++    assert dynpolicy.release_entries("a", env.dir, env.sets, clock=env.clock) == [] and len(env.kernel()) == n
++    assert go(p, task="b")["result"] == "dedupe"                          # still blocked, still b's
++
++
++def test_release_demotes_a_whole_address_block_that_loses_its_second_task(env):
++    p = env.policy("enforce")
++    go(p, task="a", port=8080)
++    go(p, task="b", port=9090)                                            # promoted
++    out = dynpolicy.release_entries("a", env.dir, env.sets, clock=env.clock)
++    assert "dyn-ip-unblocked:45.33.32.156" in out and "dyn-flow-unblocked:45.33.32.156|tcp|8080" in out
++    assert any("delete element inet cora dyn4 { 45.33.32.156 }" in s for s in env.kernel())
++    # b's hit WAS the promotion, so it never had a flow entry of its own: its destination is re-blocked (flow level,
++    # a clean offense 1) on its next event, rather than being kept alive by evidence a is no longer part of
++    r = go(p, task="b", port=9090)
++    assert r["result"] == "blocked" and r["kind"] == "flow" and r["offense"] == 1
++
++
++def test_release_in_shadow_touches_no_kernel_and_ignores_unknown_tasks_and_expired_entries(env):
++    ps, pe = env.policy("shadow"), env.policy("enforce")
++    go(ps, action="dry-run:ISOLATE")
++    assert dynpolicy.release_entries("t0", env.dir, env.sets, clock=env.clock) == ["dyn-flow-dropped(shadow):45.33.32.156|tcp|443"]
++    assert env.kernel() == [] and dynpolicy.release_entries("nobody", env.dir, env.sets, clock=env.clock) == []
++    go(pe, task="x")
++    env.clock.advance(700)
++    n = len(env.kernel())
++    assert dynpolicy.release_entries("x", env.dir, env.sets, clock=env.clock) == [] and len(env.kernel()) == n
++
++
++def test_a_failed_unblock_keeps_the_entry_and_says_so(env):
++    p = env.policy("enforce")
++    go(p, task="a")
++    good = env.fake.__call__
++    env.sets._run = lambda args, stdin: (1, "", "Error: busy") if args == ["-f", "-"] else good(args, stdin)
++    out = dynpolicy.release_entries("a", env.dir, env.sets, clock=env.clock)
++    assert out and out[0].startswith("dyn-unblock-FAILED")
++    env.sets._run = good
++    assert dynpolicy.release_entries("a", env.dir, env.sets, clock=env.clock) == ["dyn-flow-unblocked:45.33.32.156|tcp|443"]
++
++
++class _Cg:
++    def freeze_requested(self, n): return False
++    def is_frozen(self, n): return False
++    def reset_limits(self, n): return []
++
++
++class _Fw:
++    def unblock(self, n): return False
++
++
++def test_cora_firewall_release_also_drops_the_dynamic_entries_and_survives_their_failure():
++    assert release_task(_Cg(), _Fw(), "t", dyn=lambda n: [f"dyn-flow-unblocked:{n}"]) == ["dyn-flow-unblocked:t"]
++    boom = lambda n: (_ for _ in ()).throw(RuntimeError("x"))             # noqa: E731
++    assert release_task(_Cg(), _Fw(), "t", dyn=boom) == ["dyn-release-FAILED:RuntimeError"]
++    assert release_task(_Cg(), _Fw(), "t") == []                          # the old signature still works
++
++
++def test_make_release_builds_the_undo_from_the_firewall_and_state_dir(env):
++    class Fw:
++        table, _run = "cora", env.fake
++    go(env.policy("enforce"), task="a")
++    assert dynpolicy.make_release(Fw(), env.dir)("a") == ["dyn-flow-unblocked:45.33.32.156|tcp|443"]
++
++
++# ================= reconcile =================
++def test_reconcile_notices_an_element_an_operator_removed_and_blocks_again_on_the_next_hit(env):
++    p = env.policy("enforce")
++    go(p, task="a")
++    assert p.reconcile() == 0
++    env.fake.sets["dynflow4"].clear()                                     # cora-floor unblock-flow, or a flush
++    assert p.reconcile() == 1
++    assert go(p, task="a")["result"] == "blocked"                         # not a dedupe against a block that is gone
++
++
++def test_reconcile_does_nothing_without_a_floor(env):
++    p = env.policy("enforce")
++    go(p, task="a")
++    env.sets._run = lambda args, stdin: (1, "", "Error: No such file or directory")
++    assert p.reconcile() == 0
++    assert DynPolicy("shadow", log=lambda m: None).reconcile() == 0
++
++
++# ================= supporting pieces =================
++def test_nftsets_flow_helpers(env):
++    ns = env.sets
++    ns.block_flow("45.33.32.156", "tcp", 443)
++    ns.block_ip("45.33.33.4")
++    assert ns.live_flows() == {"45.33.32.156|tcp|443"} and ns.live_ips() == {"45.33.33.4"}
++    assert ns.unblock_flow("45.33.32.156", "tcp", 443) is True and ns.unblock_flow("45.33.32.156", "tcp", 443) is False
++    with pytest.raises(ValueError):
++        ns.unblock_flow("45.33.32.156", "icmp", 1)
++
++
++def fsync(**kw):
++    kw.setdefault("protect", lambda: {"203.0.113.50": "default gateway"})
++    return FloorSync(NftSets(run=FakeNft()), log=lambda m: None, resolv=lambda: ["9.9.9.9"],
++                     extra_allow=["45.33.33.0/24"], **kw)
++
++
++def test_exempt_reason_covers_allow_resolvers_protected_and_the_blocklist_allow_file():
++    fs = fsync()
++    assert fs.exempt_reason("45.33.33.5").startswith("allowed:") and fs.exempt_reason("9.9.9.9").startswith("allowed:")
++    assert fs.exempt_reason("203.0.113.50").startswith("protected:") and fs.exempt_reason("8.8.8.8") is None
++    fs.track(bl_with(["192.0.2.0/24"], allow=["8.8.8.0/24"]))             # a reload: the cache must not hide the new list
++    assert fs.exempt_reason("8.8.8.8").startswith("allowed:")
++
++
++def test_summarize_decisions_counts_results_reasons_and_targets():
++    lines = [json.dumps({"final": "ISOLATE", "dyn": {"result": "would_block", "key": "1.1.1.1|tcp|443", "web": True,
++                                                    "kind": "flow", "ttl_s": 600}}),
++             json.dumps({"final": "ISOLATE", "dyn": {"result": "would_refresh", "key": "1.1.1.1|tcp|443", "web": True,
++                                                    "kind": "flow", "ttl_s": 2400}}),
++             json.dumps({"final": "ISOLATE", "dyn": {"result": "skipped", "reason": "infra_port"}}),
++             json.dumps({"final": "ALLOW"}), "garbage"]
++    r = dynpolicy.summarize_decisions(lines)
++    assert r["isolate_decisions"] == 3 and r["with_dyn_record"] == 3 and r["results"]["skipped"] == 1
++    assert r["skipped_reasons"] == {"infra_port": 1} and r["targets"] == 1 and r["web_targets"] == 1
++    assert r["top"][0][1]["max_ttl_s"] == 2400
++
++
++# ================= through the real Adjudicator =================
++def event(net, p, cg, ip="45.33.34.9", port=443, **ev_extra):
++    evd = {"remote_ip": ip, "remote_port": port, "local_port": 40000, "dest_class": "public", **ev_extra}
++    return build_payload(p.pid, net.ensure(p.pid), "sleep", "unauthorized_connection", "high", evd,
++                         read_starttime(p.pid), cgroup=cg)
++
++
++def test_a_model_isolate_is_recorded_in_the_decision_in_shadow_and_the_task_is_isolated_as_before(procs, env):
++    ps = procs(1)
++    net, adj, fw, cgs, decisions = pipeline(ps, GateModel(verdict("ISOLATE", 0.95), delay=0), dyn=env.policy("shadow"))
++    d = adj.handle(event(net, ps[0], "task0"))
++    assert fw.calls == ["task0"] and d["dyn"]["result"] == "would_block" and d["dyn"]["mode"] == "shadow"
++    assert decisions[0]["dyn"]["key"] == "45.33.34.9|tcp|443" and env.kernel() == []
++
++
++def test_enforcing_adjudicator_plus_enforce_policy_writes_the_kernel(procs, env):
++    ps = procs(1)
++    net, adj, fw, cgs, decisions = pipeline(ps, GateModel(verdict("ISOLATE", 0.95), delay=0), enforce=True,
++                                            dyn=env.policy("enforce"))
++    d = adj.handle(event(net, ps[0], "task0"))
++    assert d["dyn"]["result"] == "blocked" and "dynflow4 { 45.33.34.9 . tcp . 443 timeout 600s }" in env.kernel()[-1]
++
++
++def test_an_escalate_verdict_or_a_blocked_gate_never_reaches_the_kernel(procs, env):
++    ps = procs(2)
++    net, adj, fw, cgs, decisions = pipeline(ps, GateModel(verdict("ESCALATE", 0.95), delay=0), enforce=True,
++                                            dyn=env.policy("enforce"))
++    assert "dyn" not in adj.handle(event(net, ps[0], "task0")) and env.kernel() == []
++    net2, adj2, *_ = pipeline(ps, GateModel(verdict("ISOLATE", 0.95), delay=0), enforce=True, dyn=env.policy("enforce"))
++    ev = event(net2, ps[1], "task1")
++    net2.release(ps[1].pid)                                              # the gate refuses: the task left the registry
++    d = adj2.handle(ev)
++    assert d["action"] == "blocked" and d["dyn"]["reason"] == "not_acted" and env.kernel() == []
++
++
++def test_a_blocklist_isolate_is_left_to_the_static_sets(procs, env):
++    ps = procs(1)
++    net, adj, fw, cgs, decisions = pipeline(ps, GateModel(verdict("ISOLATE", 0.95), delay=0), dyn=env.policy("shadow"))
++    d = adj.handle(event(net, ps[0], "task0", blocklist="demo/rogue_subnet/45.33.34.9/32"))
++    assert d["dyn"] == {"mode": "shadow", "result": "skipped", "reason": "blocklist"}
++
++
++def test_a_policy_that_raises_never_breaks_the_decision(procs):
++    class Boom:
++        def consider(self, ev, d):
++            raise RuntimeError("ledger exploded")
++    ps = procs(1)
++    net, adj, fw, cgs, decisions = pipeline(ps, GateModel(verdict("ISOLATE", 0.95), delay=0), dyn=Boom())
++    d = adj.handle(event(net, ps[0], "task0"))
++    assert d["final"] == "ISOLATE" and d["dyn"]["result"] == "error" and decisions and fw.calls == ["task0"]
++
++
++def test_no_policy_means_no_dyn_field(procs):
++    ps = procs(1)
++    net, adj, fw, cgs, decisions = pipeline(ps, GateModel(verdict("ISOLATE", 0.95), delay=0))
++    assert "dyn" not in adj.handle(event(net, ps[0], "task0"))
++
++
++# ================= CLI and daemon flags =================
++def test_cora_floor_dyn_and_dyn_report(env, tmp_path, capsys):
++    p = env.policy("shadow")
++    go(p, action="dry-run:ISOLATE")
++    real = dynpolicy.time.time
++    dynpolicy.time.time = env.clock
++    try:
++        assert nftsets.main(["--state-dir", env.dir, "dyn", "--mode", "shadow"]) == 0
++        out = capsys.readouterr().out
++        assert "[shadow] 1 active" in out and "45.33.32.156|tcp|443" in out
++        assert nftsets.main(["--state-dir", env.dir, "dyn", "--mode", "enforce"]) == 0
++        assert "no ledger" in capsys.readouterr().out
++    finally:
++        dynpolicy.time.time = real
++    f = tmp_path / "decisions.jsonl"
++    f.write_text(json.dumps({"final": "ISOLATE", "dyn": {"result": "would_block", "key": "1.1.1.1|tcp|443",
++                                                         "web": True, "kind": "flow", "ttl_s": 600}}) + "\n")
++    assert nftsets.main(["dyn-report", str(f)]) == 0
++    assert "would_block 1" in capsys.readouterr().out
++
++
++@pytest.mark.parametrize("argv", [["--dyn-policy", "enforce"], ["--dyn-policy", "enforce", "--model", "m", "--floor", "--nft",
++                                                                  "--cgroup-root", "/x"],
++                                  ["--dyn-min-conf", "0.2"], ["--dyn-task-cap", "0"]])
++def test_dyn_flags_are_validated(argv, monkeypatch, capsys):
++    import sys
++    from cora_sentinel import daemon
++    monkeypatch.setattr(sys, "argv", ["cora-sentinel", *argv])
++    assert daemon.main() == 1 and "--dyn" in capsys.readouterr().err
++
++
++def test_the_default_is_shadow_and_bad_modes_are_rejected():
++    import subprocess, sys
++    h = subprocess.run([sys.executable, "-m", "cora_sentinel.daemon", "--help"], capture_output=True, text=True).stdout
++    assert "default shadow" in h
++    with pytest.raises(ValueError):
++        DynPolicy("sometimes")
+diff --git a/tests/test_floor_gate.py b/tests/test_floor_gate.py
+index ddcb7ad..106ede1 100644
+--- a/tests/test_floor_gate.py
++++ b/tests/test_floor_gate.py
+@@ -117,20 +117,21 @@ def ns_runner(ns):
+ 
+ 
+ class Lab:
+-    def __init__(self, tmp_path: Path, ports=(PORT,)):
++    def __init__(self, tmp_path: Path, ports=(PORT,), bind: str = S_IP):
+         u = uuid.uuid4().hex[:6]
+         self.c, self.s = f"cfc{u}", f"cfs{u}"
+         self.tmp, self.procs = tmp_path, []
+         sh("ip", "netns", "add", self.c)
+         sh("ip", "netns", "add", self.s)
+         vc, vs = f"vc{u}", f"vs{u}"
++        self.vc, self.vs = vc, vs
+         sh("ip", "link", "add", vc, "netns", self.c, "type", "veth", "peer", "name", vs, "netns", self.s)
+         for ns, dev, addr in ((self.c, vc, C_IP), (self.s, vs, S_IP)):
+             sh("ip", "-n", ns, "addr", "add", f"{addr}/24", "dev", dev)
+             sh("ip", "-n", ns, "link", "set", dev, "up")
+             sh("ip", "-n", ns, "link", "set", "lo", "up")
+         self.count_file = tmp_path / "accepted"
+-        srv = subprocess.Popen(["ip", "netns", "exec", self.s, sys.executable, "-c", SERVER_PY, S_IP,
++        srv = subprocess.Popen(["ip", "netns", "exec", self.s, sys.executable, "-c", SERVER_PY, bind,
+                                 ",".join(str(p) for p in ports), str(self.count_file)])
+         self.procs.append(srv)
+         for _ in range(100):
+@@ -148,9 +149,9 @@ class Lab:
+         time.sleep(0.15)                          # the listener's accept loop runs a moment behind the handshake
+         return int(self.count_file.read_text())
+ 
+-    def connect(self, n: int, port: int = PORT, timeout: float = 0.6) -> int:
++    def connect(self, n: int, port: int = PORT, timeout: float = 0.6, ip: str = S_IP) -> int:
+         """Open n connections from the client at once; returns how many completed a handshake."""
+-        r = sh("ip", "netns", "exec", self.c, sys.executable, "-c", CLIENT_PY, S_IP, str(port), str(n), str(timeout))
++        r = sh("ip", "netns", "exec", self.c, sys.executable, "-c", CLIENT_PY, ip, str(port), str(n), str(timeout))
+         return int(r.stdout.strip())
+ 
+     def close(self):
+diff --git a/tools/dyn_bench.py b/tools/dyn_bench.py
+new file mode 100755
+index 0000000..9ba5215
+--- /dev/null
++++ b/tools/dyn_bench.py
+@@ -0,0 +1,88 @@
++#!/usr/bin/env python3
++"""
++dyn_bench - what the dynamic policy costs per decision.
++
++  shadow   consider() with the ledger only (flock + JSON read/modify/write); the kernel is not touched.
++  enforce  the same plus ONE nft commit for the element. Runs inside a throwaway network namespace (`unshare -n`) in a
++           throwaway table, so the host ruleset is never touched. Needs root, nft and unshare; skipped without them.
++
++Each row is measured on an empty ledger and on one already holding --entries live elements (the ledger is rewritten on
++every decision, so this is the number that grows). Decisions arrive at the model's pace (seconds apart), so these are
++costs, not throughput limits; the point is that they stay small next to a 2-4 s model call.
++
++  python tools/dyn_bench.py [--n 200] [--entries 500]
++"""
++import argparse
++import os
++import shutil
++import subprocess
++import sys
++import tempfile
++import time
++
++from cora_sentinel.dynpolicy import DynConfig, DynPolicy
++
++
++def event(i, port=8080):
++    ip = f"45.{(i >> 16) & 255}.{(i >> 8) & 255}.{i & 255}"
++    return ({"anomaly": {"kind": "unauthorized_connection", "evidence": {
++        "remote_ip": ip, "remote_port": port, "local_port": 40000, "dest_class": "public"}},
++             "subject": {"cgroup": f"task{i}", "name": "n", "pid": 1}},
++            {"final": "ISOLATE", "action": "done:ISOLATE@cgroup:x", "model": {"verdict": "ISOLATE", "confidence": 0.95}})
++
++
++def pct(xs, p):
++    xs = sorted(xs)
++    return xs[min(len(xs) - 1, int(len(xs) * p / 100))]
++
++
++def run(mode, sets, n, entries):
++    d = tempfile.mkdtemp(prefix="dynbench")
++    try:
++        pol = DynPolicy(mode, sets=sets, state_dir=d, log=lambda m: None,
++                        cfg=DynConfig(write_per_min=10 ** 7, task_cap=10 ** 7, max_live=10 ** 7))
++        for i in range(entries):
++            pol.consider(*event(i))
++        ms = []
++        for i in range(entries, entries + n):
++            ev, dec = event(i)
++            t = time.perf_counter()
++            r = pol.consider(ev, dec)
++            ms.append((time.perf_counter() - t) * 1000.0)
++            assert r["result"] in ("blocked", "would_block"), r
++        return ms
++    finally:
++        shutil.rmtree(d, ignore_errors=True)
++
++
++def row(label, ms):
++    print(f"{label:<34} p50 {pct(ms, 50):7.2f}   p99 {pct(ms, 99):7.2f}   max {max(ms):7.2f}   (ms, n={len(ms)})", flush=True)
++
++
++def inner(a):
++    from cora_sentinel.nftsets import NftSets
++    sets = NftSets(table="cora_bench")
++    sets.ensure()
++    for e in (0, a.entries):
++        row(f"enforce, ledger of {e}", run("enforce", sets, a.n, e))
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("--n", type=int, default=200)
++    ap.add_argument("--entries", type=int, default=500)
++    ap.add_argument("--inner", action="store_true", help=argparse.SUPPRESS)
++    a = ap.parse_args()
++    if a.inner:
++        return inner(a)
++    for e in (0, a.entries):
++        row(f"shadow, ledger of {e}", run("shadow", None, a.n, e))
++    if os.geteuid() == 0 and shutil.which("nft") and shutil.which("unshare"):
++        r = subprocess.run(["unshare", "-n", sys.executable, os.path.abspath(__file__), "--inner",
++                            "--n", str(a.n), "--entries", str(a.entries)])
++        return r.returncode
++    print("enforce rows skipped: needs root, nft and unshare")
++
++
++if __name__ == "__main__":
++    sys.exit(main())

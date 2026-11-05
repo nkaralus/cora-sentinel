@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.6.0
+
+### Added
+- **Dynamic policy (`--dyn-policy off|shadow|enforce`, default `shadow`; `cora_sentinel.dynpolicy`).** A model ISOLATE
+  can now also drop the destination in the kernel (`dyn*` sets, timeouts expire them), so the next task's first packet to
+  that address does not escape. In **shadow** it computes everything, budgets and escalation included, and writes
+  `dyn: {result: would_block|would_refresh|would_promote|skipped, ...}` into each decision; the kernel is untouched.
+  `enforce` needs `--model`, `--enforce` and `--floor`, and stays in shadow for decisions the adjudicator only dry-ran.
+- **Policy:** only a final ISOLATE the MODEL chose, at confidence >= 0.9, whose gate passed and whose action ran;
+  ESCALATE never writes; never non-public addresses, allowed or protected ones (gateway, SSH peers, resolvers), or DNS/NTP
+  ports. **Web ports (80/443, tcp and udp) are flow-only** (address, proto, port), 10 min, x4 per repeat offense up to
+  24 h, **never promoted** to a whole-address block. **Other ports:** flow first; whole address (30 min, x4, up to 24 h)
+  once two distinct tasks have hit non-web ports of it within an hour.
+- **Limits:** 20 kernel writes/min (token bucket), 512 live elements, 8 distinct targets per task per hour
+  (`--dyn-write-budget`, `--dyn-max-live`, `--dyn-task-cap`, `--dyn-min-conf`).
+- **A persistent ledger** per mode in `--state-dir` (flock-guarded: `cora-firewall release` is another process).
+  Offense memory lasts 7 days; the daemon reconciles it against the kernel at start and hourly, so an element removed by
+  hand is not remembered as blocked.
+- **`cora-firewall release TASK` also drops that task's dynamic entries** (a whole-address block that loses its second
+  distinct task is demoted; blocks another task caused stay; a failed unblock keeps the entry and says so).
+- `cora-floor dyn` (the ledger) and `cora-floor dyn-report decisions.jsonl` (what shadow would have done: the data for the
+  shadow-to-enforce call). `tools/dyn_bench.py` (cost per decision, enforce in a throwaway namespace).
+- `NftSets.unblock_flow`, `live_flows`, `live_ips`; `FloorSync.exempt_reason` / `track`; `Adjudicator(dyn=...)`;
+  `release_task(..., dyn=...)`.
+- Tests: `test_dynpolicy.py` (67) and `test_dyn_kernel.py` (7, real traffic). Re-adding a timed element refreshes its
+  timeout on the kernel (checked), so a repeat offense is a plain `add`.
+
+### Design notes
+- The model is a 3B network and a task controls the address it touches and the text the model reads, so a model-only
+  verdict that writes host-wide drops is an injection surface. Hence: shadow by default, the limits above, no ESCALATE,
+  the target taken from the event, and web ports flow-only (nft cannot see SNI or Host, so a flow block on 443 still hits
+  everything behind a shared address; the safety there is TTL, budgets and shadow, and a web address is promoted through
+  the blocklist path, with a human).
+- Documentation ranges (192.0.2/24, 198.51.100/24, 203.0.113/24) are not global addresses, so the policy refuses them.
+
+### Changed
+- `tests/test_floor_gate.py`'s `Lab` takes `bind=` and `connect(..., ip=)` (backward compatible).
+
+### Not done
+- After a demotion the promoting hit has no flow entry of its own, so its destination is re-blocked on its next event.
+- The ledger is rewritten on every decision; its cost grows with its size (about 1 ms empty, 7 ms at 500 entries here).
+- `cora-floor unblock` / `unblock-flow` do not edit the ledger; reconcile (start, hourly) catches the difference.
+- IPv6 targets are covered by unit tests, not by a kernel test.
+
 ## 0.5.1
 
 ### Added

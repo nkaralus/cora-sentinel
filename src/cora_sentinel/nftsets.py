@@ -42,6 +42,7 @@ import os
 import re
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -323,6 +324,31 @@ class NftSets:
         self._script(f"add element inet {self.table} dynflow{a.version} "
                      f"{{ {a} . {p} . {int(port)} timeout {t}s }}\n")
 
+    def unblock_flow(self, ip: str, proto: str, port: int) -> bool:
+        a, p = self._addr(ip), PROTOS.get(str(proto).lower())
+        if p is None or not 0 < int(port) < 65536:
+            raise ValueError("bad flow")
+        try:
+            self._script(f"delete element inet {self.table} dynflow{a.version} {{ {a} . {p} . {int(port)} }}\n")
+        except FirewallError as e:
+            if "No such file" in str(e) or "does not exist" in str(e):
+                return False
+            raise
+        return True
+
+    def live_flows(self) -> Set[str]:
+        """'ip|proto|port' for every live dynflow element (the ledger's key format)."""
+        out: Set[str] = set()
+        for v in (4, 6):
+            for tok in self.list_set(f"dynflow{v}"):
+                parts = [x.strip() for x in tok.split(" . ")]
+                if len(parts) == 3:
+                    out.add(f"{_unwrap(ipaddress.ip_address(parts[0]))}|{parts[1]}|{parts[2]}")
+        return out
+
+    def live_ips(self) -> Set[str]:
+        return {str(_unwrap(ipaddress.ip_address(t))) for v in (4, 6) for t in self.list_set(f"dyn{v}")}
+
     # ---- reading back ------------------------------------------------------
     def drop_counts(self) -> Dict[str, int]:
         """Packets dropped by the floor, per direction, from the drop rules' counters."""
@@ -395,6 +421,7 @@ class FloorSync:
         self._protect = protect or floorguard.protected_addresses
         self.guard, self.token, self.disabled, self._reported = guard, None, False, False
         self._lock = threading.Lock()
+        self.bl, self._exempt_cache = None, None             # the list in force, for exempt_reason()
 
     # ---- what goes where ----
     def configured_allow(self, bl) -> List[str]:
@@ -431,6 +458,24 @@ class FloorSync:
         return floorguard.fingerprint(self.sets.table, self.sets.in_priority, self.sets.out_priority,
                                       self.configured_allow(bl))
 
+    # ---- what the dynamic policy must never block ----
+    def track(self, bl) -> None:
+        """Remember the list in force without touching the kernel (dyn policy in shadow, no --floor)."""
+        self.bl, self._exempt_cache = bl, None
+
+    def exempt_reason(self, ip: str) -> Optional[str]:
+        """Why a dynamic verdict must NOT block this address: protected (gateway, SSH peer) or allowed (loopback,
+        resolvers, --floor-allow, the blocklist allow list). None = not exempt. Cached for 5 s."""
+        now = time.monotonic()
+        c = self._exempt_cache
+        if c is None or now - c[0] > 5.0 or c[3] is not self.bl:
+            c = self._exempt_cache = (now, floorguard.net_index(self._allow_effective(self.bl)), self._protect(), self.bl)
+        _, idx, prot, _ = c
+        if ip in prot:
+            return f"protected:{prot[ip]}"
+        hit = floorguard.covering(ip, idx)
+        return f"allowed:{hit}" if hit else None
+
     # ---- the pre-check ----
     def conflicts(self, bl) -> List[str]:
         if not self.precheck:
@@ -461,6 +506,7 @@ class FloorSync:
         """Full reconcile. Raises FirewallError (FloorRefused for a pre-check failure) if it cannot."""
         with self._lock:
             self._refuse_on_conflicts(bl)
+            self.track(bl)
             if bl is not None and bl.allow is not None and bl.allow.domains:
                 self.log("floor: allow-list DOMAINS are not mirrored into the kernel (only subnets and addresses)")
             r = self.sets.reconcile(self.static_entries(bl), self._allow_effective(bl),
@@ -528,6 +574,7 @@ class FloorSync:
                 self._refuse_on_conflicts(bl, "reload")
                 a = self.sets.sync_allow(self._allow_effective(bl))
                 s = self.sets.sync_static(self.static_entries(bl))
+                self.track(bl)
                 self.log(f"floor reloaded: allow +{a[0]}/-{a[1]}, static +{s[0]}/-{s[1]}")
             except FloorRefused as e:
                 self.log(f"floor reload REFUSED, keeping the previous sets: {e}")
@@ -561,6 +608,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     sub.add_parser("confirm", help="keep the floor that --floor-confirm is waiting on")
     sub.add_parser("unconfirm", help="forget the confirmed allow set, so the next start asks for confirmation again")
     sub.add_parser("pending", help="seconds left to confirm, or 'none'")
+    p = sub.add_parser("dyn", help="the dynamic-policy ledger: what is blocked (or would be, in shadow) and why")
+    p.add_argument("--mode", choices=("shadow", "enforce"), action="append")
+    p = sub.add_parser("dyn-report", help="summarise what the dynamic policy did or would have done, from decisions.jsonl")
+    p.add_argument("decisions")
     sub.add_parser("rollback", help="remove the floor IF it is still awaiting confirmation (the unit's ExecStopPost)")
     p = sub.add_parser("watchdog", help=argparse.SUPPRESS)           # internal: the detached rollback timer
     p.add_argument("token"); p.add_argument("seconds", type=float)
@@ -595,6 +646,31 @@ def main(argv: Optional[List[str]] = None) -> int:
         elif a.cmd == "pending":
             left = floorguard.FloorGuard(a.state_dir).remaining()
             print("none" if left is None else f"{left:.0f}s left to confirm")
+        elif a.cmd == "dyn":
+            from cora_sentinel import dynpolicy
+            now = time.time()
+            for eff in (a.mode or ["enforce", "shadow"]):
+                path = dynpolicy._ledger_path(a.state_dir, eff)
+                if not path or not Path(path).exists():
+                    print(f"[{eff}] no ledger")
+                    continue
+                L = dynpolicy.DynLedger(path).read()
+                live = [(k, e, t) for t, tbl in (("flow", L["flows"]), ("ip", L["ips"])) for k, e in tbl.items()
+                        if dynpolicy._active(e, now)]
+                print(f"[{eff}] {len(live)} active of {len(L['flows']) + len(L['ips'])} remembered")
+                for k, e, t in sorted(live, key=lambda x: -x[1]["expires"]):
+                    print(f"  {t:<4} {k:<46} {e['expires'] - now:>7.0f}s left  offense {e['offenses']}  "
+                          f"tasks {len(e['tasks'])}  hits {e['hits']}")
+        elif a.cmd == "dyn-report":
+            from cora_sentinel import dynpolicy
+            with open(a.decisions) as fh:
+                r = dynpolicy.summarize_decisions(fh)
+            print(f"ISOLATE decisions {r['isolate_decisions']}, with a dyn record {r['with_dyn_record']}")
+            print("results  " + (", ".join(f"{k} {v}" for k, v in sorted(r['results'].items())) or "none"))
+            print("skipped  " + (", ".join(f"{k} {v}" for k, v in sorted(r['skipped_reasons'].items())) or "none"))
+            print(f"targets  {r['targets']} ({r['web_targets']} on web ports)")
+            for k, v in r["top"]:
+                print(f"  {v['n']:>4}x {v['kind']:<4} {k:<46} {'web' if v['web'] else '   '} max ttl {v['max_ttl_s']}s")
         elif a.cmd == "rollback":
             g = floorguard.FloorGuard(a.state_dir)
             print("floor removed (it was never confirmed)" if g.rollback(reason="rollback requested")

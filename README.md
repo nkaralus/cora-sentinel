@@ -115,6 +115,16 @@ with a dead-man: it removes itself unless `sudo cora-floor confirm` arrives in t
 armed before the floor goes in, so a crashed daemon cannot strand it. You are asked once per allow set, so unattended
 restarts and reboots do not prompt. See [docs/service.md](docs/service.md).
 
+### Dynamic policy (`--dyn-policy`)
+
+When the model isolates a task for talking to a public address, the next task to reach it would still get its first
+packet out. `--dyn-policy` can turn that verdict into a short-lived kernel drop of the destination. It is **off in
+effect by default: the default is `shadow`**, which records what it *would* do in the decision log and touches nothing.
+Web ports (80/443) are blocked per flow only, never the whole address; other ports escalate to the whole address after
+two distinct tasks; there are budgets (20 writes/min, 512 live, 8 targets per task per hour); and `cora-firewall release
+TASK` drops what that task caused. See [docs/dyn-policy.md](docs/dyn-policy.md), and review a week of shadow data with
+`cora-floor dyn-report sentinel_decisions.jsonl` before you consider `--dyn-policy enforce`.
+
 ### As a service
 
 ```bash
@@ -221,6 +231,8 @@ packets.
   address.
 - **The lockout guard is best effort.** The pre-check sees the default gateway and SSH on port 22 (or the port in
   `$SSH_CONNECTION`); other management paths need `--floor-allow`. The dead-man is the net underneath it.
+- **Dynamic policy is only as good as the model's verdicts.** It is bounded (see docs/dyn-policy.md) but a block on a
+  web address is still a block on everything behind it, which is why web ports are flow-only and why shadow is the default.
 - **The kernel floor is address-level.** It cannot match names, and a listed address shared with something you use is
   dropped for everything on the host (`--floor-allow` is the remedy). Fed from the lists' addresses and subnets only,
   unless you opt in to `--floor-dns`.
@@ -263,14 +275,18 @@ TCP between two network namespaces, each with its own throwaway table, so the ho
 real `/proc` decoding, and the daemon end to end; they skip without root, nft and `ip netns`, and the daemon ones also
 need a cgroup v2 mount, or `CORA_TEST_CGROUP_MOUNT`).
 
+0.6.0 adds `tests/test_dynpolicy.py` (67, no kernel) and `tests/test_dyn_kernel.py` (7: real traffic is cut and
+restored by the policy's decisions; they use a public address aliased inside the lab, because the policy refuses private
+ones). `tools/dyn_bench.py` measures the per-decision cost.
+
 ## Layout
 
 ```
-src/cora_sentinel/   daemon  netmon  nflog  nftdump  nftsets  floorguard  sockdiag  firewall  cgroup  blocklist  blocklist_store  reload  report  verdict  run  demo  selfcheck
+src/cora_sentinel/   daemon  netmon  nflog  nftdump  nftsets  floorguard  dynpolicy  sockdiag  firewall  cgroup  blocklist  blocklist_store  reload  report  verdict  run  demo  selfcheck
 tests/               unit tests, plus kernel tests that skip without root
 schema/              violation.schema.json (cora.security.violation/v1)
 examples/            starter blocklists, an allow list, an example report
-docs/                architecture.md, service.md, violation-reports.md
+docs/                architecture.md, service.md, dyn-policy.md, violation-reports.md
 deploy/              cora-sentinel.service, cora-sentinel.conf, install-service.sh
 ```
 

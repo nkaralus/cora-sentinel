@@ -261,8 +261,10 @@ class Firewall:
         # rc != 0 just means the table was not there
 
 
-def release_task(cg: CgroupRoot, fw: Firewall, name: str) -> List[str]:
-    """The review action: undo every containment measure on a task."""
+def release_task(cg: CgroupRoot, fw: Firewall, name: str,
+                 dyn: Optional[Callable[[str], List[str]]] = None) -> List[str]:
+    """The review action: undo every containment measure on a task. `dyn` (cora_sentinel.dynpolicy.make_release)
+    also drops the dynamic kernel entries that task alone caused."""
     undone: List[str] = []
     if cg.freeze_requested(name) or cg.is_frozen(name):   # requested, not just completed: freezing is async
         cg.thaw(name)
@@ -270,6 +272,11 @@ def release_task(cg: CgroupRoot, fw: Firewall, name: str) -> List[str]:
     if fw.unblock(name):
         undone.append("egress-unblocked")
     undone += cg.reset_limits(name)
+    if dyn is not None:
+        try:
+            undone += dyn(name)
+        except Exception as e:                      # the task is already released; say what did not happen
+            undone.append(f"dyn-release-FAILED:{e.__class__.__name__}")
     return undone
 
 
@@ -297,7 +304,13 @@ def main() -> int:
             print("unblocked" if fw.unblock(a[1]) else "was not blocked")
             return 0
         if len(a) == 2 and a[0] == "release":
-            print("released:", release_task(cg, fw, a[1]) or "nothing to undo")
+            dyn = None
+            try:
+                from cora_sentinel.dynpolicy import make_release
+                dyn = make_release(fw, os.environ.get("CORA_STATE_DIR", "/var/lib/cora-sentinel"))
+            except Exception:
+                pass
+            print("released:", release_task(cg, fw, a[1], dyn) or "nothing to undo")
             return 0
     except (FirewallError, CgroupError, OSError) as e:
         print(f"error: {e}", file=sys.stderr)

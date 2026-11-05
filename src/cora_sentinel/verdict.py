@@ -168,8 +168,9 @@ class Adjudicator:
     def __init__(self, net: VirtualNet, model, executor: Executor,
                  decisions_path: Optional[str] = None, min_conf: float = 0.6,
                  sink: Optional[Callable[[dict], None]] = None,
-                 reporter=None, blocklist_floor: bool = True, contain_first: bool = True):
+                 reporter=None, blocklist_floor: bool = True, contain_first: bool = True, dyn=None):
         self.reporter, self.blocklist_floor = reporter, blocklist_floor
+        self.dyn = dyn                                    # cora_sentinel.dynpolicy.DynPolicy, or None
         # Contain a blocklist hit at submit() time, before it queues behind the model. The floor in handle()
         # guarantees at least ISOLATE for these whatever the model says, so this changes WHEN, not whether.
         self.contain_first = contain_first
@@ -257,6 +258,13 @@ class Adjudicator:
                     d["contained_ms"] = first
         elif final == "ESCALATE":
             d["action"] = "needs-human"
+        if self.dyn is not None:                          # shadow or enforce; a failure here must never break adjudication
+            try:
+                rec = self.dyn.consider(ev, d)
+                if rec:
+                    d["dyn"] = rec
+            except Exception as e:
+                d["dyn"] = {"result": "error", "error": f"{e.__class__.__name__}: {str(e)[:100]}"}
         self._record(d)
         if bl and self.reporter:
             try:

@@ -614,6 +614,15 @@ def main() -> int:
                     help="do not refuse a floor that would drop the default gateway or a live SSH peer")
     ap.add_argument("--state-dir", default="/var/lib/cora-sentinel",
                     help="where --floor-confirm keeps its state (default /var/lib/cora-sentinel)")
+    ap.add_argument("--dyn-policy", choices=("off", "shadow", "enforce"), default="shadow",
+                    help="turn the model's ISOLATE verdicts into short-lived kernel drops of the destination "
+                         "(default shadow: record what it WOULD do in the decision log, touch nothing). "
+                         "enforce needs --model, --enforce and --floor")
+    ap.add_argument("--dyn-min-conf", type=float, default=0.9, help="model confidence needed (default 0.9)")
+    ap.add_argument("--dyn-write-budget", type=int, default=20, metavar="PER_MIN",
+                    help="kernel writes per minute (default 20)")
+    ap.add_argument("--dyn-max-live", type=int, default=512, help="live dynamic elements (default 512)")
+    ap.add_argument("--dyn-task-cap", type=int, default=8, help="distinct targets per task per hour (default 8)")
     ap.add_argument("--floor-log-group", type=int, default=72,
                     help="NFLOG group for floor drop records (default 72; the tap is 71; unbound = discarded)")
     ap.add_argument("--floor-out-priority", type=int, default=-5,
@@ -647,6 +656,13 @@ def main() -> int:
     if (a.floor or a.floor_dns) and not (a.floor and a.nft and a.cgroup_root):
         print("[cora-sentinel] --floor needs --nft and --cgroup-root (and --floor-dns needs --floor)", file=sys.stderr)
         return 1
+    if a.dyn_policy == "enforce" and not (a.floor and a.enforce and a.model):
+        print("[cora-sentinel] --dyn-policy enforce needs --model, --enforce and --floor "
+              "(use shadow to see what it would do first)", file=sys.stderr)
+        return 1
+    if not 0.5 <= a.dyn_min_conf <= 1.0 or min(a.dyn_write_budget, a.dyn_max_live, a.dyn_task_cap) < 1:
+        print("[cora-sentinel] bad --dyn-* limits (--dyn-min-conf 0.5-1.0, the rest at least 1)", file=sys.stderr)
+        return 1
     if a.floor_confirm and (not a.floor or not 10 <= a.floor_confirm <= 3600):
         print("[cora-sentinel] --floor-confirm needs --floor and a value between 10 and 3600 seconds", file=sys.stderr)
         return 1
@@ -672,7 +688,13 @@ def main() -> int:
             return 1
         print(f"[cora-sentinel] cgroup mode: {a.cgroup_root} controllers={ctl or 'none'}",
               file=sys.stderr)
-    floor_ref: dict = {"sync": None}       # filled in once the firewall exists (the resolver may cycle first)
+    floor_ref: dict = {"sync": None, "track": None}   # filled in once the firewall exists (the resolver may cycle first)
+
+    def reloaded(new: Blocklist) -> None:
+        if floor_ref["sync"] is not None:
+            floor_ref["sync"].on_reload(new)
+        elif floor_ref["track"] is not None:
+            floor_ref["track"].track(new)             # dyn policy in shadow without the floor: exemptions only
 
     def make_resolver(target: Blocklist) -> DomainResolver:
         r = DomainResolver(target, max_per_cycle=a.resolve_max)
@@ -709,7 +731,7 @@ def main() -> int:
     reloader = Reloader(s, (lambda: load_lists(a.blocklist, a.blocklist_store, a.blocklist_allow))
                         if has_lists else None,
                         resolver=resolver, make_resolver=None if a.no_resolve else make_resolver,
-                        on_reload=lambda new: floor_ref["sync"] and floor_ref["sync"].on_reload(new))
+                        on_reload=reloaded)
     reloader.start()
     fw = None
     if a.nft:
@@ -739,7 +761,26 @@ def main() -> int:
                 print(f"[cora-sentinel] --floor unusable: {e}", file=sys.stderr)
                 return 1
             floor_ref["sync"] = fs
-    adj = None
+    adj = dyn = None
+    if a.model and a.dyn_policy != "off":
+        from cora_sentinel.dynpolicy import DynConfig, DynPolicy
+        fsx = floor_ref["sync"]
+        if fsx is None:                         # shadow without --floor: only the exemption checks are needed
+            from cora_sentinel.nftsets import FloorSync, NftSets
+            fsx = FloorSync(NftSets(table=a.nft_table), extra_allow=a.floor_allow,
+                            allow_detected=a.floor_allow_detected, precheck=not a.no_floor_precheck,
+                            log=lambda m: None)
+            fsx.track(bl)
+            floor_ref["track"] = fsx
+        dyn = DynPolicy(a.dyn_policy, sets=floor_ref["sync"].sets if floor_ref["sync"] else None,
+                        exempt=fsx.exempt_reason, state_dir=a.state_dir,
+                        cfg=DynConfig(min_conf=a.dyn_min_conf, write_per_min=a.dyn_write_budget,
+                                      max_live=a.dyn_max_live, task_cap=a.dyn_task_cap))
+        if a.dyn_policy == "enforce":
+            dyn.reconcile()
+        print(f"[cora-sentinel] dyn policy: {a.dyn_policy} "
+              f"({'kernel drops of model-ISOLATEd destinations, flow-level on web ports' if a.dyn_policy == 'enforce' else 'recording what it WOULD block in the decision log; nothing is written to the kernel'})",
+              file=sys.stderr)
     if a.model:
         from cora_sentinel.verdict import Adjudicator, Executor, Qwen3B  # lazy: heavy deps
         reporter = None
@@ -749,7 +790,8 @@ def main() -> int:
         adj = Adjudicator(s.net, Qwen3B(a.model, n_threads=a.threads),
                           Executor(enforce=a.enforce, cgroups=cg, firewall=fw), a.decisions,
                           a.min_conf, reporter=reporter,
-                          blocklist_floor=not a.no_blocklist_floor, contain_first=not a.no_contain_first)
+                          blocklist_floor=not a.no_blocklist_floor, contain_first=not a.no_contain_first,
+                          dyn=dyn)
         adj.start()
         base_emit = emit
         emit = lambda p: (base_emit(p), adj.submit(p))  # noqa: E731
@@ -815,6 +857,8 @@ def main() -> int:
         n += 1
         if floor_ref["sync"] is not None:
             floor_ref["sync"].poll()            # reports the dead-man's outcome once
+        if dyn is not None and a.dyn_policy == "enforce" and n % 3600 == 0:
+            dyn.reconcile()                     # an operator unblock must not leave the ledger claiming a block
         if fw and n % 60 == 0:  # housekeeping: drop rules whose task cgroup is gone
             try:                # Firewall serializes itself; holding the registry lock across nft stalled everyone
                 fw.gc(cg.names())

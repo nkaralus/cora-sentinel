@@ -117,20 +117,21 @@ def ns_runner(ns):
 
 
 class Lab:
-    def __init__(self, tmp_path: Path, ports=(PORT,)):
+    def __init__(self, tmp_path: Path, ports=(PORT,), bind: str = S_IP):
         u = uuid.uuid4().hex[:6]
         self.c, self.s = f"cfc{u}", f"cfs{u}"
         self.tmp, self.procs = tmp_path, []
         sh("ip", "netns", "add", self.c)
         sh("ip", "netns", "add", self.s)
         vc, vs = f"vc{u}", f"vs{u}"
+        self.vc, self.vs = vc, vs
         sh("ip", "link", "add", vc, "netns", self.c, "type", "veth", "peer", "name", vs, "netns", self.s)
         for ns, dev, addr in ((self.c, vc, C_IP), (self.s, vs, S_IP)):
             sh("ip", "-n", ns, "addr", "add", f"{addr}/24", "dev", dev)
             sh("ip", "-n", ns, "link", "set", dev, "up")
             sh("ip", "-n", ns, "link", "set", "lo", "up")
         self.count_file = tmp_path / "accepted"
-        srv = subprocess.Popen(["ip", "netns", "exec", self.s, sys.executable, "-c", SERVER_PY, S_IP,
+        srv = subprocess.Popen(["ip", "netns", "exec", self.s, sys.executable, "-c", SERVER_PY, bind,
                                 ",".join(str(p) for p in ports), str(self.count_file)])
         self.procs.append(srv)
         for _ in range(100):
@@ -148,9 +149,9 @@ class Lab:
         time.sleep(0.15)                          # the listener's accept loop runs a moment behind the handshake
         return int(self.count_file.read_text())
 
-    def connect(self, n: int, port: int = PORT, timeout: float = 0.6) -> int:
+    def connect(self, n: int, port: int = PORT, timeout: float = 0.6, ip: str = S_IP) -> int:
         """Open n connections from the client at once; returns how many completed a handshake."""
-        r = sh("ip", "netns", "exec", self.c, sys.executable, "-c", CLIENT_PY, S_IP, str(port), str(n), str(timeout))
+        r = sh("ip", "netns", "exec", self.c, sys.executable, "-c", CLIENT_PY, ip, str(port), str(n), str(timeout))
         return int(r.stdout.strip())
 
     def close(self):
