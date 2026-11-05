@@ -122,6 +122,10 @@ the loop's worst poll was **4 ms** (2,418 ms before the change) while the sync w
 still attributed. Steady-state `ensure(pid)` takes no lock, and `Firewall` serializes its own read-then-write steps
 instead of relying on a caller holding the registry lock across `nft`.
 
+**Containment path.** tap -> netmon loop -> delivery worker -> `Adjudicator.submit`, which isolates a blocklist hit
+*right there* (gate, then one nft commit), then queues the event for the model, which can only add to it. See
+[containment-latency.md](containment-latency.md).
+
 Since 0.3.1 each tap sync is also split into lock wait / nft / other plus a no-op-child control, and a slow one is
 explained in the log: see [tap-latency.md](tap-latency.md). Since 0.3.3 the kernel's rules are READ over netlink
 (`nftdump`) rather than with `nft list`, whose cost grows quadratically with live tasks; writes still go through nft.

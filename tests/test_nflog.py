@@ -1997,3 +1997,148 @@ def test_the_experiment_tool_shows_one_commit_per_write_operation_and_cleans_up(
     assert len(rows) >= 2 and all(" 1 commit " in ln and "commits" not in ln for ln in rows)
     assert "coraexp" not in subprocess.run(["nft", "list", "tables"], capture_output=True, text=True).stdout
     assert not [n for n in os.listdir(MOUNT) if n.startswith("coraexp-")]
+
+
+# ============ time-to-containment, from the TASK's point of view, on the real kernel ============
+class _SlowModel:
+    """Stands in for the real model: `delay` seconds per event, then ESCALATE (it adds nothing at the floor)."""
+    def __init__(self, delay):
+        self.delay = delay
+
+    def judge(self, ev):
+        time.sleep(self.delay)
+        return json.dumps({"verdict": "ESCALATE", "confidence": 0.9, "reason": "slow"})
+
+
+_PROBE = ("import socket, time\n"
+          "s = socket.socket(2, 2); t0 = time.monotonic()\n"
+          "while time.monotonic() - t0 < 8:\n"
+          "    try:\n"
+          "        s.sendto(b'x', ('203.0.113.1', 9))\n"
+          "    except PermissionError:\n"                       # netfilter OUTPUT drop: egress is really cut
+          "        print(int((time.monotonic() - t0) * 1000), flush=True); time.sleep(8); break\n"   # stay alive: the late
+          "    time.sleep(0.001)\n"                                                               # decision needs a pid
+          "else:\n"
+          "    print(-1, flush=True)\n")
+
+
+@real
+@pytest.mark.parametrize("contain_first", [True, False])
+def test_a_task_hitting_a_listed_address_is_cut_off_in_milliseconds_not_after_the_model(env, contain_first):
+    """A real task sends UDP to a listed address in a loop and measures how long until its first EPERM (egress
+    really dropped). The model takes 1.5 s. With early containment the task is cut off long before the model answers;
+    the control (switch off) is cut off only after it, which is how the system behaved before."""
+    from cora_sentinel.verdict import Adjudicator, Executor
+    if GW is None:
+        pytest.skip("no default route: a UDP send would fail before netfilter")
+    cg, fw, made = env
+    events, decisions = [], []
+    s, nm = monitor(cg, fw, made, events, lines=["203.0.113.1/32"])
+    adj = Adjudicator(s.net, _SlowModel(1.5), Executor(True, cg, fw), None, 0.6, sink=decisions.append,
+                      contain_first=contain_first)
+    s.emit = lambda p: (events.append(p), adj.submit(p))
+    adj.start()
+    p = task(cg, fw, "probe", _PROBE)
+    try:
+        latency = int(p.stdout.readline().strip())
+        assert _until(lambda: decisions, 10)                              # the model's decision arrives later
+    finally:
+        p.kill(); adj.stop()
+    d = decisions[0]
+    print(f"\ncontain_first={contain_first}: task cut off after {latency} ms; decision after model {d['model_ms']} ms; "
+          f"in-process first-seen -> contained {d.get('contained_ms')} ms")
+    assert latency >= 0 and d["final"] == "ISOLATE" and d["model_ms"] >= 1500
+    if contain_first:
+        assert latency < 500, "the task was not cut off before the model answered"
+        assert d["contained_first"]["action"].startswith("done:ISOLATE") and d["contained_ms"] < 500
+        assert d["action"].endswith(",already]")
+    else:
+        assert latency >= 1400, "without early containment the task is only cut off after the model"
+
+
+_LATENCY_TOOL = Path(__file__).resolve().parents[1] / "tools" / "containment_latency.py"
+
+
+@real
+def test_the_containment_latency_tool_shows_floor_first_beating_the_model_and_cleans_up():
+    if GW is None:
+        pytest.skip("no default route")
+    r = subprocess.run([sys.executable, str(_LATENCY_TOOL), "--trials", "2", "--model-delay", "1.0", "--check"],
+                       capture_output=True, text=True, timeout=180)
+    assert r.returncode == 0, r.stdout[-1500:] + r.stderr[-1500:]
+    assert "floor-first ON" in r.stdout and "floor-first OFF" in r.stdout and "slower: that is the model" in r.stdout
+    assert "coralat" not in subprocess.run(["nft", "list", "tables"], capture_output=True, text=True).stdout
+    assert not [n for n in os.listdir(MOUNT) if n.startswith("coralat-")]
+    assert not [n for n in os.listdir("/run/lock") if n.startswith("cora-tap-coralat")]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="as root the tool would actually run")
+def test_the_containment_latency_tool_refuses_to_run_without_root():
+    r = subprocess.run([sys.executable, str(_LATENCY_TOOL)], capture_output=True, text=True, timeout=60)
+    assert r.returncode != 0 and "run as root" in r.stderr
+
+
+# ============ IPv6 through the tap. NOT RUN BY THE AUTHOR: the development kernel has no IPv6 at all ============
+def _v6_loopback():
+    try:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        s.bind(("::1", 0))
+        s.close()
+        return True
+    except OSError:
+        return False
+
+
+v6 = pytest.mark.skipif(not _v6_loopback(), reason="no IPv6 loopback (sudo sysctl -w net.ipv6.conf.lo.disable_ipv6=0)")
+
+
+@real
+@v6
+def test_ipv6_tcp_syns_are_seen_by_the_tap_and_attributed_to_the_task(env):
+    """Written so the first run on a machine WITH IPv6 either confirms the v6 TCP tap or finds the hole. The tap's TCP
+    rule is in an `inet` table, so it should cover v6; that has never been exercised on a kernel."""
+    cg, fw, made = env
+    events = []
+    s, nm = monitor(cg, fw, made, events, lines=[])
+    lis = socket.socket(socket.AF_INET6)
+    lis.bind(("::1", 0))
+    lis.listen(64)
+    port = lis.getsockname()[1]
+    stop = drain(lis)
+    code = ("import socket, time\n"
+            "for _ in range(6):\n"
+            f"    socket.create_connection(('::1', {port}), timeout=2).close()\n"
+            "    time.sleep(0.05)\n"
+            "time.sleep(2)\n")
+    p = task(cg, fw, "v6tcp", code)
+    try:
+        assert _until(lambda: nm.syn_by_task["v6tcp"] >= 6, 10), f"the tap saw {dict(nm.syn_by_task)}"
+    finally:
+        stop.set(); p.kill(); p.wait(); lis.close()
+
+
+@real
+@v6
+def test_ipv6_udp_first_packets_are_seen_once_per_flow_not_once_per_packet(env):
+    """The v6 UDP rules (u6s/u6l) and the cora_flow6 set have never run on a kernel. 8 flows x 6 datagrams each must
+    be 8 events."""
+    cg, fw, made = env
+    events = []
+    s, nm = monitor(cg, fw, made, events, lines=[])
+    srv = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+    srv.bind(("::1", 0))
+    port = srv.getsockname()[1]
+    code = ("import socket, time\n"
+            "socks = [socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) for _ in range(8)]\n"
+            "for _ in range(6):\n"
+            "    for s in socks:\n"
+            f"        s.sendto(b'x', ('::1', {port}))\n"
+            "    time.sleep(0.02)\n"
+            "time.sleep(2)\n")
+    p = task(cg, fw, "v6udp", code)
+    try:
+        assert _until(lambda: nm.udp_by_task["v6udp"] >= 8, 10), f"the tap saw {dict(nm.udp_by_task)}"
+        time.sleep(0.5)
+        assert nm.udp_by_task["v6udp"] == 8, f"expected one event per flow (8), got {nm.udp_by_task['v6udp']}"
+    finally:
+        p.kill(); p.wait(); srv.close()

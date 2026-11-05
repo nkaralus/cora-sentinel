@@ -23,7 +23,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Callable, Optional
+from typing import Callable, Dict, Optional
 
 from cora_sentinel.cgroup import CgroupError, CgroupRoot
 from cora_sentinel.firewall import FirewallError
@@ -168,8 +168,13 @@ class Adjudicator:
     def __init__(self, net: VirtualNet, model, executor: Executor,
                  decisions_path: Optional[str] = None, min_conf: float = 0.6,
                  sink: Optional[Callable[[dict], None]] = None,
-                 reporter=None, blocklist_floor: bool = True):
+                 reporter=None, blocklist_floor: bool = True, contain_first: bool = True):
         self.reporter, self.blocklist_floor = reporter, blocklist_floor
+        # Contain a blocklist hit at submit() time, before it queues behind the model. The floor in handle()
+        # guarantees at least ISOLATE for these whatever the model says, so this changes WHEN, not whether.
+        self.contain_first = contain_first
+        self._early: Dict[str, dict] = {}                 # event_id -> what the early containment did
+        self.contained_first = self.dropped = 0
         self.net, self.model, self.executor = net, model, executor
         self.min_conf = min_conf
         self.q: "queue.Queue[Optional[dict]]" = queue.Queue(maxsize=32)
@@ -203,6 +208,9 @@ class Adjudicator:
         d = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
              "event_id": ev["event_id"], "pid": subj["pid"], "vip": subj["vip"],
              "kind": ev["anomaly"]["kind"], "mode": "enforce" if self.executor.enforce else "dry-run"}
+        early = self._early.pop(ev["event_id"], None)
+        if early:
+            d["contained_first"] = early
         t0 = time.monotonic()
         try:
             m = parse_verdict(self.model.judge(ev))
@@ -240,6 +248,13 @@ class Adjudicator:
                     d["action"] = self.executor.run(final, subj["pid"], subj.get("cgroup"))
                 else:
                     d["action"] = "blocked"
+            seen = (ev.get("timing") or {}).get("seen_mono_s")
+            if seen is not None:                          # first seen -> first containment, whichever path got there
+                first = early["since_seen_ms"] if early and early["action"].startswith(("done:", "dry-run:")) else None
+                if first is None and d["action"].startswith(("done:", "dry-run:")):
+                    first = round((time.monotonic() - seen) * 1000.0, 2)
+                if first is not None:
+                    d["contained_ms"] = first
         elif final == "ESCALATE":
             d["action"] = "needs-human"
         self._record(d)
@@ -264,11 +279,58 @@ class Adjudicator:
         self._thread = threading.Thread(target=self._loop, name="adjudicator", daemon=True)
         self._thread.start()
 
+    def _contain_first(self, ev: dict) -> None:
+        """Isolate the task of a deterministic (blocklist) detection NOW, in the caller's thread, instead of after
+        its turn behind the model (2-4 s per event, one at a time, 32 slots). The gate is the same one handle() uses
+        and net.lock is held only around the action, never around the model call. Never raises."""
+        try:
+            if not (self.contain_first and self.blocklist_floor):
+                return
+            if not ev["anomaly"]["evidence"].get("blocklist"):
+                return
+            subj = ev["subject"]
+            if not (subj.get("cgroup") and self.executor.firewall):
+                return                                    # cannot isolate: handle() escalates it, as before
+            t = time.monotonic()
+            with self.net.lock:
+                ok, code, detail, gv = self._gate(subj)
+                if ok and gv.still_valid(self.net.reg):
+                    action = self.executor.run("ISOLATE", subj["pid"], subj["cgroup"])
+                else:
+                    action = "blocked"
+            done = time.monotonic()
+            seen = (ev.get("timing") or {}).get("seen_mono_s")
+            self._early[ev["event_id"]] = {
+                "action": action, "gate": {"ok": ok, "code": code, "detail": detail[:120]},
+                "act_ms": round((done - t) * 1000.0, 2),
+                "since_seen_ms": round((done - seen) * 1000.0, 2) if seen is not None else None}
+            if action.startswith(("done:", "dry-run:")):
+                self.contained_first += 1
+        except Exception as e:
+            print(f"[verdict] early containment failed: {e!r}", file=sys.stderr)
+
     def submit(self, ev: dict) -> None:
+        self._contain_first(ev)
         try:
             self.q.put_nowait(ev)
         except queue.Full:
-            print("[verdict] queue full, event dropped", file=sys.stderr)
+            # The queue is full because the model is slow. A contained task is still contained; an event that was
+            # NOT contained and is dropped here is never judged at all, so say so loudly and keep a record.
+            self.dropped += 1
+            early = self._early.pop(ev.get("event_id"), None)
+            contained = bool(early) and early["action"].startswith(("done:", "dry-run:"))
+            print("[verdict] queue full, event dropped" + ("; its task was already contained at the policy floor"
+                                                          if contained else " AND NOT CONTAINED"), file=sys.stderr)
+            try:
+                subj = ev["subject"]
+                self._record({"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                              "event_id": ev["event_id"], "pid": subj["pid"], "vip": subj["vip"],
+                              "kind": ev["anomaly"]["kind"], "mode": "enforce" if self.executor.enforce else "dry-run",
+                              "final": "ISOLATE" if contained else "DROPPED", "policy": "queue_full",
+                              "action": early["action"] if early else "dropped:queue-full", "queue_dropped": True,
+                              "model": None, "contained_first": early})
+            except Exception as e:
+                print(f"[verdict] could not record the dropped event: {e!r}", file=sys.stderr)
 
     def _loop(self) -> None:
         while True:

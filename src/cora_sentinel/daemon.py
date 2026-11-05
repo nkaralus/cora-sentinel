@@ -459,6 +459,7 @@ class Sentinel:
             if now - self._last.get(key, -1e9) < self.cooldown_s:
                 return
             self._last[key] = now
+            payload.setdefault("timing", {})["seen_mono_s"] = now   # when the tap/tick saw it (process-local seconds)
             self.emit(payload)
 
     def tick(self, now: Optional[float] = None) -> None:
@@ -569,6 +570,9 @@ def main() -> int:
     ap.add_argument("--resolve-max", type=int, default=2000, help="domains resolved per hourly cycle")
     ap.add_argument("--no-blocklist-floor", action="store_true",
                     help="let the model downgrade a blocklist hit (default: floor is ISOLATE)")
+    ap.add_argument("--no-contain-first", action="store_true",
+                    help="wait for the model before isolating a blocklist hit (default: isolate at once, at the "
+                         "floor, and let the model only add to it; see docs/containment-latency.md)")
     ap.add_argument("--report-dir", default="cora_reports",
                     help="anonymized violation reports for blocklist hits ('' disables)")
     ap.add_argument("--report-salt", default="~/.config/cora/report_salt")
@@ -692,7 +696,7 @@ def main() -> int:
         adj = Adjudicator(s.net, Qwen3B(a.model, n_threads=a.threads),
                           Executor(enforce=a.enforce, cgroups=cg, firewall=fw), a.decisions,
                           a.min_conf, reporter=reporter,
-                          blocklist_floor=not a.no_blocklist_floor)
+                          blocklist_floor=not a.no_blocklist_floor, contain_first=not a.no_contain_first)
         adj.start()
         base_emit = emit
         emit = lambda p: (base_emit(p), adj.submit(p))  # noqa: E731

@@ -5,4 +5,4 @@ local model (grammar-constrained) proposes a verdict; deterministic gates decide
 See README.md.
 """
 
-__version__ = "0.3.4"
+__version__ = "0.4.0"

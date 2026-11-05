@@ -143,7 +143,9 @@ restarting**: only the lists change (taps, cgroup tracking and firewall rules ar
 reload keeps the current lists, and resolved addresses carry over so detection has no gap. See
 [docs/blocklist-updates.md](docs/blocklist-updates.md).
 
-Reading the tap rules back is done over netlink, not with `nft list` (whose cost grows quadratically with live
+A blocklist hit is isolated at once, before it queues behind the model: a task's egress is cut about 4-6 ms after its
+first packet instead of after the model's 2-4 s (and a full queue can no longer leave it uncontained); see
+[docs/containment-latency.md](docs/containment-latency.md). Reading the tap rules back is done over netlink, not with `nft list` (whose cost grows quadratically with live
 tasks: 160 tasks cost 1.8-2.0 s per listing, 20 ms over netlink), and every write (install, ISOLATE, gc) is one nft
 commit. Slow tap installs are explained, not guessed at: each sync is split into lock wait / nft / other with a no-op-process
 control, and `tools/nft_latency_experiments.py` checks the verdict against causes it produces on purpose. See
@@ -200,8 +202,9 @@ python -m pytest -q                              # unprivileged: kernel tests sk
 sudo -E ./venv/bin/python -m pytest -q           # everything (CORA_GGUF=path adds the real-model test)
 ```
 
-At 0.3.4: **430 passed, 2 skipped** as root against the installed wheel (the skips are an IPv6 loopback and a test
-that only applies when not root; the real-model test ran), and **361 passed, 71 skipped** unprivileged. The unprivileged run is what CI executes.
+At 0.4.0: **453 passed, 5 skipped** as root against the installed wheel (the skips: IPv6 sock_diag, two tests that
+only apply when not root, and two IPv6 tap tests that have never been run on a kernel with IPv6; the real-model
+test ran), and **382 passed, 76 skipped** unprivileged. The unprivileged run is what CI executes.
 
 ## Layout
 

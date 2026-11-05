@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.4.0
+
+### Changed (behavior)
+- **A blocklist hit is isolated at once, before it queues behind the model.** `Adjudicator.submit()` runs the same gate
+  `handle()` uses and isolates the task; the model then judges the event and can only escalate. Measured from the task
+  (first packet -> first `EPERM`): 5-6 ms against 1,505 ms with a 1.5 s model, on the real kernel. `--no-contain-first`
+  restores the old order. The blocklist floor already guaranteed at least `ISOLATE`, so this changes when, not whether.
+- **Stricter, never weaker, for two verdicts.** Where the model itself returns `SUSPEND` or `TERMINATE` for a blocklist
+  hit, the floor used to add nothing, so the task ended up with no egress rule. It now also carries the egress drop.
+  The end state is identical for every other verdict (pinned by a test over all six).
+
+### Fixed
+- **A full adjudicator queue left known-bad tasks uncontained.** `submit()` discarded the event when the 32-slot queue was
+  full, and the model takes 2-4 s per event, so a burst of about 33 or more blocklist hits lost the rest entirely. They are
+  now contained before queueing, and any dropped event is counted (`Adjudicator.dropped`), written to the decision log
+  (`queue_dropped: true`) and logged as contained at the floor or "AND NOT CONTAINED".
+
+### Added
+- Decision fields `contained_first` and `contained_ms`; events carry `timing.seen_mono_s` (not shown to the model, not in
+  reports).
+- `tools/containment_latency.py`: black-box time to containment from a real task's point of view, floor-first ON and OFF
+  alternating, with a fake model or your own (`--model`).
+- IPv6 tap tests (TCP SYN, UDP once per flow). **Not run by the author**: the development kernel has no IPv6.
+
+### Not done
+- The first packet to a listed address still leaves: the tap logs it, it does not hold it. Preventing it needs the listed
+  addresses in the kernel. Model-only events still wait for the model and can still be dropped when the queue is full
+  (now loudly and on the record).
+
 ## 0.3.4
 
 ### Fixed
