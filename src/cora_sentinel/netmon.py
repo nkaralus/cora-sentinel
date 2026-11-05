@@ -72,6 +72,19 @@ def _norm(ip: str) -> str:
         return ip
 
 
+def _cpu_stall_ms() -> Optional[float]:
+    """Cumulative milliseconds in which at least one runnable task was waiting for a CPU (kernel PSI), or None
+    where the kernel does not expose it. The difference across a sync says how oversubscribed the CPUs were."""
+    try:
+        with open("/proc/pressure/cpu") as f:
+            for line in f:
+                if line.startswith("some"):
+                    return int(line.rsplit("total=", 1)[1]) / 1000.0
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
 def _fork_exec_ms() -> float:
     """Wall time of a child process that does nothing, measured under the same load as the nft calls. It separates
     'nft is slow' from 'starting ANY process is slow' (-1 if it could not be measured)."""
@@ -83,17 +96,39 @@ def _fork_exec_ms() -> float:
     return (time.monotonic() - t) * 1000.0
 
 
+def _nft_only(ne: float, ce: float, cpu_pressure: Optional[float]) -> str:
+    """The no-op child was barely delayed but nft was: say what that does and does NOT show. Forking staying fast
+    does not mean the host is idle: load can reach nft's kernel transaction path (kernel threads such as RCU's and
+    the kworkers compete with it) without slowing a fork. CPU pressure (PSI) tells the two apart."""
+    head = f"nft's slowest call lost {ne:.0f} ms against its best, a no-op process only {ce:.0f} ms: "
+    if cpu_pressure is not None and cpu_pressure >= 0.5:
+        return head + (f"but the CPUs were oversubscribed during the sync (a task was waiting for a CPU "
+                       f"{cpu_pressure:.0%} of it). That is load reaching nft's kernel transaction path (kernel "
+                       f"threads such as RCU's and kworkers compete with it) even though forking stays fast; it is "
+                       f"not evidence of commit contention")
+    if cpu_pressure is not None and cpu_pressure < 0.10:
+        return head + (f"and the CPUs were NOT oversubscribed ({cpu_pressure:.0%} pressure). This points at nft or "
+                       f"the kernel's nftables transaction path itself: consistent with commit contention from other "
+                       f"nft/netlink users, or a slow commit (for example waiting for an RCU grace period)")
+    why = (f"CPU pressure {cpu_pressure:.0%}: inconclusive" if cpu_pressure is not None
+           else "CPU pressure unavailable on this kernel")
+    return head + f"this points at nft or the kernel's nftables transaction path; host load can still slow that path without slowing fork ({why})"
+
+
 def diagnose(total_ms: float, lock_ms: float, nft_ms: float, slowest_ms: float, ctl_ms: float,
-             ctl_base: Optional[float] = None, slow_base: Optional[float] = None) -> str:
+             ctl_base: Optional[float] = None, slow_base: Optional[float] = None,
+             cpu_pressure: Optional[float] = None, total_base: Optional[float] = None) -> str:
     """Where a slow tap sync spent its time, in words. A heuristic: it says what the numbers SUGGEST.
 
     The lock wait is measured directly, so that verdict is firm. For nft the question is "what slowed it", and a
     bare comparison with the no-op child cannot answer it (an nft call costs several no-op processes even on an
-    idle host). So compare how much each SLOWED DOWN against its own fastest this run: host load slows both
-    together; a problem inside nft or the kernel's nftables path slows only nft. It is the EXTRA milliseconds that
-    count (a no-op child going from 1 ms to 4 ms is a x4 "slowdown" that is only jitter): what share of nft's extra
-    delay does the no-op child also suffer? Under 10% (and under 30 ms): nft alone. Over 15%: the whole host."""
-    if total_ms < 100:
+    idle host). So compare EXTRA milliseconds against each one's own fastest this run (a no-op child going from
+    1 ms to 4 ms is a x4 "slowdown" that is only jitter): what share of nft's extra delay does the child also
+    suffer? Under 10% (and under 30 ms): nft alone, and then CPU pressure says whether the CPUs were oversubscribed
+    anyway. Over 15%: the whole host. A busy many-core host can slow nft's commit WITHOUT slowing a fork."""
+    # Fast outright, or within 2x of what this machine has shown before. But never for a sync that is itself a stall
+    # (over the loud-note threshold): a machine that has only ever been slow must not call a 13 s sync "not slow".
+    if total_ms < 100 or (total_base and total_ms <= 2 * total_base and total_ms < STALL_WARN_MS):
         return "not slow: nothing to explain"
     if lock_ms >= 0.5 * total_ms:
         return ("mostly waiting for the cross-process tap lock: another holder (e.g. cora-run installing rules) "
@@ -105,8 +140,7 @@ def diagnose(total_ms: float, lock_ms: float, nft_ms: float, slowest_ms: float, 
     if ctl_base and slow_base:
         ce, ne = max(ctl_ms - ctl_base, 0.0), max(slowest_ms - slow_base, 1.0)     # EXTRA delay, in ms, vs best seen
         if ce < 30 and ce <= 0.10 * ne:
-            return (f"nft's slowest call lost {ne:.0f} ms against its best, a no-op process only {ce:.0f} ms: this "
-                    f"points at nft or the kernel's nftables transaction path, not general host load")
+            return _nft_only(ne, ce, cpu_pressure)
         if ce >= 0.15 * ne:
             return (f"a no-op process lost {ce:.0f} ms along with nft ({ne:.0f} ms): the whole host is slow "
                     f"(CPU or fork pressure), which is not a netlink problem")
@@ -115,7 +149,7 @@ def diagnose(total_ms: float, lock_ms: float, nft_ms: float, slowest_ms: float, 
     if ctl_ms >= 50:                                 # no baseline yet: an absolute rule is all there is
         return "nft is slow AND so is starting a no-op process: the host is too busy to fork or schedule"
     return ("nft is slow while a no-op process started promptly (no idle baseline yet to compare against): "
-            "inside nft or the kernel's nftables transaction path")
+            "inside nft or the kernel's nftables transaction path (host load can still slow it without slowing fork)")
 
 
 class NetMonitor:
@@ -149,6 +183,7 @@ class NetMonitor:
         self._sync_requested: Optional[Dict[str, int]] = None
         self.worst_sync: dict = {}                                          # the breakdown of the slowest sync
         self._ctl_base = self._slow_base = float('inf')                     # fastest no-op child / nft call seen
+        self._total_base = float('inf')                                     # fastest whole sync seen
         self._sync_warn_at = 0.0
         self._tap_synced: Dict[str, int] = {}
         self._tap_err_at = -1e9
@@ -368,6 +403,7 @@ class NetMonitor:
 
     def _sync_now(self, cur: Dict[str, int]) -> None:
         ctl = _fork_exec_ms()                        # control: is starting a process slow right now?
+        psi0 = _cpu_stall_ms()                       # and: were the CPUs oversubscribed during the sync?
         t = time.monotonic()
         try:
             added, removed = self.tap.sync(cur)      # runs nft under a cross-process lock; also repairs damage
@@ -380,9 +416,11 @@ class NetMonitor:
                 self._tap_err_at = time.monotonic()
                 _note(f"tap rule sync failed: {e}")
         finally:
-            self._record_sync((time.monotonic() - t) * 1000.0, ctl, dict(getattr(self.tap, "last_timing", None) or {}))
+            psi1 = _cpu_stall_ms()
+            self._record_sync((time.monotonic() - t) * 1000.0, ctl, dict(getattr(self.tap, "last_timing", None) or {}),
+                              (psi1 - psi0) if psi0 is not None and psi1 is not None else None)
 
-    def _record_sync(self, ms: float, ctl: float, tm: dict) -> None:
+    def _record_sync(self, ms: float, ctl: float, tm: dict, cpu_stall_ms: Optional[float] = None) -> None:
         """Split one sync into lock wait / nft / other, keep the maxima and the worst case, and say so loudly
         when it was slow: that is the evidence for WHY a tap rule was late."""
         lock, nft, slow = tm.get("lock_ms", 0.0), tm.get("nft_ms", 0.0), tm.get("nft_slowest_ms", 0.0)
@@ -390,12 +428,19 @@ class NetMonitor:
                      ("tap_nft_call_ms_max", slow), ("tap_ctl_ms_max", ctl)):
             if int(v) > self.stats[k]:
                 self.stats[k] = int(v)
+        pressure = None if cpu_stall_ms is None or ms <= 0 else min(max(cpu_stall_ms / ms, 0.0), 1.0)
+        if pressure is not None and int(pressure * 100) > self.stats["tap_cpu_pressure_pct_max"]:
+            self.stats["tap_cpu_pressure_pct_max"] = int(pressure * 100)
+        prior_total = self._total_base                  # the baseline from EARLIER syncs: this one must not define it
+        self._total_base = min(self._total_base, ms)
         if ctl > 0:
             self._ctl_base = min(self._ctl_base, ctl)
         if slow > 0:
             self._slow_base = min(self._slow_base, slow)
         this = {"total_ms": ms, "lock_ms": lock, "nft_ms": nft, "calls": tm.get("nft_calls", 0),
-                "slowest_ms": slow, "ctl_ms": ctl,
+                "slowest_ms": slow, "ctl_ms": ctl, "slowest_cmd": tm.get("nft_slowest_cmd", ""),
+                "cpu_pressure": pressure,
+                "total_base": prior_total if prior_total != float("inf") else None,
                 "ctl_base": self._ctl_base if self._ctl_base != float("inf") else None,
                 "slow_base": self._slow_base if self._slow_base != float("inf") else None}
         if ms >= self.worst_sync.get("total_ms", -1.0):
@@ -407,10 +452,12 @@ class NetMonitor:
     @staticmethod
     def _describe(w: dict) -> str:
         other = max(w["total_ms"] - w["lock_ms"] - w["nft_ms"], 0.0)
+        cmd = f" [{w['slowest_cmd']}]" if w.get("slowest_cmd") else ""
+        press = f" CPU pressure during it: {w['cpu_pressure']:.0%}." if w.get("cpu_pressure") is not None else ""
         return (f"tap sync took {w['total_ms']:.0f} ms = lock wait {w['lock_ms']:.0f} + nft {w['nft_ms']:.0f} "
-                f"({w['calls']} calls, slowest {w['slowest_ms']:.0f}) + other {other:.0f}; a no-op child took "
-                f"{w['ctl_ms']:.0f} ms. Suggests: "
-                f"{diagnose(w['total_ms'], w['lock_ms'], w['nft_ms'], w['slowest_ms'], w['ctl_ms'], w.get('ctl_base'), w.get('slow_base'))}")
+                f"({w['calls']} calls, slowest {w['slowest_ms']:.0f}{cmd}) + other {other:.0f}; a no-op child took "
+                f"{w['ctl_ms']:.0f} ms.{press} Suggests: "
+                f"{diagnose(w['total_ms'], w['lock_ms'], w['nft_ms'], w['slowest_ms'], w['ctl_ms'], w.get('ctl_base'), w.get('slow_base'), w.get('cpu_pressure'), w.get('total_base'))}")
 
     def _sync_loop(self) -> None:
         while not self._stop.is_set():
@@ -557,7 +604,8 @@ class NetMonitor:
                 f"owner_cached={s['owner_cached']} dispatch_dropped={s['dispatch_dropped']} errors={s['errors']} "
                 f"poll_ms_max={s['poll_ms_max']} tap_sync_ms_max={s['tap_sync_ms_max']} "
                 f"(lock_wait_max={s['tap_lock_wait_ms_max']} nft_max={s['tap_nft_ms_max']} "
-                f"slowest_nft_call={s['tap_nft_call_ms_max']} noop_child_max={s['tap_ctl_ms_max']}) "
+                f"slowest_nft_call={s['tap_nft_call_ms_max']} noop_child_max={s['tap_ctl_ms_max']} "
+                f"cpu_pressure_max={s['tap_cpu_pressure_pct_max']}%) "
                 f"LOST={self.lost()}"
                 + (f" | worst_tap_sync: {self._describe(self.worst_sync)}"
                    if self.worst_sync.get("total_ms", 0) > STALL_WARN_MS else ""))

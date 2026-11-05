@@ -17,12 +17,18 @@ def _preinstall_tap(cg: CgroupRoot, name: str) -> None:
     misses it installs the rule within one poll interval."""
     try:
         from cora_sentinel.firewall import Firewall
-        from cora_sentinel.nflog import DEFAULT_GROUP, TapRules
+        from cora_sentinel.nflog import (DEFAULT_GROUP, PREINSTALL_LOCK_TIMEOUT_S, TapLockTimeout, TapRules,
+                                         lock_timeout_from_env)
         fw = Firewall(cg, table=os.environ.get("CORA_NFT_TABLE", "cora"))
         # udp=None: follow the live table (the sentinel may run with --no-tap-udp)
-        tap = TapRules(fw, int(os.environ.get("CORA_NFLOG_GROUP", DEFAULT_GROUP)), udp=None)
+        # a short lock timeout: never hold up starting the task for long (the sentinel installs the rule anyway)
+        tap = TapRules(fw, int(os.environ.get("CORA_NFLOG_GROUP", DEFAULT_GROUP)), udp=None,
+                       lock_timeout=lock_timeout_from_env(PREINSTALL_LOCK_TIMEOUT_S))
         if tap.active():
             tap.install(name)
+    except TapLockTimeout as e:   # never block starting the task, but say what it costs
+        print(f"cora_run: tap pre-install SKIPPED: {e}. The task starts anyway; its first connection may go "
+              f"unobserved until the sentinel installs the rule.", file=sys.stderr)
     except Exception as e:   # never block starting the task
         print(f"cora_run: tap pre-install skipped ({e})", file=sys.stderr)
 

@@ -1,49 +1,106 @@
 # Why was a tap rule late? Splitting a slow sync into lock, nft and host
 
 A new task's tap rules are installed by the **tap sync worker** (and by `cora-run` before it execs). Two things can make
-that slow, and they have different fixes: waiting for the cross-process **tap lock**, or time spent **inside nft**. And
-slow nft has two very different causes: the *host* is too busy to run anything, or something in **nft or the kernel's
-nftables transaction path** is slow. Since 0.3.1 every sync is measured so you can tell which.
+that slow, with different fixes: waiting for the cross-process **tap lock**, or time spent **inside nft**. And slow nft
+has more than one cause. Every sync is measured so you can tell which.
 
 ## What is measured
 
 | Number | Meaning |
 |---|---|
 | **lock wait** | time spent waiting for the cross-process lock (`/run/lock/cora-tap-<table>.lock`), held by `cora-run` or another sync |
-| **nft** | wall time inside nft subprocesses, with the call count and the slowest single call |
-| **other** | the rest: Python, the GIL, disk |
-| **no-op child** | how long `true` took, measured just before the sync, under the same conditions: a control for "is starting *any* process slow right now?" |
+| **nft** | wall time inside nft subprocesses, with the call count, the slowest call, and **which call it was** (`-j list chain` is a dump; `-f -` is a transaction commit) |
+| **other** | the rest: Python, the GIL, disk, and the netlink reads (a millisecond or two) |
+| **no-op child** | how long `true` took, just before the sync: a control for "is starting *any* process slow right now?" |
+| **CPU pressure** | the share of the sync during which some task was waiting for a CPU (the kernel's PSI, `/proc/pressure/cpu`); absent on kernels without it |
 
 The nft tally is per thread, so the sync worker's numbers are not mixed with the adjudicator's. None of this runs on the
-event loop (see `architecture.md`); the cost is one extra no-op child process per sync, on the worker (about 1 ms).
+event loop (see `architecture.md`); the cost is one extra no-op child per sync, on the worker (about 1 ms).
 
 ## Where it shows up
 
-When a sync takes more than 500 ms the sentinel says so at once, in the log:
+A sync over 500 ms is reported at once, in the log:
 
 ```
-[cora-sentinel] tap sync took 1575 ms = lock wait 1568 + nft 7 (2 calls, slowest 4) + other 0; a no-op child took 2 ms.
-Suggests: mostly waiting for the cross-process tap lock: another holder (e.g. cora-run installing rules) kept it that long
+[cora-sentinel] tap sync took 1575 ms = lock wait 1568 + nft 7 (2 calls, slowest 4 [-f -]) + other 0; a no-op child
+took 2 ms. CPU pressure during it: 2%. Suggests: mostly waiting for the cross-process tap lock: another holder (e.g.
+cora-run installing rules) kept it that long
 ```
 
-and the end-of-run summary carries `tap_sync_ms_max=… (lock_wait_max=… nft_max=… slowest_nft_call=… noop_child_max=…)`,
-plus `worst_tap_sync: …` (the breakdown of the single slowest sync) if there was a slow one.
+and the end-of-run summary carries `tap_sync_ms_max=… (lock_wait_max=… nft_max=… slowest_nft_call=… noop_child_max=…
+cpu_pressure_max=…%)`, plus `worst_tap_sync: …` (the breakdown of the single slowest sync) if there was a slow one.
+
+## The biggest cost was reading the rules, and it grew with load
+
+A 28-core bare-metal run showed an *idle* sync whose slowest call was **`[-j list chain]`, 79-84 ms**: the dump, not a
+commit. That led to the cause:
+
+**`nft list` prints a `socket cgroupv2` match by resolving the cgroup id back to a path, and the cost of that grows
+with how many cgroups it has to get through.** Measured on a Linux 6.18 / nft 1.0.9 test machine:
+
+| what | result |
+|---|---|
+| process start (`nft --version`) | 1.5 ms, flat |
+| text, JSON and `-nnn` listings | identical: it is not formatting |
+| a chain **without** cgroup rules, in the same table | 2 ms whatever the cgroup count |
+| 1,000 extra cgroups, the directory given ten different names: **six** list *before* ours | 233-306 ms (8 rules), 1,150-1,290 ms (40 rules) |
+| ... and the other **four** list *after* ours | 3.4-3.8 ms (8 rules), 8-11 ms (40 rules) |
+| **only our own tasks**, UDP rules (5 per task), 10 / 40 / 80 / 160 live tasks | 13-19 / 118-140 / 431-515 / **1,786-2,021 ms** (two runs); netlink 1.2-1.6 / 4.9-6.0 / 9-10 / 20-22 ms |
+
+Read together: the cost is (rules in the chain) x (cgroups the walk visits before reaching each rule's target) x about
+0.03 ms. *Which* cgroups are visited first depends on the kernel's listing order, which follows a hash of the directory
+names, so it is fixed for a given machine and differs between machines (and between my test runs, which is how I first
+mis-blamed the UDP rules: my TCP and UDP tables happened to sit on opposite sides of the big directory). I measured the
+effect and its scaling; I did **not** read nft's source, so "it walks the cgroup tree" is the explanation that fits, not
+a quoted fact.
+
+It is also **quadratic in live tasks**, with no external cgroups at all: each task adds 5 rules *and* another sibling
+cgroup for later lookups to walk past (80 -> 160 tasks multiplied the time by about 4). The listing ran inside the tap lock,
+which every `cora-run` launch and the sync worker serialize on, so a burst of task launches paid it over and over; and in
+`Firewall.gc`, which an ISOLATE waits behind. `active()` (run before every `cora-run` pre-install) and `udp_enabled()`
+used a plain `list`, which prints the same rules and so pays the same.
+
+### The fix: read the kernel's rules over netlink
+
+`cora_sentinel/nftdump.py` asks the kernel directly (`NFT_MSG_GETRULE` dump, `GETCHAIN`, `GETSET`). The kernel's dump
+carries the raw ids, so the cost is O(rules): **160 tasks went from 1.8-2.0 s to 20 ms**, and the cost no longer depends
+on where the machine's other cgroups sit. It reads exactly what the callers use: each rule's handle, comment and first
+counter, and whether a chain or set exists. Writes still go through nft.
+
+- **It agrees with nft.** On the real kernel, rules read both ways are identical in every state tested: empty, live with
+  real packet counters, with an injected duplicate rule, for the tap chain and the egress chain.
+- **It falls back, once, loudly.** Any netlink failure (no `CAP_NET_ADMIN`, no netlink support) switches that `Firewall`
+  to the nft command and prints one message; the result is the same, only slower.
+- **It is off where it must be:** with an injected runner (a test's fake must see every read), with no nft binary
+  (a missing nft stays a clear error from any operation, not an empty listing), and with `CORA_NFT_NATIVE=0`.
+- Not read natively: the `-f -` writes (they do not list, and were measured fast).
+
+**Check it on your machine:** `sudo python3 tools/nft_latency_experiments.py dump --tasks 160` builds live tasks in steps
+and shows the nft command against netlink side by side, with a "same rules?" column. What is *not* yet shown is that this
+was the cause of the 1.5-13 s stalls you saw under load: it is the best candidate (a listing that is quadratic in live
+tasks, held under a lock that every launch queues on), but the evidence on your machine is the `lock_wait_max` / `nft_max`
+in the monitor summary from a heavy parallel run with this version. If they stay small, it was.
 
 ## How the verdict is reached
 
-| lock wait | nft | no-op child | verdict |
-|---|---|---|---|
-| **most of the time** | | | waiting for the lock (this one is measured directly, so it is firm) |
-| small | **most of the time** | barely delayed | points at **nft or the kernel's transaction path** |
-| small | **most of the time** | delayed too | **the whole host** is slow (CPU or fork pressure), not a netlink problem |
-| small | most of the time | somewhat delayed | mixed: host load is part of it, not all |
-| small | small | | neither (Python, the GIL, disk) |
+| lock wait | nft | no-op child | CPU pressure | verdict |
+|---|---|---|---|---|
+| **most of the time** | | | | waiting for the lock (measured directly: firm) |
+| small | **most** | barely delayed | **>= 50%** | the CPUs were **oversubscribed**: load reaching nft's kernel path, *not* evidence of commit contention |
+| small | **most** | barely delayed | **< 10%** | nft or the kernel's transaction path itself: consistent with commit contention, or a slow commit (e.g. an RCU grace period) |
+| small | **most** | barely delayed | between, or unknown | nft or the kernel path; load can still slow it without slowing fork: inconclusive |
+| small | **most** | delayed too | | the whole host is slow (CPU or fork pressure) |
+| small | most | somewhat delayed | | mixed |
+| small | small | | | neither (Python, the GIL, disk) |
 
-"Delayed" is judged by **extra milliseconds against the fastest this run saw**, not by ratios (a no-op child going from
-1 ms to 4 ms is a x4 "slowdown" that is only jitter): the child suffers under 10% (and under 30 ms) of nft's extra delay
--> nft alone; 15% or more -> the whole host. These thresholds are heuristics. **The numbers are the ground truth; the
-verdict is a convenience.** A daemon that starts under load has no idle baseline until it sees a fast sync, and falls back
-to absolute rules until then.
+"Not slow" means under 100 ms **or within 2x of the fastest sync this machine has shown** (a fixed number is wrong on
+some machine: an idle 28-core sync took 100-111 ms). "Delayed" is judged by **extra milliseconds against the fastest this
+run saw**, not by ratios: under 10% of nft's extra delay (and under 30 ms) is "barely", 15% or more is "too". These
+thresholds are heuristics. **The numbers are the ground truth; the verdict is a convenience.**
+
+**A fast no-op child does not mean an idle host.** On a many-core machine, saturating the CPUs slowed nft x5 while a fork
+took 2 ms. And a slow *dump* and a slow *commit* are different problems: in a loaded run the slowest call was the dump
+(`-j list chain`, 397 ms) in one scenario and the commit (`-f -`, 221 ms) in another. The label tells you which.
 
 ## Does the verdict deserve trust? Test it on your machine
 
@@ -52,28 +109,26 @@ tool says. It needs root, touches only scratch tables (`coraexp*`), its own cgro
 them on exit.
 
 ```bash
-sudo python3 tools/nft_latency_experiments.py            # idle, lock, busy, kernel
+sudo python3 tools/nft_latency_experiments.py            # idle, lock, busy, kernel, dump
 sudo python3 tools/nft_latency_experiments.py idle lock --check     # exit 1 if a stalled scenario is named wrongly
 ```
 
-The `kernel` scenario runs 16 low-priority loaders doing tiny nft transactions in a loop, which queue on the kernel's
-commit mutex while leaving the CPU free. Measured on the author's test machine (a **single-core** microVM), twice:
+The `kernel` scenario (16 low-priority loaders doing tiny nft transactions) cannot be separated from load on one core
+(the loaders themselves showed 35% CPU pressure); use a many-core machine. The `busy` scenario is named "the whole host is
+slow" where fork slows too (few cores) and "the CPUs were oversubscribed" where it does not (many cores).
 
-| cause | worst sync | verdict |
+## The tap lock is bounded
+
+The lock used to be a plain blocking `flock`, which has no timeout: a holder that hangs (stopped, or stuck in
+uninterruptible I/O) would hang its caller forever. Now it is taken with a deadline:
+
+| Caller | Waits at most | If it times out |
 |---|---|---|
-| idle | 19-26 ms | not slow |
-| another process holds the lock | 263-267 ms = lock 248 + nft 14-18 | waiting for the lock |
-| host busy, 40 spinning processes | 536-604 ms = nft 536-603; no-op child 59-91 ms | the whole host is slow |
-| nft commit contention, CPU free | 244-249 ms = nft 243-248 (slowest call 222-227); no-op child 4-6 ms | points at nft / the kernel path |
+| the sentinel's sync worker | 30 s | logs `tap rule sync failed: could not get the tap lock ...: held by pid N (name, state)`, keeps the event loop running, and **retries** on the next poll |
+| `cora-run` (pre-install) | 5 s | prints `tap pre-install SKIPPED: ...`, **starts the task anyway**, and says what that costs: its first connection may go unobserved until the sentinel installs the rule |
 
-**Limits of that evidence.** One core means kernel work and host load are the same resource: an earlier attempt with
-30,000-rule transactions (long CPU-bound kernel work) was named "kernel" in one run and "whole host" in the next, which
-is physically right for one core and not a clean test. The low-CPU generator avoids it, but more cores separate the two
-far better, so run the tool on your own hardware. If its verdict surprises you, the log line and the tool's output are
-what to look at.
-
-## Known hazards this did not change
-
-- The tap **lock has no timeout**: a holder that hangs would hang the sync worker (new tasks would then get no tap
-  rules, silently apart from the slow-sync note once it finally returns). `cora-run` holds it only for a few nft calls.
-- Each nft call has a 10 s timeout, so one call cannot exceed that; a sync is the sum of its calls plus the lock wait.
+`CORA_TAP_LOCK_TIMEOUT` (seconds) overrides both; a non-numeric, zero, negative or infinite value is ignored with a
+message. The lock file holds `pid name` of whoever holds it, so a timeout says **who** is stuck and whether it is stopped
+(`T`), in uninterruptible I/O (`D`), or just slow. Polling adds at most 5 ms after the lock is released. Holding the lock
+is now much shorter (no slow listing inside it), and a legitimately slow holder is still bounded by nft's own 10 s
+per-call timeout.

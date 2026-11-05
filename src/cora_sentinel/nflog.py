@@ -55,6 +55,7 @@ import os
 import re
 import socket
 import struct
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
@@ -72,6 +73,8 @@ NFULNL_CFG_CMD_BIND, NFULNL_CFG_CMD_UNBIND = 1, 2
 NFULNL_COPY_PACKET = 2
 NLM_F_REQUEST, NLM_F_ACK, NLMSG_ERROR = 1, 4, 2
 SO_RCVBUFFORCE = 33
+DEFAULT_LOCK_TIMEOUT_S = 30.0          # the sentinel's sync worker: it is the only installer, so it can afford to wait
+PREINSTALL_LOCK_TIMEOUT_S = 5.0        # cora-run: must not hold up starting a task; the sentinel installs the rule anyway
 PREFIX = "cora-tap:"
 SNAPLEN_TCP = 128          # IP + TCP headers
 SNAPLEN_UDP = 320          # IP + UDP + a DNS header and a full question name
@@ -311,15 +314,37 @@ class NflogListener:
 COMMENT_RE = re.compile(r"cora-tap(?:-(u4s|u4l|u6s|u6l))?:([a-z0-9][a-z0-9_-]*)(?::(\d+))?")
 
 
+class TapLockTimeout(FirewallError):
+    """The cross-process tap lock could not be taken in time: its holder is stuck, or far slower than normal."""
+
+
+def lock_timeout_from_env(default: float) -> float:
+    """CORA_TAP_LOCK_TIMEOUT (seconds) overrides a default; an invalid value is ignored, loudly."""
+    raw = os.environ.get("CORA_TAP_LOCK_TIMEOUT")
+    if raw is None:
+        return default
+    try:
+        v = float(raw)
+        if 0 < v < float("inf"):
+            return v
+    except ValueError:
+        pass
+    print(f"cora-tap: ignoring invalid CORA_TAP_LOCK_TIMEOUT={raw!r}, using {default:g} s", file=sys.stderr)
+    return default
+
+
 class TapRules:
     CHAIN, SET4, SET6 = "tap", "cora_flow4", "cora_flow6"
     LEGACY_SETS = ("cora_udp4", "cora_udp6")   # 0.1.0 keyed flows WITHOUT the task; cleaned up on teardown
     TCP_KINDS, UDP_KINDS = ("t",), ("u4s", "u4l", "u6s", "u6l")
 
     def __init__(self, fw: Firewall, group: int = DEFAULT_GROUP, udp: Optional[bool] = True,
-                 udp_timeout: int = 30):
-        """udp=True/False forces it; udp=None auto-detects from the live table (used by cora_run)."""
+                 udp_timeout: int = 30, lock_timeout: Optional[float] = None):
+        """udp=True/False forces it; udp=None auto-detects from the live table (used by cora_run).
+        lock_timeout: seconds to wait for the cross-process tap lock before giving up (TapLockTimeout)."""
         self.fw, self.group, self.udp, self.udp_timeout = fw, group, udp, udp_timeout
+        self.lock_timeout = (lock_timeout if lock_timeout is not None
+                             else lock_timeout_from_env(DEFAULT_LOCK_TIMEOUT_S))
 
     last_timing: Dict[str, float] = {}
 
@@ -331,7 +356,8 @@ class TapRules:
         twice (measured: 4 of 30 tasks)."""
         for base in ("/run/lock", tempfile.gettempdir()):
             try:
-                fd = os.open(os.path.join(base, f"cora-tap-{self.fw.table}.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+                path = os.path.join(base, f"cora-tap-{self.fw.table}.lock")
+                fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
                 break
             except OSError:
                 continue
@@ -340,22 +366,61 @@ class TapRules:
             return
         try:
             t = time.monotonic()
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            self._flock(fd, path, t)
             self.fw.timing.lock_ms += (time.monotonic() - t) * 1000.0     # how long WE waited for another holder
+            self._note_holder(fd)
             yield
         finally:
             os.close(fd)                             # closing releases the flock
 
+    def _flock(self, fd: int, path: str, start: float) -> None:
+        """flock WITH A DEADLINE. A plain blocking flock has no timeout, so a holder that hangs (stopped, or stuck in
+        uninterruptible I/O) would hang its caller forever. Polling costs at most 5 ms after the lock is released."""
+        delay = 0.0005
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except OSError as e:
+                if e.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    raise
+            waited = time.monotonic() - start
+            if waited >= self.lock_timeout:
+                self.fw.timing.lock_ms += waited * 1000.0        # a failed wait still shows in last_timing
+                raise TapLockTimeout(f"could not get the tap lock {path} within {self.lock_timeout:g} s: "
+                                     f"{self._who_holds(fd)}")
+            time.sleep(delay)
+            delay = min(delay * 2, 0.005)
+
+    @staticmethod
+    def _note_holder(fd: int) -> None:
+        """Write who holds the lock into it (under the lock), so a timeout can say who is stuck."""
+        try:
+            os.ftruncate(fd, 0)
+            os.pwrite(fd, f"{os.getpid()} {os.path.basename(sys.argv[0]) or 'python'}\n".encode(), 0)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _who_holds(fd: int) -> str:
+        try:
+            pid, _, name = os.pread(fd, 200, 0).decode(errors="replace").strip().partition(" ")
+            with open(f"/proc/{int(pid)}/stat") as f:
+                state = f.read().rsplit(")", 1)[1].split()[0]
+            what = {"T": "stopped", "t": "traced", "D": "stuck in uninterruptible I/O", "Z": "a zombie",
+                    "S": "sleeping", "R": "running"}.get(state, f"state {state}")
+            return f"held by pid {int(pid)} ({name}, {what})"
+        except (OSError, ValueError, IndexError):
+            return "the holder could not be identified"
+
     def udp_enabled(self) -> bool:
         if self.udp is not None:
             return self.udp
-        rc, _, _ = self.fw._run(["list", "set", "inet", self.fw.table, self.SET4], None)
-        return rc == 0
+        return self.fw.set_exists(self.SET4)
 
     def active(self) -> bool:
         """True if a sentinel has set up the tap chain (used by cora_run to pre-install)."""
-        rc, _, _ = self.fw._run(["list", "chain", "inet", self.fw.table, self.CHAIN], None)
-        return rc == 0
+        return self.fw.chain_exists(self.CHAIN)
 
     def _level(self) -> int:
         """Depth of a task cgroup in the v2 tree: every task is a direct child of the root."""
@@ -410,13 +475,9 @@ class TapRules:
 
     # ---- state read back from the kernel -------------------------------------------
     def rules(self) -> Dict[str, dict]:
-        rc, out, _ = self.fw._run(["-j", "list", "chain", "inet", self.fw.table, self.CHAIN], None)
-        if rc != 0:
-            return {}
         found: Dict[str, dict] = {}
-        for item in json.loads(out).get("nftables", []):
-            r = item.get("rule")
-            m = COMMENT_RE.fullmatch(r.get("comment", "")) if r else None
+        for r in self.fw.chain_rules(self.CHAIN):            # [] when the table or chain is not there yet
+            m = COMMENT_RE.fullmatch(r["comment"] or "")
             if not m:
                 continue
             kind, name, cgid = m.group(1) or "t", m.group(2), int(m.group(3)) if m.group(3) else None
@@ -425,7 +486,7 @@ class TapRules:
             e["kinds"].add(kind)
             e["cgids"].add(cgid)
             if kind == "t":
-                e["packets"] = next((x["counter"].get("packets", 0) for x in r["expr"] if "counter" in x), 0)
+                e["packets"] = r["packets"]
         for e in found.values():                             # one agreed id, or -1 (inconsistent => stale)
             e["cgid"] = next(iter(e["cgids"])) if len(e["cgids"]) == 1 else -1
         return found
@@ -452,7 +513,7 @@ class TapRules:
                 return self._sync(live)
         finally:
             self.last_timing = {"lock_ms": tm.lock_ms, "nft_ms": tm.ms, "nft_calls": tm.calls,
-                                "nft_slowest_ms": tm.slowest}
+                                "nft_slowest_ms": tm.slowest, "nft_slowest_cmd": tm.slowest_cmd}
 
     def _sync(self, live: Dict[str, int]) -> Tuple[List[str], List[str]]:
         have = self.rules()

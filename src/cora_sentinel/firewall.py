@@ -19,6 +19,7 @@ import functools
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -26,7 +27,9 @@ import time
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
+from cora_sentinel import nftdump
 from cora_sentinel.cgroup import DEFAULT_MOUNT, DEFAULT_ROOT, CgroupError, CgroupRoot
+from cora_sentinel.nftdump import NftNetlinkError
 
 NFT_BASE = "/sys/fs/cgroup"          # nft resolves cgroupv2 paths from here
 PATH_RE = re.compile(r"[A-Za-z0-9_./@-]+", re.ASCII)
@@ -48,6 +51,7 @@ class NftTiming(threading.local):
         self.ms = 0.0          # wall time inside nft subprocesses
         self.calls = 0
         self.slowest = 0.0     # the slowest single nft call
+        self.slowest_cmd = ""  # ... and which one it was (e.g. '-j list chain' is a dump, '-f -' a commit)
         self.lock_ms = 0.0
 
 
@@ -86,6 +90,11 @@ class Firewall:
             raise FirewallError(f"bad table name {table!r}")
         self.cg, self.table, self.nft_base = cgroups, table, nft_base
         self.timing = NftTiming()
+        # Reads go straight to the kernel over netlink (see nftdump: `nft list` costs rules x cgroups). Only for the
+        # real nft, and only when its binary is there: an injected runner (a test's fake) must see every read, and a
+        # missing nft must stay a clear error from any operation rather than an empty listing.
+        self.native = (run is None and os.environ.get("CORA_NFT_NATIVE", "1") != "0"
+                       and shutil.which(nft) is not None)
         raw = run or _default_runner(nft)
 
         def timed(args: List[str], stdin: Optional[str]) -> Tuple[int, str, str]:
@@ -96,9 +105,54 @@ class Firewall:
                 ms, tm = (time.monotonic() - t) * 1000.0, self.timing
                 tm.ms += ms
                 tm.calls += 1
-                tm.slowest = max(tm.slowest, ms)
+                if ms > tm.slowest:
+                    tm.slowest, tm.slowest_cmd = ms, " ".join(args[:3])
         self._run = timed
         self._lock = threading.RLock()
+
+    # ---- reads: netlink first, the nft command as the fallback ------------------
+    def _native_off(self, e: Exception) -> None:
+        if self.native:
+            self.native = False
+            print(f"cora: reading nftables over netlink failed ({e}); using the nft command, which is slower "
+                  f"(its listing cost grows with the number of cgroups)", file=sys.stderr)
+
+    def chain_rules(self, chain: str) -> List[dict]:
+        """[{handle, comment, packets, bytes}] for one chain of our table; [] if the table or chain is missing."""
+        if self.native:
+            try:
+                return nftdump.dump_rules(self.table, chain)
+            except NftNetlinkError as e:
+                self._native_off(e)
+        rc, out, _ = self._run(["-j", "list", "chain", "inet", self.table, chain], None)
+        if rc != 0:
+            return []                                    # table or chain not there yet = no rules
+        res = []
+        for item in json.loads(out).get("nftables", []):
+            r = item.get("rule")
+            if r:
+                cnt = next((e["counter"] for e in r.get("expr", []) if "counter" in e), {})
+                res.append({"handle": r["handle"], "comment": r.get("comment"),
+                            "packets": cnt.get("packets", 0), "bytes": cnt.get("bytes", 0)})
+        return res
+
+    def chain_exists(self, chain: str) -> bool:
+        if self.native:
+            try:
+                return nftdump.chain_exists(self.table, chain)
+            except NftNetlinkError as e:
+                self._native_off(e)
+        rc, _, _ = self._run(["list", "chain", "inet", self.table, chain], None)
+        return rc == 0
+
+    def set_exists(self, name: str) -> bool:
+        if self.native:
+            try:
+                return nftdump.set_exists(self.table, name)
+            except NftNetlinkError as e:
+                self._native_off(e)
+        rc, _, _ = self._run(["list", "set", "inet", self.table, name], None)
+        return rc == 0
 
     # ---- plumbing ---------------------------------------------------------
     def _nft(self, args: List[str], stdin: Optional[str] = None) -> str:
@@ -141,18 +195,12 @@ class Firewall:
 
     # ---- state (read back from the kernel) --------------------------------
     def rules(self) -> Dict[str, dict]:
-        rc, out, _ = self._run(["-j", "list", "chain", "inet", self.table, self.CHAIN], None)
-        if rc != 0:
-            return {}  # table or chain not there yet = no rules
         found: Dict[str, dict] = {}
-        for item in json.loads(out).get("nftables", []):
-            r = item.get("rule")
-            c = r.get("comment", "") if r else ""
+        for r in self.chain_rules(self.CHAIN):             # {} when the table or chain is not there yet
+            c = r["comment"] or ""
             if c.startswith("cora:"):
                 name, _, cgid = c[5:].partition(":")       # "cora:<name>[:<cgroup id>]"
-                cnt = next((e["counter"] for e in r["expr"] if "counter" in e), {})
-                found[name] = {"handle": r["handle"], "packets": cnt.get("packets", 0),
-                               "bytes": cnt.get("bytes", 0),
+                found[name] = {"handle": r["handle"], "packets": r["packets"], "bytes": r["bytes"],
                                "cgid": int(cgid) if cgid.isdigit() else None}
         return found
 

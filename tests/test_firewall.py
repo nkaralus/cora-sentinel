@@ -409,3 +409,74 @@ def test_nft_time_is_tallied_per_thread_so_the_sync_worker_is_not_mixed_with_the
     a.start(); b.start(); a.join(); b.join()
     assert seen["a"][0] == 3 and seen["a"][1] >= 80 and seen["b"][0] == 1 and 25 <= seen["b"][1] < 80
     assert seen["a"][2] >= 25 and seen["b"][2] >= 25
+
+
+def test_the_firewall_remembers_which_call_was_the_slowest(tmp_path):
+    base = tmp_path / "cgroup"; root = base / "cora"; (root / "a").mkdir(parents=True)
+    fake = FakeNft()
+
+    def run(args, stdin):
+        time.sleep(0.05 if args[:2] == ["-f", "-"] else 0.001)
+        return fake(args, stdin)
+    fw = Firewall(CgroupRoot(str(root), str(base)), table="slowestcmd", nft_base=str(base), run=run)
+    fw.timing.reset()
+    fw._run(["-j", "list", "chain"], None)
+    fw._run(["-f", "-"], "add table inet x\n")
+    fw._run(["list", "tables"], None)
+    assert fw.timing.slowest_cmd == "-f -" and fw.timing.calls == 3
+
+
+# ---- reads over netlink: when they are used, and what happens when they fail -----------
+def _fw(tmp_path, **kw):
+    root = tmp_path / "c"; root.mkdir(exist_ok=True)
+    return Firewall(CgroupRoot(str(root), str(tmp_path)), **kw)
+
+
+def test_an_injected_runner_always_keeps_the_command_path(tmp_path):
+    """A test's fake must see every read; native reads would bypass it and hit the real kernel."""
+    assert _fw(tmp_path, run=FakeNft()).native is False
+
+
+def test_a_missing_nft_binary_disables_native_reads_so_the_error_stays_clear(tmp_path):
+    assert _fw(tmp_path, nft="/nonexistent/nft").native is False
+
+
+def test_the_environment_can_switch_native_reads_off(tmp_path, monkeypatch):
+    import shutil
+    if not shutil.which("nft"):
+        pytest.skip("no nft on this machine")
+    assert _fw(tmp_path).native is True
+    monkeypatch.setenv("CORA_NFT_NATIVE", "0")
+    assert _fw(tmp_path).native is False
+
+
+def test_a_failing_netlink_read_falls_back_to_the_nft_command_once_and_says_so(tmp_path, monkeypatch, capsys):
+    from cora_sentinel import nftdump
+
+    def refuse(*a, **k):
+        raise nftdump.NftNetlinkError("the kernel said EPERM", 1)
+    monkeypatch.setattr(nftdump, "dump_rules", refuse)
+    monkeypatch.setattr(nftdump, "chain_exists", refuse)
+    cli = []
+
+    def fake(args, stdin):
+        cli.append(args)
+        if args[:2] == ["-j", "list"]:
+            return 0, json.dumps({"nftables": [{"chain": {}}, {"rule": {
+                "handle": 9, "comment": "cora:web:77", "expr": [{"match": {}}, {"counter": {"packets": 3, "bytes": 180}}]}}]}), ""
+        return 0, "", ""
+    fw = _fw(tmp_path, run=fake)
+    fw.native = True                                     # as if the real nft were there; the fake stands in for the CLI
+    assert fw.rules() == {"web": {"handle": 9, "packets": 3, "bytes": 180, "cgid": 77}}      # the CLI's answer
+    assert fw.native is False and "netlink failed" in capsys.readouterr().err
+    assert fw.chain_exists("x") is True and fw.rules() and capsys.readouterr().err == ""    # no second complaint
+    assert cli[0][:2] == ["-j", "list"]
+
+
+def test_the_command_fallback_reads_the_same_fields_as_the_netlink_path(tmp_path):
+    def fake(args, stdin):
+        return 0, json.dumps({"nftables": [{"chain": {}},
+                                           {"rule": {"handle": 4, "expr": [{"match": {}}]}},
+                                           {"rule": {"handle": 5, "comment": "c", "expr": [{"counter": {"packets": 2, "bytes": 9}}]}}]}), ""
+    assert _fw(tmp_path, run=fake).chain_rules("tap") == [
+        {"handle": 4, "comment": None, "packets": 0, "bytes": 0}, {"handle": 5, "comment": "c", "packets": 2, "bytes": 9}]

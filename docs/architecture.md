@@ -123,7 +123,8 @@ still attributed. Steady-state `ensure(pid)` takes no lock, and `Firewall` seria
 instead of relying on a caller holding the registry lock across `nft`.
 
 Since 0.3.1 each tap sync is also split into lock wait / nft / other plus a no-op-child control, and a slow one is
-explained in the log: see [tap-latency.md](tap-latency.md).
+explained in the log: see [tap-latency.md](tap-latency.md). Since 0.3.3 the kernel's rules are READ over netlink
+(`nftdump`) rather than with `nft list`, whose cost grows quadratically with live tasks; writes still go through nft.
 
 ## Containment
 

@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import statistics
 import struct
@@ -1535,3 +1536,355 @@ def test_the_experiment_tool_names_idle_and_a_lock_hog_correctly_and_cleans_up()
 def test_the_experiment_tool_refuses_to_run_without_root():
     r = subprocess.run([sys.executable, str(_TOOL), "idle"], capture_output=True, text=True, timeout=60)
     assert r.returncode != 0 and "run as root" in r.stderr
+
+
+# ============ a hung lock holder must not wedge the caller ============
+def _stuck_holder(table):
+    """A real process that takes the real tap lock, prints 'held', and then sleeps. It dies with its parent
+    (PR_SET_PDEATHSIG), so a failing test cannot leave a frozen process holding a lock on this machine."""
+    code = (f"import ctypes, time\nctypes.CDLL(None).prctl(1, 9)\n"
+            f"from cora_sentinel.cgroup import CgroupRoot\nfrom cora_sentinel.firewall import Firewall\n"
+            f"from cora_sentinel.nflog import TapRules\n"
+            f"t = TapRules(Firewall(CgroupRoot('/nonexistent/x', '/nonexistent'), table='{table}'), 88, lock_timeout=5)\n"
+            f"with t._locked():\n    print('held', flush=True)\n    time.sleep(120)\n")
+    p = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+    assert p.stdout.readline().strip() == "held"
+    return p
+
+
+def test_a_stuck_lock_holder_times_out_instead_of_hanging_the_caller(tmp_path):
+    from cora_sentinel.nflog import TapLockTimeout
+    t, cg = _slow_tap(tmp_path, 0.0)
+    holder = None
+    try:
+        t.ensure_chain(); cg.create("a")
+        holder = _stuck_holder(t.fw.table)
+        os.kill(holder.pid, signal.SIGSTOP)                      # hung: it keeps the lock and will never release it
+        t.lock_timeout = 0.4
+        start = time.monotonic()
+        with pytest.raises(TapLockTimeout, match=r"within 0\.4 s: held by pid %d \(-c, stopped\)" % holder.pid):
+            t.sync({"a": 1})
+        assert time.monotonic() - start < 2.0                    # bounded, where a plain flock would wait forever
+        assert t.last_timing["lock_ms"] >= 350                   # and the failed wait is still accounted for
+        os.kill(holder.pid, signal.SIGKILL); holder.wait(10)     # the holder dies: the lock is released with it ...
+        t.lock_timeout = 5.0
+        t.sync({"a": 1})                                         # ... and the very next sync just works
+        assert t.last_timing["lock_ms"] < 100
+    finally:
+        if holder:
+            holder.kill(); holder.wait(10)
+        _drop_lock(t.fw.table)
+
+
+def test_the_holder_is_named_with_its_state(tmp_path):
+    t, cg = _slow_tap(tmp_path, 0.0)
+    p = subprocess.Popen(["sleep", "60"])
+    try:
+        fd = os.open(os.path.join(tempfile.gettempdir(), "who-holds-test"), os.O_CREAT | os.O_RDWR, 0o600)
+        os.pwrite(fd, f"{p.pid} cora-run\n".encode(), 0)
+        time.sleep(0.1)
+        assert t._who_holds(fd) == f"held by pid {p.pid} (cora-run, sleeping)"
+        os.kill(p.pid, signal.SIGSTOP); time.sleep(0.1)
+        assert t._who_holds(fd) == f"held by pid {p.pid} (cora-run, stopped)"
+        os.pwrite(fd, b"not a pid\n", 0); os.ftruncate(fd, 10)
+        assert "could not be identified" in t._who_holds(fd)
+        os.pwrite(fd, b"999999999 ghost\n", 0); os.ftruncate(fd, 16)
+        assert "could not be identified" in t._who_holds(fd)          # a pid that does not exist
+        os.close(fd)
+    finally:
+        p.kill(); p.wait()
+        try: os.unlink(os.path.join(tempfile.gettempdir(), "who-holds-test"))
+        except OSError: pass
+        _drop_lock(t.fw.table)
+
+
+def test_a_released_lock_is_taken_promptly_and_an_uncontended_one_at_once(tmp_path):
+    t, cg = _slow_tap(tmp_path, 0.0)
+    try:
+        t.ensure_chain(); cg.create("a")
+        t.sync({"a": 1})
+        assert t.last_timing["lock_ms"] < 20                      # uncontended: no waiting at all
+        held = threading.Event()
+
+        def hog():
+            with t._locked():
+                held.set(); time.sleep(0.3)
+        th = threading.Thread(target=hog, daemon=True)
+        th.start(); assert held.wait(5)
+        t.sync({"a": 1}); th.join()
+        assert 270 <= t.last_timing["lock_ms"] <= 400             # polling adds at most a few ms after the release
+    finally:
+        _drop_lock(t.fw.table)
+
+
+@pytest.mark.parametrize("raw,expect_default", [("2.5", False), ("0.1", False), ("abc", True), ("-1", True),
+                                                ("0", True), ("nan", True), ("inf", True), ("", True)])
+def test_the_lock_timeout_can_be_set_from_the_environment_and_nonsense_is_ignored_loudly(monkeypatch, capsys, raw, expect_default):
+    from cora_sentinel.nflog import lock_timeout_from_env
+    monkeypatch.setenv("CORA_TAP_LOCK_TIMEOUT", raw)
+    v = lock_timeout_from_env(30.0)
+    assert (v == 30.0) is expect_default and (expect_default or v == float(raw))
+    assert ("ignoring invalid" in capsys.readouterr().err) is expect_default
+    monkeypatch.delenv("CORA_TAP_LOCK_TIMEOUT")
+    assert lock_timeout_from_env(7.0) == 7.0 and capsys.readouterr().err == ""
+
+
+def test_the_sync_worker_logs_a_lock_timeout_and_retries_instead_of_giving_up(tmp_path, capsys):
+    from cora_sentinel.nflog import TapLockTimeout
+    calls = []
+
+    def sync(cur):
+        calls.append(1)
+        if len(calls) == 1:
+            raise TapLockTimeout("could not get the tap lock /run/lock/x within 30 s: held by pid 7 (cora-run, stopped)")
+        return list(cur), []
+    nm, events, tapq = _threaded_monitor(tmp_path, sync=sync)
+    nm.start()
+    try:
+        assert _until(lambda: len(calls) >= 2, 5), "the worker did not retry"
+        assert nm.stats["errors"] >= 1
+    finally:
+        nm.stop()
+    assert "tap rule sync failed: could not get the tap lock" in capsys.readouterr().err
+
+
+@real
+def test_cora_run_does_not_wait_for_a_stuck_lock_and_the_sentinel_recovers_when_it_frees(env, capsys):
+    """On the real kernel: the tap lock is held by a hung process. cora-run gives up after a short wait and STARTS the
+    task anyway (saying what that costs); the sentinel's sync worker times out, logs it, keeps the loop responsive,
+    and installs the task's rules as soon as the lock frees."""
+    cg, fw, made = env
+    events = []
+    s, nm = monitor(cg, fw, made, events)
+    nm.tap.rules.lock_timeout = 0.6
+    time.sleep(0.5)                                                  # initial (empty) sync done
+    holder = _stuck_holder(fw.table)
+    os.kill(holder.pid, signal.SIGSTOP)
+    try:
+        e = {**os.environ, "CORA_CGROUP_ROOT": str(cg.root), "CORA_CGROUP_MOUNT": MOUNT, "CORA_NFT_TABLE": fw.table,
+             "CORA_NFLOG_GROUP": str(GROUP), "CORA_TAP_LOCK_TIMEOUT": "0.5"}
+        start = time.monotonic()
+        p = subprocess.Popen([sys.executable, "-m", "cora_sentinel.run", "stuckstart", sys.executable, "-c",
+                              "import time; print('started', flush=True); time.sleep(4)"],
+                             env=e, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        assert p.stdout.readline().strip() == "started"
+        assert time.monotonic() - start < 5.0                        # it did not wait for the hung holder
+        assert _until(lambda: nm.stats["errors"] >= 1, 5)            # the sentinel's worker timed out too ...
+        assert nm.stats["poll_ms_max"] < 500                         # ... while the event loop stayed responsive
+        assert "stuckstart" not in nm.tap.rules.rules()              # nobody could install the rule yet
+        os.kill(holder.pid, signal.SIGKILL); holder.wait(10)         # the hung holder dies; the lock frees with it
+        assert _until(lambda: "stuckstart" in nm.tap.rules.rules(), 8), "the sentinel never installed the rule"
+        err = p.communicate(timeout=30)[1]
+        assert "tap pre-install SKIPPED" in err and "held by pid %d" % holder.pid in err
+        assert "task starts anyway" in err
+    finally:
+        holder.kill(); holder.wait(10)
+    assert "tap rule sync failed: could not get the tap lock" in capsys.readouterr().err
+
+
+def test_cora_run_waits_less_for_the_lock_than_the_sentinel_does_by_default(monkeypatch, tmp_path):
+    """Starting a task must never be held up for long, so cora-run's default is shorter than the sync worker's."""
+    from cora_sentinel import nflog, run
+    monkeypatch.delenv("CORA_TAP_LOCK_TIMEOUT", raising=False)
+    assert nflog.PREINSTALL_LOCK_TIMEOUT_S <= 10 < nflog.DEFAULT_LOCK_TIMEOUT_S
+    seen = []
+    monkeypatch.setattr(nflog.TapRules, "active", lambda self: seen.append(self.lock_timeout) or False)
+    root = tmp_path / "cora"; root.mkdir()
+    run._preinstall_tap(CgroupRoot(str(root), str(tmp_path)), "x")
+    assert seen == [nflog.PREINSTALL_LOCK_TIMEOUT_S]                    # what cora-run really builds
+    t, _ = _slow_tap(tmp_path / "s", 0.0)
+    try:
+        assert t.lock_timeout == nflog.DEFAULT_LOCK_TIMEOUT_S           # what the sentinel builds
+    finally:
+        _drop_lock(t.fw.table)
+
+
+# ============ CPU pressure: telling "the CPUs are oversubscribed" from "commit contention" ============
+@pytest.mark.parametrize("pressure,says", [
+    (0.97, "CPUs were oversubscribed"),            # measured on 28 cores: 80 spinners, nft x5 slower, fork still 2 ms
+    (0.60, "CPUs were oversubscribed"),
+    (0.03, "NOT oversubscribed"),                  # measured on 28 cores: 16 low-CPU loaders hammering nft
+    (0.30, "inconclusive"),
+    (None, "CPU pressure unavailable")])
+def test_a_slow_nft_with_a_prompt_noop_child_is_read_with_the_cpu_pressure(pressure, says):
+    from cora_sentinel.netmon import diagnose
+    v = diagnose(452, 0, 451, 425, 2, 1, 79, pressure)       # their idle baseline: nft 79 ms, no-op child 1 ms
+    assert says in v
+    assert "not general host load" not in v                  # the old wording was wrong: load CAN reach nft without slowing fork
+
+
+def test_oversubscription_is_not_called_evidence_of_commit_contention():
+    from cora_sentinel.netmon import diagnose
+    assert "not evidence of commit contention" in diagnose(452, 0, 451, 425, 2, 1, 79, 0.95)
+    assert "consistent with commit contention" in diagnose(280, 0, 280, 185, 1, 0.9, 79, 0.03)
+
+
+def test_the_log_line_names_the_slowest_nft_call_and_the_cpu_pressure(tmp_path, monkeypatch, capsys):
+    import itertools
+    from cora_sentinel import netmon
+    monkeypatch.setattr(netmon, "_fork_exec_ms", lambda: 1.0)
+    monkeypatch.setattr(netmon, "STALL_WARN_MS", 100)
+    monkeypatch.setattr(netmon, "_cpu_stall_ms", lambda it=itertools.cycle([0.0, 1000.0]): next(it))
+    timing = {"lock_ms": 0.0, "nft_ms": 240.0, "nft_calls": 2, "nft_slowest_ms": 220.0, "nft_slowest_cmd": "-f -"}
+    nm, _, _ = _threaded_monitor(tmp_path, sync=lambda cur: (time.sleep(0.25), (list(cur), []))[1], timing=timing)
+    nm.start()
+    live = []
+    try:
+        assert _until(lambda: (live.append(capsys.readouterr().err), "tap sync took" in "".join(live))[1], 5)
+    finally:
+        nm.stop()
+    during = "".join(live)
+    assert "slowest 220 [-f -]" in during                    # a dump or a commit? now it says
+    assert "CPU pressure during it: 100%" in during          # 1000 ms of stall over a ~250 ms sync, capped at 100%
+    assert nm.stats["tap_cpu_pressure_pct_max"] == 100
+    assert "cpu_pressure_max=100%" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(_cpu_stall_ms_missing := not os.path.exists("/proc/pressure/cpu"), reason="no PSI on this kernel")
+def test_the_cpu_pressure_reading_rises_when_the_cpus_are_oversubscribed():
+    """The sensor itself, on the real kernel: idle gives almost no stall, 2 x cores spinning processes give a lot."""
+    from cora_sentinel.netmon import _cpu_stall_ms
+    a = _cpu_stall_ms(); time.sleep(0.4); b = _cpu_stall_ms()
+    assert a is not None and b >= a
+    quiet = b - a
+    spinners = [subprocess.Popen([sys.executable, "-c", "while 1: pass"]) for _ in range(2 * (os.cpu_count() or 1))]
+    try:
+        time.sleep(0.4)                                      # let them all get running
+        a = _cpu_stall_ms(); time.sleep(0.5); b = _cpu_stall_ms()
+    finally:
+        for p in spinners:
+            p.kill()
+        for p in spinners:
+            p.wait()
+    assert (b - a) >= 150 and (b - a) > 5 * max(quiet, 10)   # >= 30% of the window, and far above idle
+
+
+# ============ reading the kernel's rules over netlink instead of `nft list` ============
+def _both(tr):
+    """TapRules.rules() read both ways, on the same kernel state."""
+    tr.fw.native = True
+    a = tr.rules()
+    tr.fw.native = False
+    b = tr.rules()
+    tr.fw.native = True
+    return a, b
+
+
+@real
+def test_netlink_and_nft_read_the_same_rules_in_every_state_including_damage_and_live_counters(env):
+    from cora_sentinel import nftdump
+    cg, fw, made = env
+    tr = TapRules(fw, GROUP)
+    tr.ensure_chain()
+    assert fw.native is True                                        # the real nft, and its binary is there
+    a, b = _both(tr)
+    assert a == b == {}                                             # an empty chain
+    lis, port = listener()
+    stop = drain(lis)
+    p = task(cg, fw, "cnt", beacons(port, 4, hold=8))               # cora-run pre-installs; the task makes 4 real SYNs
+    try:
+        assert _until(lambda: tr.rules().get("cnt", {}).get("packets", 0) >= 4, 10)
+        cg.create("other")
+        tr.sync({n: os.stat(cg.root / n).st_ino for n in cg.names()})
+        a, b = _both(tr)
+        assert a == b and set(a) == {"cnt", "other"} and a["cnt"]["packets"] >= 4      # same handles, kinds, counters
+        fw._script(f"add rule inet {fw.table} tap {tr.rule_texts('cnt')['t']}\n")      # DAMAGE: a duplicate rule
+        a, b = _both(tr)
+        assert a == b and len(a["cnt"]["handles"]) == len(tr._needed()) + 1
+        assert (fw.chain_exists("tap"), fw.chain_exists("nosuch")) == (True, False)
+        fw.native = False
+        assert (fw.chain_exists("tap"), fw.chain_exists("nosuch")) == (True, False)    # the command agrees
+        assert (fw.set_exists("cora_flow4"), fw.set_exists("nosuch")) == (True, False)
+        fw.native = True
+        assert (fw.set_exists("cora_flow4"), fw.set_exists("nosuch")) == (True, False)
+        assert nftdump.dump_rules("no-such-table", "tap") == [] and nftdump.dump_rules(fw.table, "nosuch") == []
+    finally:
+        stop.set(); p.kill(); p.wait(); lis.close()
+
+
+@real
+def test_netlink_and_nft_read_the_same_egress_rules_with_live_drop_counters(env):
+    cg, fw, made = env
+    cg.create("jailed")
+    fw.ensure()
+    assert fw.block("jailed")
+    a, b = None, None
+    for native in (True, False):
+        fw.native = native
+        r = fw.rules()
+        a, b = (r, b) if native else (a, r)
+    assert a == b and a["jailed"]["packets"] == 0 and a["jailed"]["cgid"] == os.stat(cg.root / "jailed").st_ino
+    fw.native = True
+    assert fw.is_blocked("jailed") and not fw.is_blocked("nobody")
+
+
+@real
+def test_listing_cost_no_longer_grows_with_the_number_of_live_tasks(env):
+    """nft resolves each rule's cgroup id to a path by walking the cgroup tree, so `nft list` of the tap chain costs
+    (rules x cgroups visited) and grows QUADRATICALLY with live tasks (each adds 5 rules and a sibling cgroup). The
+    netlink read is O(rules). Measured here: 160 tasks -> 1.8 s by nft, 22 ms by netlink."""
+    cg, fw, made = env
+    tr = TapRules(fw, GROUP)
+    tr.ensure_chain()
+    for i in range(140):
+        cg.create(f"t{i}")
+    tr.sync({n: os.stat(cg.root / n).st_ino for n in cg.names()})            # 140 tasks = 700 tap rules
+
+    def ms(native):
+        fw.native = native
+        t = time.monotonic()
+        rules = tr.rules()
+        return (time.monotonic() - t) * 1000.0, rules
+    fast, via_netlink = ms(True)
+    slow, via_nft = ms(False)
+    fw.native = True
+    print(f"\n140 live tasks (700 rules): nft command {slow:.0f} ms, netlink {fast:.0f} ms")
+    assert via_netlink == via_nft and len(via_netlink) == 140                # the SAME answer ...
+    if slow < 100:
+        pytest.skip("this machine lists too quickly for nft's cost to show")
+    assert fast < 80 and fast * 10 <= slow                                   # ... without nft's cost
+
+
+@pytest.mark.parametrize("total,base,says", [
+    (111, 94, "not slow"),        # measured on 28 cores: an idle sync of 111 ms, best seen 94 ms (not a stall)
+    (188, 94, "not slow"),        # exactly 2x the machine's own best is still not an anomaly
+    (189, 94, "nft"),             # just beyond it, the explanation is given
+    (900, 94, "nft"),             # a real stall is explained however slow the machine's baseline is
+    (150, None, "nft")])          # no baseline yet: only the absolute floor applies
+def test_not_slow_means_within_twice_this_machines_own_best_sync(total, base, says):
+    from cora_sentinel.netmon import diagnose
+    v = diagnose(total, 0, total - 3, total - 8, 1, 1, 10, 0.05, base)
+    assert says in v and ("not slow" in v) is (says == "not slow")
+
+
+@real
+def test_the_experiment_tool_shows_netlink_and_the_nft_command_agreeing_and_cleans_up():
+    r = subprocess.run([sys.executable, str(_TOOL), "dump", "--tasks", "60", "--check"],
+                       capture_output=True, text=True, timeout=180)
+    assert r.returncode == 0, r.stdout + r.stderr
+    rows = [ln for ln in r.stdout.splitlines() if ln.rstrip().endswith(("yes", "NO"))]
+    assert rows and all(ln.rstrip().endswith("yes") for ln in rows)         # the same rules at every size
+    assert "coraexp" not in subprocess.run(["nft", "list", "tables"], capture_output=True, text=True).stdout
+    assert not [n for n in os.listdir(MOUNT) if n.startswith("coraexp-")]
+
+
+def test_a_machine_that_has_only_ever_been_slow_still_gets_its_stall_explained():
+    """The first sync defines nothing: a 13 s stall must never be called 'not slow' because it is the best seen."""
+    from cora_sentinel.netmon import diagnose
+    assert "waiting for the cross-process tap lock" in diagnose(13000, 12000, 800, 700, 1, None, None, None, None)
+    assert "waiting for the cross-process tap lock" in diagnose(13000, 12000, 800, 700, 1, 1, 10, 0.0, 13000)
+    assert "nft" in diagnose(600, 0, 590, 580, 1, 1, 10, 0.0, 400)          # 600 ms is within 2x of 400, but it is a stall
+    assert "not slow" in diagnose(450, 0, 440, 430, 1, 1, 10, 0.0, 400)     # under the loud-note threshold and within 2x
+
+
+def test_the_baseline_comes_from_earlier_syncs_not_from_the_one_being_judged(tmp_path, monkeypatch):
+    from cora_sentinel import netmon
+    monkeypatch.setattr(netmon, "_cpu_stall_ms", lambda: None)
+    nm, _, _ = _threaded_monitor(tmp_path)
+    nm._record_sync(900.0, 1.0, {"lock_ms": 850.0, "nft_ms": 40.0})
+    assert nm.worst_sync["total_base"] is None                              # the first sync has no history
+    nm._record_sync(950.0, 1.0, {"lock_ms": 900.0, "nft_ms": 40.0})
+    assert nm.worst_sync["total_base"] == 900.0                             # and the second is judged against the first
+    nm._record_sync(80.0, 1.0, {"lock_ms": 0.0, "nft_ms": 70.0})
+    nm._record_sync(1200.0, 1.0, {"lock_ms": 1100.0, "nft_ms": 40.0})
+    assert nm.worst_sync["total_base"] == 80.0                              # the fastest of the earlier ones

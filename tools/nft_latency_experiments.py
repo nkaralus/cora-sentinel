@@ -8,19 +8,30 @@ flock and real load, runs the same instrumented sync, and shows what the tool sa
 
     idle     nothing wrong          -> expect: "not slow"
     lock     another process holds the tap lock         -> expect: "waiting for the cross-process tap lock"
-    busy     the host is saturated (spinning processes) -> expect: "the whole host is slow"
+    busy     the host is saturated (spinning processes) -> expect: "the whole host is slow" (fork slows too, typical
+             of few cores) OR "the CPUs were oversubscribed" (typical of MANY cores: nft's commit slows while a fork
+             does not, because the kernel threads a transaction waits on compete with the load)
     kernel   many tiny nft transactions queue on the kernel's commit mutex, with the CPU left free
-                                                        -> expect: "points at nft or the kernel's transaction path"
+                                                        -> expect: "the CPUs were NOT oversubscribed ... commit
+             contention". If the loaders themselves oversubscribe the CPUs (few cores) the result is "inconclusive".
+    dump     reading the tap chain two ways as live tasks accumulate: the `nft` command, whose listing resolves each
+             rule's cgroup id to a path by walking the cgroup tree (cost: rules x cgroups visited, so QUADRATIC in live
+             tasks, plus whatever other cgroups the walk passes first), and a netlink read (cost: O(rules)).
+             -> expect: both give the SAME rules, and netlink is far faster wherever nft is slow.
 
 Run it as root, ideally while the machine is otherwise quiet. It touches only scratch tables named coraexp*, its own
 cgroup directory and files in a temp directory, and it removes them on exit (also on Ctrl-C).
 
     sudo python3 tools/nft_latency_experiments.py                    # all four
     sudo python3 tools/nft_latency_experiments.py idle lock --check  # exit 1 if a verdict is wrong
+    sudo python3 tools/nft_latency_experiments.py dump --tasks 160   # the listing cost, nft command vs netlink
 
 Read the numbers, not only the verdict: "lock" is time waiting for the cross-process tap lock, "nft" is time inside
-nft subprocesses, "no-op child" is how long `true` took under the same conditions. On a single core, kernel work and
-host load are the same resource, so the kernel scenario cannot be cleanly separated there; more cores separate them.
+nft subprocesses, "no-op child" is how long `true` took under the same conditions, and "cpu pressure" is the share of
+the sync during which some task was waiting for a CPU (kernel PSI). Two things to keep in mind. A busy host can slow
+nft's commit WITHOUT slowing a fork, so a fast no-op child does not mean the host is idle: read the CPU pressure. And
+on a single core, kernel work and host load are the same resource, so the kernel scenario cannot be cleanly separated
+there; more cores separate them.
 """
 from __future__ import annotations
 
@@ -38,11 +49,13 @@ from pathlib import Path
 
 from cora_sentinel.cgroup import CgroupRoot
 from cora_sentinel.firewall import Firewall
-from cora_sentinel.netmon import _fork_exec_ms, diagnose
+from cora_sentinel.netmon import _cpu_stall_ms, _fork_exec_ms, diagnose
 from cora_sentinel.nflog import TapRules
 
-EXPECT = {"idle": "not slow", "lock": "tap lock", "busy": "whole host is slow",
-          "kernel": "points at nft or the kernel"}
+SCENARIOS = ("idle", "lock", "busy", "kernel", "dump")
+EXPECT = {"idle": ("not slow",), "lock": ("tap lock",),
+          "busy": ("whole host is slow", "CPUs were oversubscribed"),
+          "kernel": ("NOT oversubscribed", "points at nft")}       # "points at nft": the kernel exposes no PSI
 
 
 class Lab:
@@ -56,7 +69,7 @@ class Lab:
         self.rules = TapRules(self.fw, 97, udp=True)
         self.rules.ensure_chain()
         self.n = 0
-        self.base = {"ctl": float("inf"), "slow": float("inf")}   # fastest seen: the idle baseline, as a daemon learns it
+        self.base = {"ctl": float("inf"), "slow": float("inf"), "total": float("inf")}   # fastest seen: the idle baseline
         self.tmp = Path(tempfile.mkdtemp(prefix="coraexp-"))
         self.tables = [f"coraexpl{k}" for k in range(64)]
 
@@ -70,13 +83,18 @@ class Lab:
                 pass
         live = {n: os.stat(self.cg.root / n).st_ino for n in self.cg.names()}
         ctl = _fork_exec_ms()
+        psi0 = _cpu_stall_ms()
         t = time.monotonic()
         self.rules.sync(live)
         total = (time.monotonic() - t) * 1000.0
+        psi1 = _cpu_stall_ms()
+        cpu = None if psi0 is None or psi1 is None or total <= 0 else min(max((psi1 - psi0) / total, 0.0), 1.0)
         lt = self.rules.last_timing
         self.base["ctl"] = min(self.base["ctl"], ctl)
         self.base["slow"] = min(self.base["slow"], lt["nft_slowest_ms"])
-        return {"total": total, "lock": lt["lock_ms"], "nft": lt["nft_ms"], "slow": lt["nft_slowest_ms"], "ctl": ctl}
+        self.base["total"] = min(self.base["total"], total)
+        return {"total": total, "lock": lt["lock_ms"], "nft": lt["nft_ms"], "slow": lt["nft_slowest_ms"], "ctl": ctl,
+                "cmd": lt.get("nft_slowest_cmd", ""), "cpu": cpu}
 
     def run(self, label: str, n: int, gap: float = 0.25) -> tuple:
         rows = []
@@ -84,11 +102,48 @@ class Lab:
             rows.append(self.sync_once())
             time.sleep(gap)
         w = max(rows, key=lambda r: r["total"])
-        verdict = diagnose(w["total"], w["lock"], w["nft"], w["slow"], w["ctl"], self.base["ctl"], self.base["slow"])
+        verdict = diagnose(w["total"], w["lock"], w["nft"], w["slow"], w["ctl"], self.base["ctl"], self.base["slow"], w["cpu"], self.base["total"])
+        cpu = "n/a" if w["cpu"] is None else f"{w['cpu']:.0%}"
         print(f"{label:<44} p50 {statistics.median(r['total'] for r in rows):6.0f} ms   worst sync {w['total']:6.0f} ms = "
-              f"lock {w['lock']:5.0f} + nft {w['nft']:5.0f} (slowest call {w['slow']:5.0f}); no-op child {w['ctl']:4.0f} ms")
+              f"lock {w['lock']:5.0f} + nft {w['nft']:5.0f} (slowest call {w['slow']:5.0f} [{w['cmd']}]); "
+              f"no-op child {w['ctl']:4.0f} ms; cpu pressure {cpu}")
         print(f"{'':<44} -> {verdict}\n")
         return w, verdict
+
+    def dump_scaling(self, max_tasks: int) -> tuple:
+        """Read the tap chain via the nft command and via netlink while live tasks (5 UDP rules each) accumulate."""
+        def med(fn, n=3):
+            v = []
+            for _ in range(n):
+                t = time.monotonic()
+                out = fn()
+                v.append((time.monotonic() - t) * 1000.0)
+            return statistics.median(v), out
+        print(f"{'live tasks':>12} {'tap rules':>10} {'nft command':>13} {'netlink':>10}   same rules?")
+        made = []
+        last = (0.0, 0.0, True)
+        try:
+            for n in sorted({min(x, max_tasks) for x in (10, 40, 80, 160, max_tasks)}):
+                for i in range(len(made), n):
+                    made.append(f"d{i}")
+                    self.cg.create(made[-1])
+                self.rules.sync({x: os.stat(self.cg.root / x).st_ino for x in self.cg.names()})
+                self.fw.native = False
+                cli, a = med(self.rules.rules)
+                self.fw.native = True
+                nl, b = med(self.rules.rules)
+                same = a == b
+                print(f"{n:>12} {5 * n:>10} {cli:10.1f} ms {nl:7.1f} ms   {'yes' if same else 'NO'}")
+                last = (cli, nl, same)
+        finally:
+            self.fw.native = True
+            for name in made:
+                try:
+                    (self.cg.root / name).rmdir()
+                except OSError:
+                    pass
+            self.rules.sync({x: os.stat(self.cg.root / x).st_ino for x in self.cg.names()})    # drop their rules
+        return last
 
     def with_lock_hog(self, fn):
         stop = threading.Event()
@@ -147,13 +202,14 @@ class Lab:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="validate the tap-sync diagnosis against known causes")
-    ap.add_argument("scenarios", nargs="*", choices=list(EXPECT), help="default: all four")
+    ap.add_argument("scenarios", nargs="*", choices=list(SCENARIOS), help="default: all five")
+    ap.add_argument("--tasks", type=int, default=160, help="live tasks for the dump scenario")
     ap.add_argument("--syncs", type=int, default=14, help="syncs per scenario")
     ap.add_argument("--spinners", type=int, default=None, help="busy processes (default 40 per core up to 80)")
     ap.add_argument("--loaders", type=int, default=16, help="nft transaction loaders")
     ap.add_argument("--check", action="store_true", help="exit 1 if a scenario that DID stall is named wrongly")
     args = ap.parse_args()
-    args.scenarios = args.scenarios or list(EXPECT)
+    args.scenarios = args.scenarios or list(SCENARIOS)
     if os.geteuid() != 0:
         sys.exit("run as root (it creates scratch nft tables and a cgroup)")
     if not shutil.which("nft"):
@@ -168,6 +224,20 @@ def main() -> int:
             lab.sync_once()
             time.sleep(0.1)
         for sc in args.scenarios:
+            if sc == "dump":
+                cli, nl, same = lab.dump_scaling(args.tasks)
+                if not same:
+                    bad.append(sc)
+                    print("   !! the netlink read and the nft command DISAGREE about the rules\n")
+                elif cli < 100:
+                    print(f"   (inconclusive: the nft command listed {args.tasks} tasks in only {cli:.0f} ms here; "
+                          f"raise --tasks)\n")
+                elif nl * 5 > cli:
+                    bad.append(sc)
+                    print(f"   !! netlink ({nl:.0f} ms) is not clearly faster than the nft command ({cli:.0f} ms)\n")
+                else:
+                    print(f"   -> netlink is {cli / max(nl, 0.1):.0f}x faster at {args.tasks} tasks, same rules\n")
+                continue
             if sc == "idle":
                 w, v = lab.run("idle (control)", args.syncs)
             elif sc == "lock":
@@ -183,13 +253,16 @@ def main() -> int:
                 w, v = lab.with_procs(loaders, lambda: lab.run(f"nft commit contention ({args.loaders} loaders, low CPU)",
                                                                args.syncs), 1.5)
             stalled = w["total"] >= 100
-            if EXPECT[sc] not in v:
+            if not any(e in v for e in EXPECT[sc]):
                 if sc in ("busy", "kernel") and not stalled:
                     print(f"   (inconclusive: this load did not make the sync slow enough to explain; raise "
                           f"{'--spinners' if sc == 'busy' else '--loaders'})\n")
+                elif sc == "kernel" and "CPUs were oversubscribed" in v:
+                    print("   (inconclusive: the loaders themselves oversubscribed the CPUs, so commit contention "
+                          "cannot be separated from load here; use fewer --loaders, or a machine with more cores)\n")
                 else:
                     bad.append(sc)
-                    print(f"   !! expected a verdict containing {EXPECT[sc]!r}\n")
+                    print(f"   !! expected a verdict containing one of {EXPECT[sc]!r}\n")
     finally:
         lab.cleanup()
     if bad and args.check:
