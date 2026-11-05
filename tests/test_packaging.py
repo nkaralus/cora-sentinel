@@ -6,7 +6,7 @@ from pathlib import Path
 import cora_sentinel
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPTS = {"cora-sentinel", "cora-run", "cora-demo", "cora-cgroup", "cora-firewall",
+SCRIPTS = {"cora-sentinel", "cora-run", "cora-demo", "cora-cgroup", "cora-firewall", "cora-floor",
            "cora-blocklist", "cora-report", "cora-selfcheck"}
 
 

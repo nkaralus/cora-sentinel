@@ -594,6 +594,20 @@ def main() -> int:
     ap.add_argument("--slip-log", metavar="PATH",
                     help="JSONL log of blocklisted connections that closed before any poll saw them")
     ap.add_argument("--nft-table", default="cora", help="nftables table name (default: cora)")
+    ap.add_argument("--floor", action="store_true",
+                    help="drop listed addresses in the KERNEL (nft sets, before the first packet leaves or arrives). "
+                         "Host-wide, and it persists if the daemon dies (cora-floor remove). Needs --nft")
+    ap.add_argument("--floor-dns", action="store_true",
+                    help="also drop the addresses resolved for listed DOMAINS. Many tracker names share CDN addresses, "
+                         "so this can break unrelated sites; list them in --blocklist-allow or --floor-allow first")
+    ap.add_argument("--floor-allow", action="append", metavar="CIDR", default=[],
+                    help="always accepted by the floor (repeatable). Loopback and the resolvers in /etc/resolv.conf "
+                         "are always included")
+    ap.add_argument("--floor-log-group", type=int, default=72,
+                    help="NFLOG group for floor drop records (default 72; the tap is 71; unbound = discarded)")
+    ap.add_argument("--floor-out-priority", type=int, default=-5,
+                    help="priority of the outbound floor chain (default -5: after the tap at -10, so the tap still "
+                         "sees the first packet; use -300 to drop before the tap)")
     ap.add_argument("--nft", action="store_true",
                     help="enable the ISOLATE verdict: per-cgroup egress drop via nftables "
                          "(needs --cgroup-root and root/CAP_NET_ADMIN)")
@@ -619,6 +633,9 @@ def main() -> int:
     if a.nflog and (not a.cgroup_root or not a.nft or a.net_source == "proc"):
         print("[cora-sentinel] --nflog needs --cgroup-root, --nft and a sockdiag net source", file=sys.stderr)
         return 1
+    if (a.floor or a.floor_dns) and not (a.floor and a.nft and a.cgroup_root):
+        print("[cora-sentinel] --floor needs --nft and --cgroup-root (and --floor-dns needs --floor)", file=sys.stderr)
+        return 1
     try:
         out = open(a.out, "a", buffering=1)
     except OSError as e:
@@ -641,11 +658,17 @@ def main() -> int:
             return 1
         print(f"[cora-sentinel] cgroup mode: {a.cgroup_root} controllers={ctl or 'none'}",
               file=sys.stderr)
+    floor_ref: dict = {"sync": None}       # filled in once the firewall exists (the resolver may cycle first)
+
     def make_resolver(target: Blocklist) -> DomainResolver:
         r = DomainResolver(target, max_per_cycle=a.resolve_max)
-        # r.bl, not `target`: after a hot reload the resolver is aimed at the new list
-        r.on_cycle = lambda n: print(f"[cora-sentinel] resolver cycle done: {r.bl.summary()}",
-                                     file=sys.stderr, flush=True)
+
+        def cycled(n: int) -> None:
+            # r.bl, not `target`: after a hot reload the resolver is aimed at the new list
+            print(f"[cora-sentinel] resolver cycle done: {r.bl.summary()}", file=sys.stderr, flush=True)
+            if floor_ref["sync"] is not None:
+                floor_ref["sync"].on_resolver_cycle(r.bl)
+        r.on_cycle = cycled
         return r
 
     has_lists = bool(a.blocklist or a.blocklist_store)
@@ -671,7 +694,8 @@ def main() -> int:
                  net_allow=a.net_allow, cgroups=cg, blocklist=bl)
     reloader = Reloader(s, (lambda: load_lists(a.blocklist, a.blocklist_store, a.blocklist_allow))
                         if has_lists else None,
-                        resolver=resolver, make_resolver=None if a.no_resolve else make_resolver)
+                        resolver=resolver, make_resolver=None if a.no_resolve else make_resolver,
+                        on_reload=lambda new: floor_ref["sync"] and floor_ref["sync"].on_reload(new))
     reloader.start()
     fw = None
     if a.nft:
@@ -686,6 +710,17 @@ def main() -> int:
                   file=sys.stderr)
         except FirewallError as e:
             print(f"[cora-sentinel] nft not usable yet: {e}", file=sys.stderr)
+        if a.floor:
+            from cora_sentinel.nftsets import FloorSync, NftSets
+            try:
+                fs = FloorSync(NftSets.from_firewall(fw, log_group=a.floor_log_group,
+                                                      out_priority=a.floor_out_priority),
+                               extra_allow=a.floor_allow, dns=a.floor_dns)
+                fs.apply(bl)                    # allow first, then static; the floor is live before the first tick
+            except (FirewallError, ValueError, OSError) as e:
+                print(f"[cora-sentinel] --floor unusable: {e}", file=sys.stderr)
+                return 1
+            floor_ref["sync"] = fs
     adj = None
     if a.model:
         from cora_sentinel.verdict import Adjudicator, Executor, Qwen3B  # lazy: heavy deps

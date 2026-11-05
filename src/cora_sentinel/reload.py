@@ -72,8 +72,10 @@ def _count(bl: Optional[Blocklist]) -> Tuple[set, set]:
 class Reloader:
     def __init__(self, sentinel, loader: Optional[Callable[[], Tuple[Blocklist, List[str]]]],
                  resolver=None, make_resolver: Optional[Callable[[Blocklist], object]] = None,
-                 log: Callable[[str], None] = _note):
+                 log: Callable[[str], None] = _note,
+                 on_reload: Optional[Callable[[Blocklist], None]] = None):
         self.s, self.loader, self.resolver, self.make_resolver, self.log = sentinel, loader, resolver, make_resolver, log
+        self.on_reload = on_reload             # called with the NEW list after it is live (the kernel floor follows it)
         self.stats: Counter = Counter()
         self._pending = False
         self._stop = threading.Event()
@@ -135,6 +137,11 @@ class Reloader:
             self.s.set_blocklist(new)                          # the one atomic swap
             if self.resolver is not None:
                 self.resolver.kick()                           # resolve the new domains now, not in an hour
+            if self.on_reload is not None:
+                try:
+                    self.on_reload(new)
+                except Exception as e:                         # the list swap already happened; never undo it for this
+                    self.log(f"on_reload hook failed: {e!r}")
             self.stats["reloads_ok"] += 1
             self.log(f"reloaded blocklists: domains {len(od)} -> {len(nd)} (+{len(nd - od)}/-{len(od - nd)}), "
                      f"subnets/IPs {len(on)} -> {len(nn)} (+{len(nn - on)}/-{len(on - nn)}), "

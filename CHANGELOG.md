@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.5.0
+
+### Added
+- **Kernel-side blocklist floor (`--floor`, `cora_sentinel.nftsets`, `cora-floor`).** The first packet to a listed address
+  no longer escapes: listed subnets and addresses live in nftables sets (`static4/6`, optional `dns4/6`, expiring
+  `dyn4/6` and per-flow `dynflow4/6`) and are dropped in the kernel. Inbound at `prerouting`/`raw`; outbound at priority
+  -5, just after the tap (-10), so the tap still logs and attributes the attempt and the daemon still escalates it.
+  `--floor-out-priority -300` drops before the tap instead.
+- **An allow set is checked first** (loopback, the resolvers in `/etc/resolv.conf`, `--floor-allow`, the blocklist allow
+  list), so a bad list or verdict cannot lock the host out.
+- **Delta sync in one transaction.** Only the difference is sent, deletes and adds together, so an address that stays
+  listed is never absent while the list changes, and a daemon killed mid-sync leaves the old set or the new one. Hot reload
+  (`kill -HUP`) now updates the sets (`Reloader(on_reload=...)`).
+- **Kernel-expiring verdicts.** `NftSets.block_ip`, `block_flow` (one address+protocol+port, for shared addresses) and
+  `unblock_ip`; no garbage-collection thread. `cora-floor block|unblock|block-flow|list|status|sync-static|ensure|remove`.
+- Tests: `tests/test_nftsets.py` (30, unprivileged) and `tests/test_floor_gate.py` (7, real packets across two network
+  namespaces): first-packet escape (both hooks), a flow block sparing other ports, drops continuing past the log rate,
+  allow precedence, delta sync with a prober running throughout, and SIGKILL mid-sync then reconcile.
+
+### Design notes
+- Log and drop are **separate rules**. `limit rate ... log ... drop` in one rule drops only the packets under the limit
+  and accepts the rest, so a scan would walk past the floor; the over-limit test pins this.
+- The resolver's domain addresses are **not** loaded unless you pass `--floor-dns`: the floor is host-wide and many
+  tracker names sit on shared CDN addresses. With `--floor-dns` a sync that would remove more than half of 20+ addresses
+  (a resolver outage) is applied add-only.
+- The floor persists if the daemon dies, on purpose. `cora-floor remove` or `cora-firewall purge` takes it out.
+
+### Not done
+- Adjudicator verdicts do not add to `dyn*` on their own. Blocking an address host-wide because one task misbehaved is a
+  policy decision (shared addresses); the API and CLI exist, the automatic wiring does not.
+- The audit log goes to NFLOG group 72 (`--floor-log-group`); nothing in the daemon binds it. Per-element counters
+  (`cora-floor status`) are the audit trail unless you bind the group yourself.
+- Allow-list domain entries are not mirrored into the kernel.
+
 ## 0.4.0
 
 ### Changed (behavior)

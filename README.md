@@ -86,6 +86,29 @@ sudo ./venv/bin/cora-cgroup list                # tasks, pids, frozen / freeze_r
 sudo ./venv/bin/cora-firewall purge             # panic button: delete the whole nft table
 ```
 
+### The kernel floor (`--floor`)
+
+Without it the first packet to a listed address still leaves: the tap logs it, it does not hold it. With
+`--floor` the blocklist's subnets and addresses are loaded into nftables sets and dropped in the kernel, inbound
+(prerouting, `raw`) and outbound (just after the tap, so the tap still sees and attributes the attempt):
+
+```bash
+sudo ./venv/bin/cora-sentinel --cgroup-root /sys/fs/cgroup/cora --nft --nflog --floor \
+    --floor-allow 192.168.0.0/16 --blocklist ./blocklists --blocklist-allow ./allow
+sudo ./venv/bin/cora-floor status                 # elements per set, packets dropped in / out
+sudo ./venv/bin/cora-floor block 203.0.113.9 600  # drop one address host-wide for 10 minutes (kernel expires it)
+sudo ./venv/bin/cora-floor remove                 # take the floor out (the per-task egress chain stays)
+```
+
+- **It is host-wide.** Unlike `ISOLATE` (one task), a floor drop affects every process. Loopback, the resolvers in
+  `/etc/resolv.conf`, `--floor-allow` and the blocklist allow list are always accepted first.
+- **It outlives the daemon.** The sets and chains stay in the kernel if the daemon dies; restart reconciles them.
+  `cora-floor remove` or `cora-firewall purge` takes them out.
+- **Domains are not on by default.** `--floor-dns` also drops the addresses the resolver found for listed domains,
+  but many tracker names share CDN addresses, so that can break unrelated sites. Allow-list domains are not mirrored.
+- A list reload (`kill -HUP`) updates the sets as one transaction per set pair: an address that stays listed is
+  never unblocked while the list changes.
+
 ## How a decision is made
 
 1. **Detect** (deterministic). A flow is a violation if it is on a blocklist, or outside the allowlist. A
@@ -176,6 +199,9 @@ packets.
 - **TCP and UDP only.** Encrypted DNS (DoH, DoT, DoQ) hides query names. QUIC **hostnames are not
   recoverable** (that needs AES, may span two packets, and ECH hides it); QUIC is labelled and matched by
   address.
+- **The kernel floor is address-level.** It cannot match names, and a listed address shared with something you use is
+  dropped for everything on the host (`--floor-allow` is the remedy). Fed from the lists' addresses and subnets only,
+  unless you opt in to `--floor-dns`.
 - **The tap needs a task's rules to exist before its first packet.** `cora-run` guarantees it; a task
   started another way is unobserved until the monitor's next sync (one poll interval).
 - **No UDP view of flows that began before the tap**, until they go idle and start a new flow.
@@ -206,17 +232,21 @@ At 0.4.0: **453 passed, 5 skipped** as root against the installed wheel (the ski
 only apply when not root, and two IPv6 tap tests that have never been run on a kernel with IPv6; the real-model
 test ran), and **382 passed, 76 skipped** unprivileged. The unprivileged run is what CI executes.
 
+0.5.0 adds `tests/test_nftsets.py` (30 tests, no kernel needed) and `tests/test_floor_gate.py` (7 tests with real packets
+between two network namespaces; they skip without root, nft and `ip netns`). Those namespaces hold their own throwaway
+table, so the gate never touches the host's network.
+
 ## Layout
 
 ```
-src/cora_sentinel/   daemon  netmon  nflog  nftdump  sockdiag  firewall  cgroup  blocklist  blocklist_store  reload  report  verdict  run  demo  selfcheck
+src/cora_sentinel/   daemon  netmon  nflog  nftdump  nftsets  sockdiag  firewall  cgroup  blocklist  blocklist_store  reload  report  verdict  run  demo  selfcheck
 tests/               unit tests, plus kernel tests that skip without root
 schema/              violation.schema.json (cora.security.violation/v1)
 examples/            starter blocklists, an allow list, an example report
 docs/                architecture.md, violation-reports.md
 ```
 
-Commands: `cora-sentinel`, `cora-run`, `cora-demo`, `cora-cgroup`, `cora-firewall`, `cora-blocklist`,
+Commands: `cora-sentinel`, `cora-run`, `cora-demo`, `cora-cgroup`, `cora-firewall`, `cora-floor`, `cora-blocklist`,
 `cora-report`, `cora-selfcheck`.
 
 ## Related repositories

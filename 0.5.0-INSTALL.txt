@@ -1,0 +1,17 @@
+cora-sentinel 0.5.0 overlay (kernel-side blocklist floor)
+
+Extract over a clean v0.4.0 checkout:
+    cd ~/cora-sentinel
+    unzip -o /path/to/cora-sentinel-0.5.0.zip
+    pip install -e ".[dev]"          # re-register: new `cora-floor` script and the 0.5.0 version metadata
+    sudo -E ./venv/bin/python -m pytest -q tests/test_nftsets.py tests/test_floor_gate.py
+    sudo -E ./venv/bin/python -m pytest -q                # full suite
+
+New:      src/cora_sentinel/nftsets.py  tests/test_nftsets.py  tests/test_floor_gate.py
+Modified: src/cora_sentinel/daemon.py (--floor, --floor-dns, --floor-allow, --floor-log-group, --floor-out-priority)
+          src/cora_sentinel/reload.py (on_reload hook)  src/cora_sentinel/__init__.py (0.5.0)
+          pyproject.toml (cora-floor)  tests/test_packaging.py  README.md  CHANGELOG.md
+0.5.0.patch is the same change as a `git apply` patch, for review.
+
+The gate tests build two network namespaces and a throwaway table inside them; they never touch the host ruleset.
+Floor is opt-in: nothing changes unless you start the daemon with --floor (needs --nft and --cgroup-root).
