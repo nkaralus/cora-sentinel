@@ -18,6 +18,9 @@ flock and real load, runs the same instrumented sync, and shows what the tool sa
              rule's cgroup id to a path by walking the cgroup tree (cost: rules x cgroups visited, so QUADRATIC in live
              tasks, plus whatever other cgroups the walk passes first), and a netlink read (cost: O(rules)).
              -> expect: both give the SAME rules, and netlink is far faster wherever nft is slow.
+    writes   the nft COMMITS (`-f -`) each write operation performs, and its time, as live tasks accumulate:
+             cora-run's install, the sentinel's sync, an ISOLATE, and gc of several dead tasks.
+             -> expect: ONE commit each. The ISOLATE time is, in effect, your machine's cost of a single commit.
 
 Run it as root, ideally while the machine is otherwise quiet. It touches only scratch tables named coraexp*, its own
 cgroup directory and files in a temp directory, and it removes them on exit (also on Ctrl-C).
@@ -25,6 +28,7 @@ cgroup directory and files in a temp directory, and it removes them on exit (als
     sudo python3 tools/nft_latency_experiments.py                    # all four
     sudo python3 tools/nft_latency_experiments.py idle lock --check  # exit 1 if a verdict is wrong
     sudo python3 tools/nft_latency_experiments.py dump --tasks 160   # the listing cost, nft command vs netlink
+    sudo python3 tools/nft_latency_experiments.py writes --tasks 160 # commits and time per write operation
 
 Read the numbers, not only the verdict: "lock" is time waiting for the cross-process tap lock, "nft" is time inside
 nft subprocesses, "no-op child" is how long `true` took under the same conditions, and "cpu pressure" is the share of
@@ -52,7 +56,7 @@ from cora_sentinel.firewall import Firewall
 from cora_sentinel.netmon import _cpu_stall_ms, _fork_exec_ms, diagnose
 from cora_sentinel.nflog import TapRules
 
-SCENARIOS = ("idle", "lock", "busy", "kernel", "dump")
+SCENARIOS = ("idle", "lock", "busy", "kernel", "dump", "writes")
 EXPECT = {"idle": ("not slow",), "lock": ("tap lock",),
           "busy": ("whole host is slow", "CPUs were oversubscribed"),
           "kernel": ("NOT oversubscribed", "points at nft")}       # "points at nft": the kernel exposes no PSI
@@ -145,6 +149,68 @@ class Lab:
             self.rules.sync({x: os.stat(self.cg.root / x).st_ino for x in self.cg.names()})    # drop their rules
         return last
 
+    def write_costs(self, max_tasks: int) -> list:
+        """[(live tasks, {operation: (commits, ms)})]: what each write operation costs as the table grows."""
+        log = []
+        orig = self.fw._run
+
+        def logged(args, stdin):
+            t = time.monotonic()
+            r = orig(args, stdin)
+            log.append((args[:2] == ["-f", "-"], (time.monotonic() - t) * 1000.0))
+            return r
+        view = TapRules(self.fw, 97, udp=None)               # what cora-run builds: UDP follows the live table
+        made, jail, rows = [], [], []
+
+        def newtask(prefix):
+            name = f"{prefix}{len(made)}"
+            made.append(name)
+            self.cg.create(name)
+            return name
+
+        def timed(op, reps=5):
+            commits, ms = [], []
+            for i in range(reps):
+                arg = op["prep"](i) if op.get("prep") else None
+                log.clear()
+                t = time.monotonic()
+                op["run"](arg)
+                ms.append((time.monotonic() - t) * 1000.0)
+                commits.append(sum(1 for is_commit, _ in log if is_commit))
+            return int(statistics.median(commits)), statistics.median(ms)
+
+        def live():
+            return {x: os.stat(self.cg.root / x).st_ino for x in self.cg.names()}
+
+        def prep_gc(i):                                       # five isolated tasks that then die
+            names = [newtask("j") for _ in range(5)]
+            for x in names:
+                self.fw.block(x)
+            for x in names:
+                (self.cg.root / x).rmdir()
+            return None
+        ops = {"cora-run install": {"prep": lambda i: newtask("w"), "run": lambda name: view.install(name)},
+               "sentinel sync (+1)": {"prep": lambda i: newtask("w"), "run": lambda _: self.rules.sync(live())},
+               "ISOLATE block()": {"prep": lambda i: newtask("w"), "run": lambda name: self.fw.block(name)},
+               "gc of 5 dead tasks": {"prep": prep_gc, "run": lambda _: self.fw.gc(set(self.cg.names()))}}
+        self.fw._run = logged
+        try:
+            for target in sorted({0, min(40, max_tasks), max_tasks}):
+                while len([m for m in made if m.startswith("w")]) < target:
+                    newtask("w")
+                self.rules.sync(live())
+                rows.append((target, {name: timed(op) for name, op in ops.items()}))
+        finally:
+            self.fw._run = orig
+            for name in made:
+                try:
+                    (self.cg.root / name).rmdir()
+                except OSError:
+                    pass
+            self.rules.sync(live())
+            self.fw.gc(set(self.cg.names()))
+        return rows
+
     def with_lock_hog(self, fn):
         stop = threading.Event()
 
@@ -202,8 +268,8 @@ class Lab:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="validate the tap-sync diagnosis against known causes")
-    ap.add_argument("scenarios", nargs="*", choices=list(SCENARIOS), help="default: all five")
-    ap.add_argument("--tasks", type=int, default=160, help="live tasks for the dump scenario")
+    ap.add_argument("scenarios", nargs="*", choices=list(SCENARIOS), help="default: all six")
+    ap.add_argument("--tasks", type=int, default=160, help="live tasks for the dump and writes scenarios")
     ap.add_argument("--syncs", type=int, default=14, help="syncs per scenario")
     ap.add_argument("--spinners", type=int, default=None, help="busy processes (default 40 per core up to 80)")
     ap.add_argument("--loaders", type=int, default=16, help="nft transaction loaders")
@@ -224,6 +290,21 @@ def main() -> int:
             lab.sync_once()
             time.sleep(0.1)
         for sc in args.scenarios:
+            if sc == "writes":
+                rows = lab.write_costs(args.tasks)
+                names = list(rows[0][1])
+                print(f"{'live tasks':>12} " + " ".join(f"{n:>22}" for n in names))
+                for n, ops in rows:
+                    print(f"{n:>12} " + " ".join(f"{ops[x][0]} commit{'s' if ops[x][0] != 1 else ' '} {ops[x][1]:7.1f} ms".rjust(22) for x in names))
+                many = [(n, x) for n, ops in rows for x in ops if ops[x][0] != 1]
+                if many:
+                    bad.append(sc)
+                    print(f"   !! more than one commit per operation: {many}\n")
+                else:
+                    iso = rows[0][1]["ISOLATE block()"][1]
+                    print(f"   -> one commit per operation. An ISOLATE takes {iso:.1f} ms here, which is about what a "
+                          f"single commit costs on this machine.\n")
+                continue
             if sc == "dump":
                 cli, nl, same = lab.dump_scaling(args.tasks)
                 if not same:

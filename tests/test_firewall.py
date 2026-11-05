@@ -22,15 +22,18 @@ from cora_sentinel.verdict import Adjudicator, Executor
 # =========================== part 1: fake nft ===============================
 class FakeNft:
     def __init__(self):
-        self.rules, self.next, self.chain = [], 1, False
+        self.rules, self.next, self.chain, self.scripts = [], 1, False, []     # scripts: every `-f -` transaction
 
     def __call__(self, args, stdin):
+        if args[:2] == ["list", "chain"]:                      # existence check (the command fallback of chain_exists)
+            return (0, "", "") if self.chain else (1, "", "Error: No such file or directory")
         if args[:2] == ["-j", "list"]:
             if not self.chain:
                 return 1, "", "Error: No such file or directory"
             items = [{"metainfo": {}}, {"chain": {}}] + [{"rule": r} for r in self.rules]
             return 0, json.dumps({"nftables": items}), ""
         if args == ["-f", "-"]:
+            self.scripts.append(stdin)
             for line in stdin.splitlines():
                 if line.startswith("add chain"):
                     self.chain = True
@@ -480,3 +483,89 @@ def test_the_command_fallback_reads_the_same_fields_as_the_netlink_path(tmp_path
                                            {"rule": {"handle": 5, "comment": "c", "expr": [{"counter": {"packets": 2, "bytes": 9}}]}}]}), ""
     assert _fw(tmp_path, run=fake).chain_rules("tap") == [
         {"handle": 4, "comment": None, "packets": 0, "bytes": 0}, {"handle": 5, "comment": "c", "packets": 2, "bytes": 9}]
+
+
+# ---- one transaction per operation ---------------------------------------------------------
+def _mk(fw, *names):
+    for n in names:
+        (fw.cg.root / n).mkdir(exist_ok=True)
+
+
+def _order(script, *prefixes):
+    lines = script.splitlines()
+    return [next(i for i, ln in enumerate(lines) if ln.startswith(p)) for p in prefixes]
+
+
+def test_an_isolate_is_ONE_transaction_when_the_chain_already_exists(fake):
+    fw, n = fake
+    _mk(fw, "a"); fw.ensure(); n.scripts.clear()
+    assert fw.block("a") is True
+    assert len(n.scripts) == 1 and n.scripts[0].count("add rule") == 1
+    assert "add table" not in n.scripts[0] and "add chain" not in n.scripts[0]      # nothing missing: no extra commit
+
+
+def test_the_very_first_isolate_creates_the_chain_in_the_same_transaction(fake):
+    fw, n = fake
+    _mk(fw, "a")
+    assert fw.block("a") is True and len(n.scripts) == 1
+    t, c, r = _order(n.scripts[0], "add table", "add chain", "add rule")
+    assert t < c < r                                                                # the chain exists before the rule
+
+
+def test_replacing_a_stale_rule_is_atomic_so_the_task_is_never_unblocked_in_between(fake):
+    fw, n = fake
+    _mk(fw, "a"); fw.block("a")
+    n.rules[0]["comment"] = "cora:a:1"                 # the cgroup was recreated: this rule is for an older id
+    n.scripts.clear()
+    assert fw.block("a") is True
+    assert len(n.scripts) == 1                         # one commit, where it used to be unblock + ensure + add
+    d, a = _order(n.scripts[0], "delete rule", "add rule")
+    assert d < a and "add table" not in n.scripts[0]
+    assert len(n.rules) == 1 and n.rules[0]["comment"] != "cora:a:1"
+
+
+def test_an_already_blocked_task_costs_no_transaction(fake):
+    fw, n = fake
+    _mk(fw, "a"); fw.block("a"); n.scripts.clear()
+    assert fw.block("a") is False and n.scripts == []
+
+
+def test_gc_removes_any_number_of_dead_tasks_in_ONE_transaction(fake):
+    fw, n = fake
+    _mk(fw, "a", "b", "c", "d", "e")
+    for x in "abcde":
+        fw.block(x)
+    n.scripts.clear()
+    assert sorted(fw.gc({"a"})) == ["b", "c", "d", "e"]
+    assert len(n.scripts) == 1 and n.scripts[0].count("delete rule") == 4          # was one commit per dead task
+    assert [r["comment"].split(":")[1] for r in n.rules] == ["a"]
+
+
+def test_gc_with_nothing_to_remove_sends_nothing(fake):
+    fw, n = fake
+    _mk(fw, "a"); fw.block("a"); n.scripts.clear()
+    assert fw.gc({"a"}) == [] and n.scripts == []
+
+
+@real
+def test_every_write_operation_is_one_commit_on_the_real_kernel(env):
+    """Reads go over netlink, so fw.timing.calls counts nft COMMITS. ISOLATE, a re-isolate of a recreated cgroup and
+    gc of several dead tasks are one each; and the re-isolate still contains the new cgroup."""
+    cg, fw = env
+    assert fw.native is True
+    for n in ("a", "b", "c", "d", "e"):
+        cg.create(n)
+    fw.timing.reset(); assert fw.block("a") is True
+    assert fw.timing.calls == 1                                    # the table and chain were created in the same commit
+    fw.timing.reset(); assert fw.block("b") is True
+    assert fw.timing.calls == 1
+    (cg.root / "a").rmdir(); cg.create("a")                        # a NEW cgroup under the old name
+    assert errors_in(cg, "a") == 0                                 # the old rule does not match it
+    fw.timing.reset(); assert fw.block("a") is True
+    assert fw.timing.calls == 1                                    # was: unblock + ensure + add
+    assert errors_in(cg, "a") == 3 and len(fw.rules()) == 2        # and the new cgroup really is contained
+    for n in ("c", "d", "e"):
+        fw.block(n)
+    fw.timing.reset()
+    assert sorted(fw.gc({"a", "b"})) == ["c", "d", "e"] and fw.timing.calls == 1
+    assert sorted(fw.rules()) == ["a", "b"]

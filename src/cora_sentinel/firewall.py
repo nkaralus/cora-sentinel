@@ -166,11 +166,13 @@ class Firewall:
         self._nft(["-f", "-"], text)
 
     @_serialized
+    def _ensure_lines(self) -> List[str]:
+        return [f"add table inet {self.table}",
+                f"add chain inet {self.table} {self.CHAIN} {{ type filter hook output priority 0 ; policy accept ; }}"]
+
     def ensure(self) -> None:
         """Idempotent. Creates only our own table and chain."""
-        self._script(f"add table inet {self.table}\n"
-                     f"add chain inet {self.table} {self.CHAIN} "
-                     "{ type filter hook output priority 0 ; policy accept ; }\n")
+        self._script("\n".join(self._ensure_lines()) + "\n")
 
     # ---- rule text --------------------------------------------------------
     def cgroup_match(self, name: str) -> Tuple[int, str, int]:
@@ -214,12 +216,17 @@ class Firewall:
         text = self.rule_text(name)
         cur = self.cgroup_match(name)[2]
         existing = self.rules().get(name)
+        lines: List[str] = []
         if existing is not None:
             if existing["cgid"] == cur:
                 return False                # genuinely already blocked
-            self.unblock(name)              # stale: same name, different (recreated) cgroup
-        self.ensure()
-        self._script(f"add rule inet {self.table} {self.CHAIN} {text}\n")
+            # stale (same name, a recreated cgroup): replaced in the SAME transaction, so there is no moment in
+            # which the task is unblocked between the old rule going and the new one arriving
+            lines.append(f"delete rule inet {self.table} {self.CHAIN} handle {existing['handle']}")
+        elif not self.chain_exists(self.CHAIN):
+            lines += self._ensure_lines()   # only when something is missing: it is a commit of its own
+        lines.append(f"add rule inet {self.table} {self.CHAIN} {text}")
+        self._script("\n".join(lines) + "\n")                 # ONE transaction per ISOLATE
         return True
 
     @_serialized
@@ -234,16 +241,18 @@ class Firewall:
     def gc(self, live: Iterable[str]) -> List[str]:
         """Remove rules whose task cgroup no longer exists."""
         live = set(live)
-        gone = []
+        gone, dead = [], []
         for n, r in self.rules().items():
             if n not in live:
                 gone.append(n)
+                dead.append(r["handle"])
             else:                           # live name, but a rule for an older cgroup of that name
                 cur = self.cgroup_match(n)[2]
                 if r["cgid"] is not None and cur and r["cgid"] != cur:
                     gone.append(n)
-        for n in gone:
-            self.unblock(n)
+                    dead.append(r["handle"])
+        if dead:                            # ONE transaction however many tasks died (this runs under the lock
+            self._script("\n".join(f"delete rule inet {self.table} {self.CHAIN} handle {h}" for h in dead) + "\n")
         return gone
 
     @_serialized

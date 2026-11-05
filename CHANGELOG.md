@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.3.4
+
+### Fixed
+- **Every write operation is now one nft commit.** `cora-run`'s install and an ISOLATE each ran the idempotent
+  `add table / set / chain` as a commit of its own even when the chain already existed, and `gc` committed once per dead
+  task, under the lock an ISOLATE waits behind. Counted on the test machine: install 2 -> 1 commit, ISOLATE 2 -> 1
+  (11.7 -> 3.2 ms), gc of five dead tasks 5 -> 1 (37 -> 7.3 ms). The ensure lines are included only when something is
+  missing, and in the same transaction as the rule.
+- **Re-isolating a task whose cgroup was recreated is atomic.** The old rule used to be deleted in one commit and the new
+  one added in another, so for one commit-time the task was unblocked. Delete and add are now one transaction.
+
+### Added
+- `tools/nft_latency_experiments.py writes`: the commits and time per operation (install, sync, ISOLATE, gc) as live
+  tasks accumulate, with `--check` requiring one commit each. The ISOLATE time is about one commit on that machine.
+- `Firewall._ensure_lines()`, `TapRules._ensure_lines()` / `_ready()` / `_apply()`.
+
+### Not done (deliberately)
+- Writes stay on the nft command. Building rule expressions as netlink bytes would save only process start-up (about 1
+  ms of a 14 ms transaction on the 28-core machine) at the cost of reimplementing nft's expression encoding. See
+  `docs/tap-latency.md`.
+
 ## 0.3.3
 
 ### Fixed

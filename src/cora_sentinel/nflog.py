@@ -426,7 +426,7 @@ class TapRules:
         """Depth of a task cgroup in the v2 tree: every task is a direct child of the root."""
         return len(Path(os.path.relpath(self.fw.cg.root, self.fw.cg.mount)).parts) + 1
 
-    def ensure_chain(self) -> None:
+    def _ensure_lines(self) -> List[str]:
         t = self.fw.table
         lines = [f"add table inet {t}"]
         if self.udp_enabled():
@@ -439,10 +439,23 @@ class TapRules:
                              f"size 65536 ; }}")
         lines.append(f"add chain inet {t} {self.CHAIN} "
                      "{ type filter hook output priority -10 ; policy accept ; }")
+        return lines
+
+    def _ready(self) -> bool:
+        """The chain and (when UDP is tapped) both flow sets exist: there is nothing to create, so no reason to
+        spend a commit on the idempotent 'add table / set / chain'."""
+        return self.fw.chain_exists(self.CHAIN) and (
+            not self.udp_enabled() or (self.fw.set_exists(self.SET4) and self.fw.set_exists(self.SET6)))
+
+    def ensure_chain(self) -> None:
+        self._apply(self._ensure_lines(), creating=True)
+
+    def _apply(self, lines: List[str], creating: bool) -> None:
+        """ONE nft transaction. `creating`: the lines include the table/set/chain, so a failure may be the UDP set."""
         try:
             self.fw._script("\n".join(lines) + "\n")
         except FirewallError as e:
-            if not self.udp_enabled():
+            if not creating or not self.udp_enabled():
                 raise
             raise FirewallError(
                 f"{e}. The UDP flow set is keyed on the sending task's cgroup, which needs an nftables with "
@@ -538,8 +551,8 @@ class TapRules:
             have = self.rules().get(name)
             if self._complete(have, cgid):
                 return False
-            self.ensure_chain()
-            self.fw._script("\n".join(self._replace_lines(name, have)) + "\n")
+            lines = [] if self._ready() else self._ensure_lines()     # a commit of its own, so only when needed
+            self._apply(lines + self._replace_lines(name, have), creating=bool(lines))    # ONE transaction
             return True
 
     def teardown(self) -> None:

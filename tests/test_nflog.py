@@ -1888,3 +1888,112 @@ def test_the_baseline_comes_from_earlier_syncs_not_from_the_one_being_judged(tmp
     nm._record_sync(80.0, 1.0, {"lock_ms": 0.0, "nft_ms": 70.0})
     nm._record_sync(1200.0, 1.0, {"lock_ms": 1100.0, "nft_ms": 40.0})
     assert nm.worst_sync["total_base"] == 80.0                              # the fastest of the earlier ones
+
+
+# ============ the tap's writes: one transaction per operation ============
+def _order_in(script, *prefixes):
+    lines = script.splitlines()
+    return [next(i for i, ln in enumerate(lines) if ln.startswith(p)) for p in prefixes]
+
+
+def test_install_is_ONE_transaction_when_the_chain_and_sets_already_exist(tmp_path):
+    t, cg, n, table = _fake_tap(tmp_path, udp=True)
+    try:
+        t.ensure_chain(); cg.create("a"); n.scripts.clear()
+        assert t.install("a") is True
+        assert len(n.scripts) == 1 and n.scripts[0].count("add rule") == 5          # 1 TCP + 4 UDP rules
+        assert not any(w in n.scripts[0] for w in ("add table", "add chain", "add set"))     # nothing missing: no commit
+        assert t.install("a") is False and len(n.scripts) == 1                       # complete: no transaction at all
+    finally:
+        _drop_lock(table)
+
+
+def test_the_first_install_creates_table_sets_and_chain_in_the_same_transaction_before_the_rules(tmp_path):
+    t, cg, n, table = _fake_tap(tmp_path, udp=True)
+    try:
+        cg.create("a")
+        assert t.install("a") is True and len(n.scripts) == 1
+        tb, st, ch, rl = _order_in(n.scripts[0], "add table", "add set", "add chain", "add rule")
+        assert tb < st < ch < rl
+    finally:
+        _drop_lock(table)
+
+
+def test_a_stale_install_replaces_the_rules_in_one_transaction_deleting_before_adding(tmp_path):
+    t, cg, n, table = _fake_tap(tmp_path, udp=True)
+    try:
+        t.ensure_chain(); cg.create("a"); t.install("a")
+        for r in n.rules:
+            r["comment"] = re.sub(r":\d+$", ":1", r["comment"])                      # the cgroup was recreated
+        n.scripts.clear()
+        assert t.install("a") is True and len(n.scripts) == 1
+        d, a = _order_in(n.scripts[0], "delete rule", "add rule")
+        assert d < a and n.scripts[0].count("delete rule") == 5 and n.scripts[0].count("add rule") == 5
+    finally:
+        _drop_lock(table)
+
+
+def test_sync_of_several_changes_is_one_transaction(tmp_path):
+    t, cg, n, table = _fake_tap(tmp_path, udp=True)
+    try:
+        t.ensure_chain()
+        for x in ("a", "b", "c"):
+            cg.create(x)
+        t.sync({x: os.stat(cg.root / x).st_ino for x in ("a", "b", "c")})
+        n.scripts.clear()
+        cg.create("d"); cg.create("e")
+        t.sync({x: os.stat(cg.root / x).st_ino for x in ("a", "b", "d", "e")})        # +d +e, -c
+        assert len(n.scripts) == 1 and n.scripts[0].count("delete rule") == 5 and n.scripts[0].count("add rule") == 10
+    finally:
+        _drop_lock(table)
+
+
+def test_the_udp_hint_survives_the_merge_and_only_appears_when_the_set_was_being_created(tmp_path):
+    from cora_sentinel.firewall import FirewallError
+    t, cg, n, table = _fake_tap(tmp_path, udp=True)
+    try:
+        orig = n.__call__
+        t.fw._run = lambda args, stdin: ((1, "", "Error: syntax error near typeof")
+                                         if args == ["-f", "-"] and "add set" in (stdin or "") else orig(args, stdin))
+        cg.create("a")
+        with pytest.raises(FirewallError, match="--no-tap-udp"):                      # creating the set failed: the hint
+            t.install("a")
+        t.fw._run = orig
+        t.ensure_chain(); n.scripts.clear()
+        t.fw._run = lambda args, stdin: (1, "", "Error: boom") if args == ["-f", "-"] else orig(args, stdin)
+        with pytest.raises(FirewallError) as e:
+            t.install("a")                                                           # nothing was being created: no hint
+        assert "--no-tap-udp" not in str(e.value)
+    finally:
+        _drop_lock(table)
+
+
+@real
+def test_the_tap_installs_and_syncs_are_one_commit_each_on_the_real_kernel(env):
+    cg, fw, made = env
+    tr = TapRules(fw, GROUP)
+    tr.ensure_chain()
+    assert fw.native is True
+    cg.create("a"); cg.create("b"); cg.create("c")
+    fw.timing.reset(); assert tr.install("a") is True
+    assert fw.timing.calls == 1 and tr.rules()["a"]["kinds"] == tr._needed()          # complete, with ONE commit
+    fw.timing.reset(); assert tr.install("a") is False
+    assert fw.timing.calls == 0                                                        # already complete: no commit
+    fw.timing.reset()
+    tr.sync({n: os.stat(cg.root / n).st_ino for n in ("a", "b", "c")})                # +b +c in one transaction
+    assert fw.timing.calls == 1 and set(tr.rules()) == {"a", "b", "c"}
+    (cg.root / "c").rmdir()
+    fw.timing.reset()
+    tr.sync({n: os.stat(cg.root / n).st_ino for n in ("a", "b")})                     # -c
+    assert fw.timing.calls == 1 and set(tr.rules()) == {"a", "b"}
+
+
+@real
+def test_the_experiment_tool_shows_one_commit_per_write_operation_and_cleans_up():
+    r = subprocess.run([sys.executable, str(_TOOL), "writes", "--tasks", "40", "--check"],
+                       capture_output=True, text=True, timeout=180)
+    assert r.returncode == 0, r.stdout + r.stderr
+    rows = [ln for ln in r.stdout.splitlines() if ln.strip()[:1].isdigit() and "commit" in ln]
+    assert len(rows) >= 2 and all(" 1 commit " in ln and "commits" not in ln for ln in rows)
+    assert "coraexp" not in subprocess.run(["nft", "list", "tables"], capture_output=True, text=True).stdout
+    assert not [n for n in os.listdir(MOUNT) if n.startswith("coraexp-")]

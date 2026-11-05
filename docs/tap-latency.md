@@ -81,6 +81,44 @@ was the cause of the 1.5-13 s stalls you saw under load: it is the best candidat
 tasks, held under a lock that every launch queues on), but the evidence on your machine is the `lock_wait_max` / `nft_max`
 in the monitor summary from a heavy parallel run with this version. If they stay small, it was.
 
+## Writes: one commit per operation
+
+Reads were the big cost; the write side had a smaller, different problem: operations that spent **more than one nft
+commit** (a transaction, which waits for the kernel to finish committing) where one would do. Counted and timed on the
+test machine, with the table growing:
+
+| operation | commits before -> after | time before -> after (0 live tasks) |
+|---|---|---|
+| `cora-run` install, under the tap lock | 2 -> **1** | 11.7 -> 3.4 ms |
+| an ISOLATE (`Firewall.block`) | 2 -> **1** (3 when the old rule was stale) | 11.7 -> **3.2 ms** |
+| `Firewall.gc` of 5 dead tasks, under the lock an ISOLATE waits behind | 5 -> **1** | 37 -> 7.3 ms |
+| the sentinel's `sync` adding a task | 1 -> 1 (it already batched) | unchanged |
+
+- `install` and `block` used to run an idempotent `add table / set / chain` as its own commit even though the chain
+  already existed. They now include it only when something is actually missing, and in the *same* transaction as the rule.
+- Re-isolating a task whose cgroup was recreated used to commit "delete the old rule" and "add the new one" separately,
+  so for one commit-time the task was **unblocked**. It is now one atomic transaction: delete and add together.
+- `gc` is one transaction however many tasks died.
+
+A commit costs about 3-6 ms on the test machine and does not grow with the number of rules. What still grows at 160 live
+tasks is the netlink *read* (about 21 us per rule, about 17 ms for 800 rules, parsed in Python): that is what `install`
+and `sync` spend there now, and it is linear, not quadratic. It is the next lever if the numbers ever call for it.
+
+`sudo python3 tools/nft_latency_experiments.py writes --tasks 160` measures this on your machine, one row per size. Its
+ISOLATE time is, in effect, your machine's cost of a single commit. If that is tens of milliseconds, the commit itself is
+the remaining cost. On the test kernel most of a commit was waiting for an RCU grace period (a bare `add table` +
+`delete table` took 8.0 ms, and 2.0-2.8 ms with `/sys/kernel/rcu_expedited=1`, repeatable). That is a system-wide kernel
+setting with a cost (it interrupts every CPU), so it is yours to decide; nothing here changes it.
+
+### Why the writes are not done over netlink too
+
+Reads were cheap to do natively because the callers need three fields from a rule. Writes would mean building each
+rule's expressions (`socket cgroupv2`, payload matches, log, counter, set lookup and update, comment) as kernel netlink
+bytes: reimplementing part of libnftnl, where one wrong byte means a rule that silently does not match. And it would
+save little: process start-up is about 1 ms of a roughly 14 ms transaction on the 28-core machine (`cora-selfcheck`: 1
+ms start, 14 ms transaction), so almost all of a commit is the kernel's. Batching got most of the benefit without that
+risk. Revisit only if the `writes` scenario ever shows process start-up dominating.
+
 ## How the verdict is reached
 
 | lock wait | nft | no-op child | CPU pressure | verdict |

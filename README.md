@@ -144,7 +144,8 @@ reload keeps the current lists, and resolved addresses carry over so detection h
 [docs/blocklist-updates.md](docs/blocklist-updates.md).
 
 Reading the tap rules back is done over netlink, not with `nft list` (whose cost grows quadratically with live
-tasks: 160 tasks cost 1.8-2.0 s per listing, 20 ms over netlink). Slow tap installs are explained, not guessed at: each sync is split into lock wait / nft / other with a no-op-process
+tasks: 160 tasks cost 1.8-2.0 s per listing, 20 ms over netlink), and every write (install, ISOLATE, gc) is one nft
+commit. Slow tap installs are explained, not guessed at: each sync is split into lock wait / nft / other with a no-op-process
 control, and `tools/nft_latency_experiments.py` checks the verdict against causes it produces on purpose. See
 [docs/tap-latency.md](docs/tap-latency.md).
 
@@ -199,8 +200,8 @@ python -m pytest -q                              # unprivileged: kernel tests sk
 sudo -E ./venv/bin/python -m pytest -q           # everything (CORA_GGUF=path adds the real-model test)
 ```
 
-At 0.3.3: **416 passed, 2 skipped** as root against the installed wheel (the skips are an IPv6 loopback and a test
-that only applies when not root; the real-model test ran), and **350 passed, 68 skipped** unprivileged. The unprivileged run is what CI executes.
+At 0.3.4: **430 passed, 2 skipped** as root against the installed wheel (the skips are an IPv6 loopback and a test
+that only applies when not root; the real-model test ran), and **361 passed, 71 skipped** unprivileged. The unprivileged run is what CI executes.
 
 ## Layout
 
