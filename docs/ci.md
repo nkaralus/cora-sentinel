@@ -56,6 +56,14 @@ the specific event kind, not for any event. `CORA_TEST_SLOW_START=7` makes the c
 CORA_TEST_SLOW_START=7 python -m pytest -q tests/test_net.py tests/test_blocklist.py
 ```
 
+## Scale on purpose: `CORA_TEST_TAP_TASKS=<n>`
+
+`test_listing_cost_no_longer_grows_with_the_number_of_live_tasks` compares nft's own listing of the tap chain, which is quadratic in the
+number of tasks, with the netlink read. firewall.py gives every nft call 10 s, and at 140 tasks (700 rules) the legacy listing took about
+11 s on a throttled 2-vCPU GitHub runner, so the test sometimes failed with `nft timed out`. The default is now 60 tasks (300 rules): about
+2 s there, 0.4 s on a 1-core sandbox, and still an order of magnitude slower than netlink. `CORA_TEST_TAP_TASKS=140` runs the original scale
+on a machine that can take it.
+
 ## Noise on purpose: `CORA_TEST_AMBIENT=1`
 
 The tap tests blocklist the machine's own LAN address, and the sock_diag destroy stream is host-wide, so anything else on the

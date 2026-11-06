@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.9
+
+### Fixed
+- **The privileged CI job failed `test_listing_cost_no_longer_grows_with_the_number_of_live_tasks` with `FirewallError: nft timed out`.** The test compares nft's own listing of the tap chain, which is quadratic in the number of tasks, with the netlink read. `firewall.py` gives every nft call 10 s; at 140 tasks (700 rules) the legacy listing took about 11 s on a throttled 2-vCPU GitHub runner. It had passed in earlier runs, so it was simply close to the ceiling. Only the test was wrong; no product code changed.
+  - **The scale is now 60 tasks (300 rules).** Measured on a 1-core sandbox: nft **275 ms at 60 tasks and 1,529 ms at 140**, a ratio of 5.6 against a predicted (140/60)² = 5.4, so the quadratic model holds and about 2 s is expected on the runner, five times under the ceiling. The contrast with netlink is still large (9 ms vs 275 ms there).
+  - **The commit that lowered the loop (`b683ba2`) had left the test unable to pass**: the assertion still said `len(via_netlink) == 140` and the label `140 live tasks (700 rules)`, so it failed deterministically with `60 == 140`. The scale now comes from one constant, `TAP_TASKS`, used by the loop, the assertion, the comment and the label.
+  - `CORA_TEST_TAP_TASKS=140` runs the original scale, for a machine that can take it (documented in `docs/ci.md`).
+  - `test_the_listing_benchmark_takes_its_scale_from_one_constant_and_keeps_nft_well_under_its_ceiling` fails if the old literals come back, and if the default scale leaves 30 to 100 tasks.
+  - Checked that the shrunk test still bites: with the netlink path disabled (both reads going through the nft command) it fails (`259 < 80`), and putting `== 140` back fails two tests. (A first attempt at the first break did not take effect and its "pass" was not counted; the redone one is the result above.)
+
 ## 0.8.8
 
 ### Fixed

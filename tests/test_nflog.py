@@ -1827,17 +1827,24 @@ def test_netlink_and_nft_read_the_same_egress_rules_with_live_drop_counters(env)
     assert fw.is_blocked("jailed") and not fw.is_blocked("nobody")
 
 
+# How many live tasks the listing benchmark creates (each adds 5 tap rules). nft's own listing is quadratic in this, and firewall.py gives
+# any nft call 10 s: at 140 tasks (700 rules) the legacy listing took ~11 s on a throttled 2-vCPU GitHub runner and sometimes tripped it,
+# at 60 (300 rules) it is ~(60/140)^2 of that, about 2 s there and 0.4 s on a 1-core sandbox, while the contrast with netlink is still
+# an order of magnitude. CORA_TEST_TAP_TASKS=140 runs the original scale (on bare metal, to measure).
+TAP_TASKS = int(os.environ.get("CORA_TEST_TAP_TASKS", "60"))
+
+
 @real
 def test_listing_cost_no_longer_grows_with_the_number_of_live_tasks(env):
     """nft resolves each rule's cgroup id to a path by walking the cgroup tree, so `nft list` of the tap chain costs
     (rules x cgroups visited) and grows QUADRATICALLY with live tasks (each adds 5 rules and a sibling cgroup). The
-    netlink read is O(rules). Measured here: 160 tasks -> 1.8 s by nft, 22 ms by netlink."""
+    netlink read is O(rules). Measured on bare metal: 160 tasks -> 1.8 s by nft, 22 ms by netlink."""
     cg, fw, made = env
     tr = TapRules(fw, GROUP)
     tr.ensure_chain()
-    for i in range(60):
+    for i in range(TAP_TASKS):
         cg.create(f"t{i}")
-    tr.sync({n: os.stat(cg.root / n).st_ino for n in cg.names()})            # 140 tasks = 700 tap rules
+    tr.sync({n: os.stat(cg.root / n).st_ino for n in cg.names()})            # TAP_TASKS tasks = 5 x TAP_TASKS tap rules
 
     def ms(native):
         fw.native = native
@@ -1847,8 +1854,8 @@ def test_listing_cost_no_longer_grows_with_the_number_of_live_tasks(env):
     fast, via_netlink = ms(True)
     slow, via_nft = ms(False)
     fw.native = True
-    print(f"\n140 live tasks (700 rules): nft command {slow:.0f} ms, netlink {fast:.0f} ms")
-    assert via_netlink == via_nft and len(via_netlink) == 140                # the SAME answer ...
+    print(f"\n{TAP_TASKS} live tasks ({5 * TAP_TASKS} rules): nft command {slow:.0f} ms, netlink {fast:.0f} ms")
+    assert via_netlink == via_nft and len(via_netlink) == TAP_TASKS          # the SAME answer ...
     if slow < 100:
         pytest.skip("this machine lists too quickly for nft's cost to show")
     assert fast < 80 and fast * 10 <= slow                                   # ... without nft's cost
@@ -2151,3 +2158,15 @@ def test_ipv6_udp_first_packets_are_seen_once_per_flow_not_once_per_packet(env):
         assert nm.udp_by_task["v6udp"] == 8, f"expected one event per flow (8), got {nm.udp_by_task['v6udp']}"
     finally:
         p.kill(); p.wait(); srv.close()
+
+
+def test_the_listing_benchmark_takes_its_scale_from_one_constant_and_keeps_nft_well_under_its_ceiling():
+    """The 0.8.9 change lowered the loop but left `== 140` in the assertion and `140 live tasks` in the label, so the test could not pass.
+    Guard both halves: nothing in the test hard-codes the old scale, and the default scale is small enough for nft's quadratic listing."""
+    import inspect
+    src = inspect.getsource(test_listing_cost_no_longer_grows_with_the_number_of_live_tasks)
+    for stale in ("== 140", "140 live", "700 rules", "range(60)", "range(140)"):
+        assert stale not in src, f"the benchmark hard-codes its scale again ({stale})"
+    assert "TAP_TASKS" in src
+    if "CORA_TEST_TAP_TASKS" not in os.environ:
+        assert 30 <= TAP_TASKS <= 100, "enough tasks to show nft's cost, few enough to stay far below firewall.py's 10 s ceiling on a slow runner"
