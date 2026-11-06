@@ -555,7 +555,8 @@ def main() -> int:
     ap.add_argument("--match", default="CORA_TASK", help="argv token marking test tasks (exact match)")
     ap.add_argument("--allow", action="append", default=None, help="allowed path root (repeatable)")
     ap.add_argument("--net-allow", action="append", default=None,
-                    help=f"allowed destination CIDR (repeatable; default {DEFAULT_NET_ALLOW})")
+                    help=f"allowed destination CIDR (repeatable). Giving ANY replaces the default {DEFAULT_NET_ALLOW}, so list loopback "
+                         f"too if you still want it")
     ap.add_argument("--cgroup-root", help="enable cgroup mode: tasks are dirs under this "
                     "cgroup v2 path (start them with cora-run); --match is ignored")
     ap.add_argument("--blocklist", action="append", metavar="PATH",

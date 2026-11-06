@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+import _live  # noqa: E402  (tests/_live.py: wait for the child, then poll)
+
 from cora_sentinel.blocklist import Blocklist, DomainResolver
 from cora_sentinel.daemon import ConnDetector, NetPolicy, Sentinel
 
@@ -176,17 +178,13 @@ LOCAL = _local_ip()
 def test_live_listed_address_trips_even_when_allowlisted():
     lis = socket.socket(); lis.bind((LOCAL, 0)); lis.listen(1)
     port = lis.getsockname()[1]
-    p = subprocess.Popen([sys.executable, "-c",
-        f"import socket,time;c=socket.create_connection(('{LOCAL}',{port}));time.sleep(30)", "CORA_TASK_BL"])
+    p = _live.spawn_connector(LOCAL, port, "CORA_TASK_BL")            # returns once the child HAS connected
     try:
         ev = []
         s = Sentinel("CORA_TASK_BL", ["/tmp"], spike_mb=10**6, window_s=5, emit=ev.append,
                      net_allow=["0.0.0.0/0"],                     # allow EVERYTHING ...
                      blocklist=bl_from(f"{LOCAL}/32", "rogue"))   # ... except what is listed
-        end = time.monotonic() + 5
-        while time.monotonic() < end and not ev:
-            s.tick(); time.sleep(0.2)
-        e = [x for x in ev if x["anomaly"]["kind"] == "unauthorized_connection"]
+        e = _live.tick_until(s, ev, "unauthorized_connection")         # the window now measures detection only
         assert e and e[0]["anomaly"]["evidence"]["blocklist"]["list"] == "rogue"
         assert e[0]["anomaly"]["evidence"]["remote_port"] == port
     finally:

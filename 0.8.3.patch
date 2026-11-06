@@ -1,0 +1,291 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 746b100..f58a88a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,23 @@
+ # Changelog
+ 
++## 0.8.3
++
++### Fixed
++- **Two live sentinel tests could fail on a slow machine** (`test_net.py::test_live_outbound_flagged`, `test_blocklist.py::
++  test_live_listed_address_trips_even_when_allowlisted`): each started a child Python and polled for 5 seconds from that moment, so
++  the window also had to cover the child's interpreter start-up and connect. One failed once on a busy workstation and one once on a
++  hosted runner (Python 3.11), and both passed when run alone. The child now says `ready` once it has connected; the test waits for
++  that and only then starts polling, and it waits for the specific event kind, not any event (`tests/_live.py`).
++  - **Proved red then green:** with the child connecting 7 seconds late the unchanged tests failed (empty event list, the reported
++    shape); with the fix they pass. They still fail, after a full 10 s, when the detector flags nothing (runtime mutation).
++  - `CORA_TEST_SLOW_START=<seconds>` (new) makes the child connect late on purpose. `tests/test_live.py` (7) covers the helper,
++    and a guard fails if either test goes back to a fixed 5 s window.
++  - The failure on the hosted runner was diagnosed from the test's shape and reproduced by delaying the child; the runner's log was
++    not available, so the cause there is likely, not proven.
++- **`--net-allow` replaces its default, and the help did not say so.** `--net-allow` is `append` with no default, and the policy is
++  `net_allow if not None else DEFAULT`, so adding your LAN silently drops loopback and 10/8 unless you list them too. The help (and so
++  the man page) now says it.
++
+ ## 0.8.2
+ 
+ ### Added
+diff --git a/docs/ci.md b/docs/ci.md
+index 50cc4a4..3df73de 100644
+--- a/docs/ci.md
++++ b/docs/ci.md
+@@ -43,6 +43,19 @@ VM with a real systemd), started by hand from the Actions tab (Run workflow). It
+ stub: `stop`/`disable` ordering with `ExecStopPost`, the restart on upgrade, and removing a real floor. If the runner's kernel
+ cannot do nftables the install step says so; that is a limit of the runner, not of the package. It has not been run yet.
+ 
++## Slowness on purpose: `CORA_TEST_SLOW_START=<seconds>`
++
++The live sentinel tests start a child Python that connects somewhere and then wait for the sentinel to notice it. They used to
++poll for 5 seconds from the moment the child was *started*, so the window also had to cover the child's interpreter start-up and
++connect, which a loaded shared runner can stretch past the deadline (one such test failed once on a hosted runner, another once
++on a busy workstation, and both passed alone). The child now says `ready` once it has connected, the test waits for that, and
++only then does the polling start (`tests/_live.py`), so the window measures detection latency and nothing else. The wait is for
++the specific event kind, not for any event. `CORA_TEST_SLOW_START=7` makes the child connect 7 seconds late, to prove it:
++
++```bash
++CORA_TEST_SLOW_START=7 python -m pytest -q tests/test_net.py tests/test_blocklist.py
++```
++
+ ## Noise on purpose: `CORA_TEST_AMBIENT=1`
+ 
+ The tap tests blocklist the machine's own LAN address, and the sock_diag destroy stream is host-wide, so anything else on the
+diff --git a/src/cora_sentinel/__init__.py b/src/cora_sentinel/__init__.py
+index 881444a..d7fdf73 100644
+--- a/src/cora_sentinel/__init__.py
++++ b/src/cora_sentinel/__init__.py
+@@ -5,4 +5,4 @@ local model (grammar-constrained) proposes a verdict; deterministic gates decide
+ See README.md.
+ """
+ 
+-__version__ = "0.8.2"
++__version__ = "0.8.3"
+diff --git a/src/cora_sentinel/daemon.py b/src/cora_sentinel/daemon.py
+index b151e75..bd121b8 100644
+--- a/src/cora_sentinel/daemon.py
++++ b/src/cora_sentinel/daemon.py
+@@ -555,7 +555,8 @@ def main() -> int:
+     ap.add_argument("--match", default="CORA_TASK", help="argv token marking test tasks (exact match)")
+     ap.add_argument("--allow", action="append", default=None, help="allowed path root (repeatable)")
+     ap.add_argument("--net-allow", action="append", default=None,
+-                    help=f"allowed destination CIDR (repeatable; default {DEFAULT_NET_ALLOW})")
++                    help=f"allowed destination CIDR (repeatable). Giving ANY replaces the default {DEFAULT_NET_ALLOW}, so list loopback "
++                         f"too if you still want it")
+     ap.add_argument("--cgroup-root", help="enable cgroup mode: tasks are dirs under this "
+                     "cgroup v2 path (start them with cora-run); --match is ignored")
+     ap.add_argument("--blocklist", action="append", metavar="PATH",
+diff --git a/tests/_live.py b/tests/_live.py
+new file mode 100644
+index 0000000..5ed5b1d
+--- /dev/null
++++ b/tests/_live.py
+@@ -0,0 +1,49 @@
++"""Helpers for tests that start a child process and wait for the sentinel to notice it.
++
++A test that starts a child and then polls for "at most 5 seconds" is measuring the wrong thing: the window also has to cover
++the child's interpreter start-up and its connect, which a loaded shared runner can stretch past the deadline (two such tests
++failed once each, on a busy workstation and on a hosted runner, and passed when run alone). So the child says `ready` once it
++has connected, the caller waits for that, and only then does the polling window start: it measures detection latency and
++nothing else.
++
++CORA_TEST_SLOW_START=<seconds> makes the child wait that long before it connects, to pretend the machine is slow:
++    CORA_TEST_SLOW_START=7 python -m pytest -q tests/test_net.py tests/test_blocklist.py
++"""
++from __future__ import annotations
++
++import os
++import select
++import subprocess
++import sys
++import time
++from typing import List
++
++import pytest
++
++
++def spawn_connector(host: str, port: int, marker: str, hold: float = 30.0, ready_timeout: float = 60.0) -> subprocess.Popen:
++    """A child (its argv carries `marker`) that connects to (host, port), says `ready`, and holds the connection open.
++    Returns once it has said so. If it never does, the test FAILS HERE with a setup message, not later with a detection failure."""
++    delay = float(os.environ.get("CORA_TEST_SLOW_START", "0") or 0)
++    code = (f"import socket,sys,time;time.sleep({delay!r});c=socket.create_connection(({host!r},{port!r}));"
++            f"print('ready',flush=True);time.sleep({hold!r})")
++    p = subprocess.Popen([sys.executable, "-c", code, marker], stdout=subprocess.PIPE, text=True)
++    readable, _, _ = select.select([p.stdout], [], [], ready_timeout)
++    if not readable or p.stdout.readline().strip() != "ready":
++        p.kill()
++        p.wait()
++        pytest.fail(f"the child never connected to {host}:{port} within {ready_timeout:g}s "
++                    f"(a test-setup problem, not a detection failure)")
++    return p
++
++
++def tick_until(sentinel, events: list, kind: str, timeout: float = 10.0, step: float = 0.1) -> List[dict]:
++    """Tick `sentinel` until an event of `kind` has arrived (an event of another kind does not end the wait) and return the
++    events of that kind. The timeout counts from NOW, after the child is already connected."""
++    end = time.monotonic() + timeout
++    while True:
++        sentinel.tick()
++        got = [e for e in events if e["anomaly"]["kind"] == kind]
++        if got or time.monotonic() >= end:
++            return got
++        time.sleep(step)
+diff --git a/tests/test_blocklist.py b/tests/test_blocklist.py
+index a13e605..10ad15b 100644
+--- a/tests/test_blocklist.py
++++ b/tests/test_blocklist.py
+@@ -8,6 +8,8 @@ from pathlib import Path
+ 
+ import pytest
+ 
++import _live  # noqa: E402  (tests/_live.py: wait for the child, then poll)
++
+ from cora_sentinel.blocklist import Blocklist, DomainResolver
+ from cora_sentinel.daemon import ConnDetector, NetPolicy, Sentinel
+ 
+@@ -176,17 +178,13 @@ LOCAL = _local_ip()
+ def test_live_listed_address_trips_even_when_allowlisted():
+     lis = socket.socket(); lis.bind((LOCAL, 0)); lis.listen(1)
+     port = lis.getsockname()[1]
+-    p = subprocess.Popen([sys.executable, "-c",
+-        f"import socket,time;c=socket.create_connection(('{LOCAL}',{port}));time.sleep(30)", "CORA_TASK_BL"])
++    p = _live.spawn_connector(LOCAL, port, "CORA_TASK_BL")            # returns once the child HAS connected
+     try:
+         ev = []
+         s = Sentinel("CORA_TASK_BL", ["/tmp"], spike_mb=10**6, window_s=5, emit=ev.append,
+                      net_allow=["0.0.0.0/0"],                     # allow EVERYTHING ...
+                      blocklist=bl_from(f"{LOCAL}/32", "rogue"))   # ... except what is listed
+-        end = time.monotonic() + 5
+-        while time.monotonic() < end and not ev:
+-            s.tick(); time.sleep(0.2)
+-        e = [x for x in ev if x["anomaly"]["kind"] == "unauthorized_connection"]
++        e = _live.tick_until(s, ev, "unauthorized_connection")         # the window now measures detection only
+         assert e and e[0]["anomaly"]["evidence"]["blocklist"]["list"] == "rogue"
+         assert e[0]["anomaly"]["evidence"]["remote_port"] == port
+     finally:
+diff --git a/tests/test_live.py b/tests/test_live.py
+new file mode 100644
+index 0000000..9a23aba
+--- /dev/null
++++ b/tests/test_live.py
+@@ -0,0 +1,91 @@
++"""The helpers that keep the live sentinel tests from depending on how fast the machine starts an interpreter.
++No kernel, no root (loopback only). Run: pytest -q tests/test_live.py"""
++import inspect
++import socket
++import time
++
++import pytest
++
++import _live
++import test_blocklist
++import test_net
++
++
++def listener():
++    lis = socket.socket()
++    lis.bind(("127.0.0.1", 0))
++    lis.listen(4)
++    lis.settimeout(5)
++    return lis, lis.getsockname()[1]
++
++
++def test_spawn_connector_returns_only_after_the_child_has_connected():
++    lis, port = listener()
++    p = _live.spawn_connector("127.0.0.1", port, "CORA_TEST_MARK", hold=10)
++    try:
++        assert p.poll() is None
++        conn, _ = lis.accept()                                 # it really did connect before we were handed it
++        conn.close()
++        assert "CORA_TEST_MARK" in open(f"/proc/{p.pid}/cmdline").read()      # and the marker is in its argv
++    finally:
++        p.kill(); p.wait(); lis.close()
++
++
++def test_the_slow_start_switch_delays_the_connect_and_the_helper_still_waits_for_it(monkeypatch):
++    monkeypatch.setenv("CORA_TEST_SLOW_START", "1.2")
++    lis, port = listener()
++    t0 = time.monotonic()
++    p = _live.spawn_connector("127.0.0.1", port, "CORA_TEST_MARK", hold=10)
++    try:
++        assert time.monotonic() - t0 >= 1.2 and p.poll() is None
++    finally:
++        p.kill(); p.wait(); lis.close()
++
++
++def test_a_child_that_cannot_connect_fails_the_test_at_setup_with_a_clear_message():
++    lis, port = listener()
++    lis.close()                                                # nothing is listening: the child gets ConnectionRefused and exits
++    with pytest.raises(pytest.fail.Exception, match="never connected"):
++        _live.spawn_connector("127.0.0.1", port, "CORA_TEST_MARK", ready_timeout=10)
++
++
++def test_a_child_that_is_too_slow_is_killed_and_reported_not_left_running(monkeypatch):
++    monkeypatch.setenv("CORA_TEST_SLOW_START", "5")
++    made, real = [], _live.subprocess.Popen
++    monkeypatch.setattr(_live.subprocess, "Popen", lambda *a, **k: made.append(real(*a, **k)) or made[-1])     # keep the child it makes
++    lis, port = listener()
++    t0 = time.monotonic()
++    with pytest.raises(pytest.fail.Exception, match="within 0.5s"):
++        _live.spawn_connector("127.0.0.1", port, "CORA_TEST_SLOW_KILLED", ready_timeout=0.5)
++    assert time.monotonic() - t0 < 5
++    assert len(made) == 1 and made[0].poll() is not None, "the child must be dead (and reaped) when the helper gives up"
++    lis.close()
++
++
++class FakeSentinel:
++    def __init__(self, script):
++        self.script, self.events = list(script), []
++
++    def tick(self):
++        if self.script:
++            self.events.append({"anomaly": {"kind": self.script.pop(0)}})
++
++
++def test_tick_until_waits_for_the_kind_asked_for_not_just_any_event():
++    s = FakeSentinel(["path_violation", "memory_spike", "unauthorized_connection"])
++    got = _live.tick_until(s, s.events, "unauthorized_connection", timeout=5, step=0.01)
++    assert [e["anomaly"]["kind"] for e in got] == ["unauthorized_connection"] and len(s.events) == 3
++
++
++def test_tick_until_gives_up_after_the_timeout_and_returns_nothing_of_that_kind():
++    s = FakeSentinel(["path_violation"])
++    t0 = time.monotonic()
++    assert _live.tick_until(s, s.events, "unauthorized_connection", timeout=0.3, step=0.05) == []
++    assert 0.25 <= time.monotonic() - t0 < 2
++
++
++def test_the_two_live_tests_wait_for_the_child_before_they_start_the_clock():
++    for fn in (test_net.test_live_outbound_flagged, test_blocklist.test_live_listed_address_trips_even_when_allowlisted):
++        src = inspect.getsource(fn)
++        assert "spawn_connector" in src and "tick_until" in src, fn.__name__
++        assert "monotonic() + 5" not in src, f"{fn.__name__} is back to a fixed 5 s window that includes the child's start-up"
+diff --git a/tests/test_net.py b/tests/test_net.py
+index 116957f..b469fc7 100644
+--- a/tests/test_net.py
++++ b/tests/test_net.py
+@@ -7,6 +7,8 @@ import time
+ 
+ import pytest
+ 
++import _live  # noqa: E402  (tests/_live.py: wait for the child, then poll)
++
+ from cora_sentinel.daemon import (ConnDetector, NetPolicy, Sentinel, _hex_ip,
+                            parse_proc_net_tcp)
+ 
+@@ -86,14 +88,10 @@ def sentinel(events):
+ def test_live_outbound_flagged(procs):
+     lis = socket.socket(); lis.bind(("127.0.0.1", 0)); lis.listen(1)
+     port = lis.getsockname()[1]
+-    procs.append(subprocess.Popen([sys.executable, "-c",
+-        f"import socket,time;c=socket.create_connection(('127.0.0.1',{port}));time.sleep(30)", MARK]))
++    procs.append(_live.spawn_connector("127.0.0.1", port, MARK))      # returns once the child HAS connected
+     ev = []; s = sentinel(ev)
+-    end = time.monotonic() + 5
+-    while time.monotonic() < end and not ev:
+-        s.tick(); time.sleep(0.2)
++    e = _live.tick_until(s, ev, "unauthorized_connection")          # the window now measures detection only
+     lis.close()
+-    e = [x for x in ev if x["anomaly"]["kind"] == "unauthorized_connection"]
+     assert e and e[0]["anomaly"]["evidence"]["remote_port"] == port
+     assert e[0]["anomaly"]["evidence"]["remote_ip"] == "127.0.0.1"
+ 

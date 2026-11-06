@@ -7,6 +7,8 @@ import time
 
 import pytest
 
+import _live  # noqa: E402  (tests/_live.py: wait for the child, then poll)
+
 from cora_sentinel.daemon import (ConnDetector, NetPolicy, Sentinel, _hex_ip,
                            parse_proc_net_tcp)
 
@@ -86,14 +88,10 @@ def sentinel(events):
 def test_live_outbound_flagged(procs):
     lis = socket.socket(); lis.bind(("127.0.0.1", 0)); lis.listen(1)
     port = lis.getsockname()[1]
-    procs.append(subprocess.Popen([sys.executable, "-c",
-        f"import socket,time;c=socket.create_connection(('127.0.0.1',{port}));time.sleep(30)", MARK]))
+    procs.append(_live.spawn_connector("127.0.0.1", port, MARK))      # returns once the child HAS connected
     ev = []; s = sentinel(ev)
-    end = time.monotonic() + 5
-    while time.monotonic() < end and not ev:
-        s.tick(); time.sleep(0.2)
+    e = _live.tick_until(s, ev, "unauthorized_connection")          # the window now measures detection only
     lis.close()
-    e = [x for x in ev if x["anomaly"]["kind"] == "unauthorized_connection"]
     assert e and e[0]["anomaly"]["evidence"]["remote_port"] == port
     assert e[0]["anomaly"]["evidence"]["remote_ip"] == "127.0.0.1"
 

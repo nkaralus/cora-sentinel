@@ -1,0 +1,21 @@
+cora-sentinel 0.8.3: two timing-fragile live tests fixed, and a --net-allow help fix
+
+Extract over the pushed HEAD (3ef9052, v0.8.2):
+    cd ~/cora-sentinel
+    unzip -o /path/to/cora-sentinel-0.8.3.zip
+    pip install -e ".[dev]"
+    sudo -E ./venv/bin/python -m pytest -q          # I measured 758 passed, 7 skipped as root in my sandbox
+    CORA_TEST_SLOW_START=7 python -m pytest -q tests/test_net.py tests/test_blocklist.py     # a slow machine, on purpose
+
+New:      tests/_live.py (spawn_connector: the child says "ready" once connected; tick_until: wait for the specific event kind)
+          tests/test_live.py (7)
+Modified: tests/test_net.py  tests/test_blocklist.py   (test_live_outbound_flagged and test_live_listed_address_trips_even_when_allowlisted
+              no longer start a 5 s clock before the child has connected)
+          src/cora_sentinel/daemon.py   ONLY the --net-allow help string: giving ANY --net-allow REPLACES the default
+              (127.0.0.0/8, ::1/128, 10.0.0.0/8), so list loopback too
+          docs/ci.md  CHANGELOG.md  __init__.py (0.8.3)
+0.8.3.patch is the same change as a `git apply` patch.
+
+No CI workflow is touched. The CI failure you saw on Python 3.11 (test_live_listed_address_trips_even_when_allowlisted) is the
+second test this fixes; it was reproduced by making the child connect 7 s late (the old tests fail, the new ones pass) but the runner's
+log was not available, so that is the likely cause there, not a proven one. If it recurs, send me the assertion output.

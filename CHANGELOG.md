@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.8.3
+
+### Fixed
+- **Two live sentinel tests could fail on a slow machine** (`test_net.py::test_live_outbound_flagged`, `test_blocklist.py::
+  test_live_listed_address_trips_even_when_allowlisted`): each started a child Python and polled for 5 seconds from that moment, so
+  the window also had to cover the child's interpreter start-up and connect. One failed once on a busy workstation and one once on a
+  hosted runner (Python 3.11), and both passed when run alone. The child now says `ready` once it has connected; the test waits for
+  that and only then starts polling, and it waits for the specific event kind, not any event (`tests/_live.py`).
+  - **Proved red then green:** with the child connecting 7 seconds late the unchanged tests failed (empty event list, the reported
+    shape); with the fix they pass. They still fail, after a full 10 s, when the detector flags nothing (runtime mutation).
+  - `CORA_TEST_SLOW_START=<seconds>` (new) makes the child connect late on purpose. `tests/test_live.py` (7) covers the helper,
+    and a guard fails if either test goes back to a fixed 5 s window.
+  - The failure on the hosted runner was diagnosed from the test's shape and reproduced by delaying the child; the runner's log was
+    not available, so the cause there is likely, not proven.
+- **`--net-allow` replaces its default, and the help did not say so.** `--net-allow` is `append` with no default, and the policy is
+  `net_allow if not None else DEFAULT`, so adding your LAN silently drops loopback and 10/8 unless you list them too. The help (and so
+  the man page) now says it.
+
 ## 0.8.2
 
 ### Added

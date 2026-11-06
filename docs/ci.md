@@ -43,6 +43,19 @@ VM with a real systemd), started by hand from the Actions tab (Run workflow). It
 stub: `stop`/`disable` ordering with `ExecStopPost`, the restart on upgrade, and removing a real floor. If the runner's kernel
 cannot do nftables the install step says so; that is a limit of the runner, not of the package. It has not been run yet.
 
+## Slowness on purpose: `CORA_TEST_SLOW_START=<seconds>`
+
+The live sentinel tests start a child Python that connects somewhere and then wait for the sentinel to notice it. They used to
+poll for 5 seconds from the moment the child was *started*, so the window also had to cover the child's interpreter start-up and
+connect, which a loaded shared runner can stretch past the deadline (one such test failed once on a hosted runner, another once
+on a busy workstation, and both passed alone). The child now says `ready` once it has connected, the test waits for that, and
+only then does the polling start (`tests/_live.py`), so the window measures detection latency and nothing else. The wait is for
+the specific event kind, not for any event. `CORA_TEST_SLOW_START=7` makes the child connect 7 seconds late, to prove it:
+
+```bash
+CORA_TEST_SLOW_START=7 python -m pytest -q tests/test_net.py tests/test_blocklist.py
+```
+
 ## Noise on purpose: `CORA_TEST_AMBIENT=1`
 
 The tap tests blocklist the machine's own LAN address, and the sock_diag destroy stream is host-wide, so anything else on the
