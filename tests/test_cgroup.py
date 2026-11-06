@@ -37,6 +37,8 @@ TREE = ("import subprocess,sys,time;"
 
 @pytest.fixture
 def cg():
+    if MOUNT is None:
+        pytest.skip("no writable cgroup v2 mount")
     root = CgroupRoot(f"{MOUNT}/coraci-{os.getpid()}", MOUNT)
     root.ensure()
     yield root
