@@ -13,7 +13,7 @@ import pytest
 
 from cora_sentinel.daemon import Sentinel, VirtualNet, build_payload, read_starttime
 from cora_sentinel.verdict import Adjudicator, Executor, Qwen3B
-from test_verdict import FakeCg, FakeFw, FakeModel, verdict
+from test_verdict import FakeCg, FakeFw, FakeModel, GateModel, verdict
 
 
 # ---------------------------------------------------------------------------------------------- VirtualNet: pin / unpin
@@ -425,4 +425,263 @@ def test_the_docs_describe_the_gate_codes_and_the_list_directories():
     doc = (Path(__file__).resolve().parents[1] / "docs" / "service.md").read_text()
     for word in ("OK_PROCESS_GONE", "already-contained", "subject.cgroup_id", "CGROUP_REPLACED", "CGROUP_UNPINNED", "CGROUP_GONE",
                  "PID_REUSED", "/etc/cora-sentinel/blocklists", "/etc/cora-sentinel/allow", "ISOLATE"):
+        assert word in doc, word
+
+
+# ---------------------------------------------------------------------------------------------- in-flight coalescing (0.8.6)
+class Counting(FakeModel):
+    def __init__(self, out):
+        super().__init__(out)
+        self.calls = []
+
+    def judge(self, ev):
+        self.calls.append(ev["event_id"])
+        return super().judge(ev)
+
+
+def rig2(model, enforce=False, **kw):
+    net, fw, cgs, decisions = VirtualNet(), FakeFw(), IdCg(), []
+    adj = Adjudicator(net, model, Executor(enforce, cgs, fw), None, 0.6, sink=decisions.append, **kw)
+    return net, adj, fw, cgs, decisions
+
+
+def conn(net, p, cg=None, cgid=None, ip="203.0.113.9", port=443, blocklist=None):
+    evidence = {"remote_ip": ip, "remote_port": port, "local_port": 40000, "dest_class": "public"}
+    if blocklist:
+        evidence["blocklist"] = blocklist
+    ev = build_payload(p.pid, net.ensure(p.pid), "sleep", "unauthorized_connection", "high", evidence, read_starttime(p.pid),
+                       cgroup=cg, cgroup_id=cgid)
+    ev["timing"] = {"seen_mono_s": time.monotonic()}
+    return ev
+
+
+def clean(net, adj):
+    assert net.by_pid == {} and net._pins == {} and net._deferred == set() and net._pin_since == {}
+    assert adj._pinned == set() and adj._in_flight == {}
+
+
+def test_a_burst_of_ten_identical_events_runs_the_model_once_and_leaves_nothing_behind(sleepers):
+    (p,) = sleepers()
+    model = Counting(verdict("ISOLATE"))
+    net, adj, fw, cgs, decisions = rig2(model, enforce=True)
+    cgs.where[p.pid], cgs.ids["task0"] = "task0", 1000
+    for _ in range(10):
+        adj.submit(conn(net, p, "task0", 1000))
+    assert adj.q.qsize() == 1 and adj.coalesced == 9
+    assert net._pins == {p.pid: 1} and len(adj._pinned) == 1, "nine coalesced events took no pin at all"
+    exit_(net, p)                                              # the task exits while its evaluation waits
+    cgs.where.pop(p.pid, None)
+    d = run_queued(adj)
+    assert len(model.calls) == 1, "the model judged once, not ten times"
+    assert d["coalesced"] == {"count": 9, "destinations": ["203.0.113.9:443"]}
+    assert d["gate"]["code"] == "OK_PROCESS_GONE" and fw.calls == ["task0"]
+    clean(net, adj)
+    assert not registered(net, p.pid)
+
+
+def test_events_that_arrive_while_the_model_is_judging_are_coalesced_too(sleepers):
+    (p,) = sleepers()
+    model = GateModel(verdict("ISOLATE"))                      # blocks inside judge() until released
+    net, adj, fw, cgs, decisions = rig2(model, enforce=True)
+    cgs.where[p.pid], cgs.ids["task0"] = "task0", 1000
+    adj.start()
+    try:
+        adj.submit(conn(net, p, "task0", 1000))
+        assert model.started.wait(5)
+        for i in range(9):
+            adj.submit(conn(net, p, "task0", 1000, ip=f"203.0.113.{20 + i}"))      # nine MORE, to nine other hosts, mid-inference
+        assert adj.q.qsize() == 0 and adj.coalesced == 9
+        assert net._pins == {p.pid: 1}
+        model.release.set()
+        end = time.monotonic() + 10
+        while not decisions and time.monotonic() < end:
+            time.sleep(0.02)
+        assert len(decisions) == 1 and model.calls == 1
+        assert decisions[0]["coalesced"]["count"] == 9 and len(decisions[0]["coalesced"]["destinations"]) == 9
+        assert adj.q.qsize() == 0, "ISOLATE contained the task: no follow-up is needed"
+    finally:
+        model.release.set()
+        adj.stop()
+    exit_(net, p)
+    clean(net, adj)
+
+
+def test_the_decision_line_says_how_many_were_folded_in(sleepers, capsys):
+    (p,) = sleepers()
+    net, adj, *_ = rig2(Counting(verdict("ALLOW")))
+    for _ in range(4):
+        adj.submit(conn(net, p))
+    run_queued(adj)
+    assert "+3 coalesced" in capsys.readouterr().err
+
+
+def test_a_different_kind_is_never_coalesced(sleepers):
+    (p,) = sleepers()
+    model = Counting(verdict("ALLOW"))
+    net, adj, *_ = rig2(model)
+    adj.submit(conn(net, p))
+    adj.submit(event(net, p))                                  # a path_violation for the same task while the connection is pending
+    assert adj.q.qsize() == 2 and adj.coalesced == 0 and net._pins == {p.pid: 2}
+    run_queued(adj)
+    run_queued(adj)
+    assert len(model.calls) == 2
+    exit_(net, p)
+    clean(net, adj)
+
+
+def test_a_blocklist_hit_is_never_coalesced_and_is_contained_at_submit(sleepers):
+    (p,) = sleepers()
+    net, adj, fw, cgs, decisions = rig2(Counting(verdict("ALLOW")), enforce=True)
+    cgs.where[p.pid], cgs.ids["task0"] = "task0", 1000
+    adj.submit(conn(net, p, "task0", 1000))                    # a plain connection event is pending
+    assert fw.calls == []
+    adj.submit(conn(net, p, "task0", 1000, ip="198.51.100.7", blocklist="demo/rogue_subnet/198.51.100.7/32"))
+    assert adj.coalesced == 0 and adj.q.qsize() == 2, "a deterministic detection always gets its own evaluation"
+    assert fw.calls == ["task0"], "and is isolated at submit(), whatever the model is doing"
+    assert net._pins == {p.pid: 2}
+
+
+def test_events_of_different_tasks_are_never_coalesced(sleepers):
+    a, b = sleepers(2)
+    net, adj, fw, cgs, decisions = rig2(Counting(verdict("ALLOW")))
+    adj.submit(conn(net, a, "task-a", 1))
+    adj.submit(conn(net, b, "task-b", 2))
+    assert adj.q.qsize() == 2 and adj.coalesced == 0
+
+
+def test_without_a_cgroup_a_task_is_its_pid_and_start_time_so_a_reused_pid_is_not_coalesced(sleepers):
+    (p,) = sleepers()
+    net, adj, *_ = rig2(Counting(verdict("ALLOW")))
+    first = conn(net, p)
+    again = conn(net, p)
+    reused = conn(net, p)
+    reused["subject"]["starttime"] += 1                        # same pid number, a different process
+    adj.submit(first)
+    adj.submit(again)
+    adj.submit(reused)
+    assert adj.q.qsize() == 2 and adj.coalesced == 1
+
+
+def test_a_full_queue_leaves_no_record_behind_so_the_next_event_is_not_swallowed(sleepers):
+    (p,) = sleepers()
+    net, adj, *_ = rig2(Counting(verdict("ALLOW")))
+    adj.q = queue.Queue(maxsize=1)
+    adj.q.put_nowait({"filler": True})
+    adj.submit(conn(net, p))
+    assert adj.dropped == 1 and adj._in_flight == {} and net._pins == {} and adj._pinned == set()
+    adj.submit(conn(net, p))                                   # NOT coalesced into the dropped one: it tries (and is dropped) itself
+    assert adj.coalesced == 0 and adj.dropped == 2
+
+
+def test_a_lost_evaluation_cannot_silence_a_task_for_ever(sleepers):
+    (p,) = sleepers()
+    now = [1000.0]
+    net, adj, *_ = rig2(Counting(verdict("ALLOW")))
+    adj._clock = lambda: now[0]
+    first, second = conn(net, p), conn(net, p)
+    adj.submit(first)                                          # ...and the worker dies: nobody will ever handle it
+    adj.submit(conn(net, p))
+    assert adj.coalesced == 1
+    now[0] += Adjudicator.IN_FLIGHT_MAX_AGE_S + 1
+    adj.submit(second)
+    assert adj.stale_in_flight == 1 and adj.q.qsize() == 2, "the stale record is ignored: this event gets its own evaluation"
+    adj.handle(adj.q.get_nowait())                             # the old one finally runs: it must not delete the new record
+    assert list(adj._in_flight.values())[0]["event_id"] == second["event_id"]
+    adj.handle(adj.q.get_nowait())
+    assert adj._in_flight == {}
+
+
+def test_an_exception_while_handling_clears_the_record(sleepers):
+    (p,) = sleepers()
+
+    class Boom(Executor):
+        def run(self, *a, **k):
+            raise RuntimeError("nft exploded")
+    net, fw, cgs = VirtualNet(), FakeFw(), IdCg()
+    adj = Adjudicator(net, FakeModel(verdict("TERMINATE")), Boom(True, cgs, fw), None, 0.6)
+    adj.submit(conn(net, p))
+    with pytest.raises(RuntimeError):
+        run_queued(adj)
+    assert adj._in_flight == {} and net._pins == {}
+    adj.submit(conn(net, p))
+    assert adj.coalesced == 0 and adj.q.qsize() == 1, "the next event is judged, not swallowed by a record that never cleared"
+
+
+# ---- the burst's tail is never hidden: one trailing evaluation when the verdict did not contain the task
+def test_a_burst_to_many_hosts_costs_two_evaluations_not_ten_when_the_verdict_does_not_contain_the_task(sleepers):
+    (p,) = sleepers()
+    model = Counting(verdict("ALLOW"))
+    net, adj, *_ = rig2(model)
+    events = [conn(net, p, ip=f"203.0.113.{10 + i}") for i in range(10)]
+    for ev in events:
+        adj.submit(ev)
+    assert adj.q.qsize() == 1 and adj.coalesced == 9
+    first = run_queued(adj)                                    # the verdict for the first: ALLOW
+    assert first["coalesced"]["follow_up"] == events[-1]["event_id"], "the burst's latest event is what gets judged next"
+    assert adj.q.qsize() == 1 and adj.follow_ups == 1
+    second = run_queued(adj)
+    assert model.calls == [events[0]["event_id"], events[-1]["event_id"]] and "coalesced" not in second
+    assert adj.q.qsize() == 0
+    exit_(net, p)
+    clean(net, adj)
+
+
+def test_no_trailing_evaluation_when_the_verdict_contained_the_task(sleepers):
+    (p,) = sleepers()
+    model = Counting(verdict("ISOLATE"))
+    net, adj, fw, cgs, decisions = rig2(model, enforce=True)
+    cgs.where[p.pid], cgs.ids["task0"] = "task0", 1000
+    for i in range(10):
+        adj.submit(conn(net, p, "task0", 1000, ip=f"203.0.113.{10 + i}"))
+    d = run_queued(adj)
+    assert d["action"].startswith("done:ISOLATE") and "follow_up" not in d["coalesced"] and adj.q.qsize() == 0 and len(model.calls) == 1
+
+
+def test_a_verdict_that_could_not_be_carried_out_does_not_count_as_containing(sleepers):
+    (p,) = sleepers()
+    model = Counting(verdict("ISOLATE"))
+    net, adj, fw, cgs, decisions = rig2(model, enforce=True)
+    cgs.where[p.pid], cgs.ids["task0"] = "task0", 1000
+    for i in range(3):
+        adj.submit(conn(net, p, "task0", 1000, ip=f"203.0.113.{10 + i}"))
+    exit_(net, p)
+    cgs.where.pop(p.pid, None)
+    cgs.ids["task0"] = 4242                                    # the cgroup was replaced: the gate refuses (CGROUP_REPLACED)
+    d = run_queued(adj)
+    assert d["action"] == "blocked" and d["coalesced"]["follow_up"], "ISOLATE was said but not done: the tail still needs judging"
+
+
+def test_identical_events_need_no_trailing_evaluation_even_after_allow(sleepers):
+    (p,) = sleepers()
+    model = Counting(verdict("ALLOW"))
+    net, adj, *_ = rig2(model)
+    for _ in range(10):
+        adj.submit(conn(net, p))                               # same destination: the same inputs, so the same verdict
+    d = run_queued(adj)
+    assert d["coalesced"]["count"] == 9 and "follow_up" not in d["coalesced"] and adj.q.qsize() == 0 and len(model.calls) == 1
+
+
+# ---- the premise: what the cooldown already does
+def test_identical_connections_are_already_deduplicated_by_the_cooldown_so_coalescing_is_for_the_rest():
+    emitted = []
+    s = Sentinel("CORA_TASK", ["/tmp"], 150, 10.0, emitted.append, cooldown_s=30.0)
+
+    def fire(ip, now):
+        s._fire(("task0", "unauthorized_connection", ip, 443, None), now, {"ip": ip})
+    for i in range(20):
+        fire("203.0.113.9", 100.0 + i * 0.01)
+    assert len(emitted) == 1, "twenty connections to ONE destination reach the adjudicator as one event"
+    emitted.clear()
+    for i in range(20):
+        fire(f"203.0.113.{10 + i}", 200.0 + i * 0.01)
+    assert len(emitted) == 20, "twenty DIFFERENT destinations are twenty events: that burst is what stalls the model"
+    emitted.clear()
+    fire("203.0.113.9", 131.0)
+    assert len(emitted) == 1, "and after the cooldown the same destination fires again, while a stalled queue may still hold the first"
+
+
+def test_the_docs_describe_coalescing_and_its_rules():
+    from pathlib import Path
+    doc = (Path(__file__).resolve().parents[1] / "docs" / "service.md").read_text()
+    for word in ("coalesc", "blocklist", "follow_up", "IN_FLIGHT_MAX_AGE_S", "cooldown"):
         assert word in doc, word

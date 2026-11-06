@@ -12,7 +12,9 @@
       "ip": "198.51.100.23",
       "port": 443,
       "ip_class": "public"
-    }
+    },
+    "proto": "tcp",
+    "via": "syn_tap"
   },
   "response": {
     "verdict": "ISOLATE",

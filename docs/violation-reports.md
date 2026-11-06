@@ -15,6 +15,8 @@ a blocklisted tracker or rogue address, and what Cora did about it. See
 | `process` | executable basename, or `null` (null unless the operator opts in) |
 | `violation.type` / `list` / `entry` | `tracker_domain` or `rogue_subnet`; which list; the exact entry that matched |
 | `violation.destination` | `ip` (**only if public**, else `null`), `port`, `ip_class` |
+| `violation.proto` | *optional.* How the connection spoke: `tcp`, `udp`, `quic`, `dns` or `unknown` |
+| `violation.via` | *optional.* Which detector saw it: `syn_tap`, `udp_tap`, `sock_diag`, `proc_tcp`, or `unknown`. `dns_tap` is reserved: DNS goes through the UDP tap, so it reads `proto: dns`, `via: udp_tap` |
 | `response` | `verdict`, whether it was `enforced`, any override `policy`, `model_confidence` (rounded to 0.1) |
 
 ## What is never in a report
@@ -34,3 +36,7 @@ jsonschema.validate(json.load(open('examples/violation.example.json')), s); prin
 
 Reports are written locally and are never sent automatically; review, then file with
 `gh issue create --repo nkaralus/cora-security --body-file <report>.md`.
+
+`proto` and `via` were added in 0.8.6 as optional fields of `cora.security.violation/v1`: a report without them is still valid. The schema forbids other
+extra keys, so a validator built from a copy of the schema older than 0.8.6 rejects a report that carries them. No consumer pins v1 yet; once one does,
+a further addition needs a new id.

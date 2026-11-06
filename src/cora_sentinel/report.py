@@ -38,6 +38,20 @@ SCHEMA_ID = "cora.security.violation/v1"
 TYPES = ["tracker_domain", "rogue_subnet"]
 VERDICTS = ["ALLOW", "THROTTLE", "ISOLATE", "SUSPEND", "TERMINATE", "ESCALATE"]
 IP_CLASSES = ["public", "private", "link_local", "other"]
+# How the connection spoke, and which detector saw it. Both are OPTIONAL in the report (a report from before they existed is still valid).
+# "dns_tap" is reserved: DNS flows go through the UDP tap today, so they read proto "dns", via "udp_tap".
+PROTOS = ["tcp", "udp", "quic", "dns", "unknown"]
+VIAS = ["syn_tap", "udp_tap", "dns_tap", "sock_diag", "proc_tcp", "unknown"]
+
+
+def protocol_of(evidence: dict) -> str:
+    """The protocol of a connection event, from its evidence. ConnDetector.judge() leaves `proto` out for TCP and sets it (and `l7`) for the rest."""
+    p = evidence.get("proto") or "tcp"
+    if p == "tcp":
+        return "tcp"
+    if p == "udp":
+        return evidence.get("l7") if evidence.get("l7") in ("quic", "dns") else "udp"
+    return "unknown"
 DEFAULT_SALT = "~/.config/cora/report_salt"
 
 JSON_SCHEMA = {
@@ -66,7 +80,9 @@ JSON_SCHEMA = {
                     "properties": {
                         "ip": {"type": ["string", "null"]},
                         "port": {"type": "integer", "minimum": 1, "maximum": 65535},
-                        "ip_class": {"enum": IP_CLASSES}}}}},
+                        "ip_class": {"enum": IP_CLASSES}}},
+                "proto": {"enum": PROTOS},
+                "via": {"enum": VIAS}}},
         "response": {
             "type": "object", "additionalProperties": False,
             "required": ["verdict", "enforced", "policy", "model_confidence"],
@@ -80,9 +96,9 @@ JSON_SCHEMA = {
 
 def validate_report(d: dict) -> None:
     """Strict check mirroring JSON_SCHEMA. Raises ValueError."""
-    def keys(o, want, where):
-        if not isinstance(o, dict) or set(o) != set(want):
-            raise ValueError(f"{where}: keys must be exactly {sorted(want)}")
+    def keys(o, want, where, optional=()):
+        if not isinstance(o, dict) or not (set(want) <= set(o) <= set(want) | set(optional)):
+            raise ValueError(f"{where}: keys must be {sorted(want)}" + (f", and may also have {sorted(optional)}" if optional else " exactly"))
     keys(d, JSON_SCHEMA["required"], "report")
     if d["schema"] != SCHEMA_ID:
         raise ValueError("schema id")
@@ -94,7 +110,9 @@ def validate_report(d: dict) -> None:
     if d["process"] is not None and not isinstance(d["process"], str):
         raise ValueError("process")
     v = d["violation"]
-    keys(v, ["type", "list", "entry", "destination"], "violation")
+    keys(v, ["type", "list", "entry", "destination"], "violation", optional=("proto", "via"))
+    if ("proto" in v and v["proto"] not in PROTOS) or ("via" in v and v["via"] not in VIAS):
+        raise ValueError("violation proto/via")
     if v["type"] not in TYPES or not isinstance(v["list"], str) or not isinstance(v["entry"], str):
         raise ValueError("violation fields")
     dst = v["destination"]
@@ -143,6 +161,9 @@ class Reporter:
         if self.include_process:
             argv0 = (subj.get("cmdline") or "").split(" ", 1)[0]
             proc = os.path.basename(argv0)[:64] or None
+        det = ev.get("detection") or {}                       # what the detector recorded; older events only have the evidence
+        proto = det.get("proto") if det.get("proto") in PROTOS else protocol_of(evi)
+        via = det.get("via") or evi.get("via")
         hour = self.clock().astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
         rep = {
             "schema": SCHEMA_ID,
@@ -156,7 +177,8 @@ class Reporter:
                     # a private/LAN address would map the reporter's network: omit it
                     "ip": evi["remote_ip"] if cls == "public" else None,
                     "port": int(evi["remote_port"]),
-                    "ip_class": cls if cls in IP_CLASSES else "other"}},
+                    "ip_class": cls if cls in IP_CLASSES else "other"},
+                "proto": proto, "via": via if via in VIAS else "unknown"},
             "response": {
                 "verdict": decision["final"],
                 "enforced": str(decision.get("action", "")).startswith("done:"),

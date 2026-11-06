@@ -35,6 +35,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Deque, Dict, List, Optional, Tuple
 
+from cora_sentinel.report import protocol_of
 from cora_sentinel.blocklist import Blocklist, DomainResolver
 from cora_sentinel.reload import ListError, Reloader, load_lists
 from cora_sentinel.cgroup import CgroupRoot
@@ -421,12 +422,13 @@ def build_payload(pid: int, vip: str, cmdline: str, kind: str,
                   severity: str, evidence: dict,
                   starttime: Optional[int] = None,
                   cgroup: Optional[str] = None,
-                  cgroup_id: Optional[int] = None) -> dict:
+                  cgroup_id: Optional[int] = None,
+                  detection: Optional[dict] = None) -> dict:
     try:
         mem = parse_meminfo(Path("/proc/meminfo").read_text())
     except OSError:
         mem = {}
-    return {
+    payload = {
         "schema": SCHEMA_EVENT,
         "event_id": uuid.uuid4().hex,
         "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -442,6 +444,9 @@ def build_payload(pid: int, vip: str, cmdline: str, kind: str,
         "expects": {"schema": SCHEMA_VERDICT, "verdict_enum": VERDICTS,
                     "fields": ["verdict", "confidence", "reason"]},
     }
+    if detection:                       # how a connection was seen (proto, via): NOT in `anomaly`, so the model's prompt is unchanged
+        payload["detection"] = detection
+    return payload
 
 
 # --------------------------------------------------------------------------
@@ -466,6 +471,7 @@ class Sentinel:
         self.emit = emit
         self.cooldown_s = cooldown_s
         self._last: Dict[Tuple, float] = {}
+        self.vip_skipped = self.tick_errors = 0
 
     def cgroup_id_of(self, name: Optional[str]) -> Optional[int]:
         """The identity of a task's cgroup NOW (recorded in the event, so the gate can later prove it is still the same one)."""
@@ -473,7 +479,8 @@ class Sentinel:
 
     def _payload(self, pid, vip, cmd, kind, sev, ev, st) -> dict:
         name = self._cg.get(pid)
-        return build_payload(pid, vip, cmd, kind, sev, ev, st, cgroup=name, cgroup_id=self.cgroup_id_of(name))
+        det = {"proto": protocol_of(ev), "via": "proc_tcp"} if kind == "unauthorized_connection" else None   # the /proc/net/tcp path
+        return build_payload(pid, vip, cmd, kind, sev, ev, st, cgroup=name, cgroup_id=self.cgroup_id_of(name), detection=det)
 
     def _targets(self) -> Dict[int, str]:
         me = os.getpid()
@@ -509,6 +516,16 @@ class Sentinel:
             payload.setdefault("timing", {})["seen_mono_s"] = now   # when the tap/tick saw it (process-local seconds)
             self.emit(payload)
 
+    def guarded_tick(self) -> None:
+        """tick() for the main loop: one bad tick is logged and counted, and the watch goes on (it used to end the daemon)."""
+        try:
+            self.tick()
+        except Exception as e:
+            self.tick_errors += 1
+            if self.tick_errors <= 3 or self.tick_errors % 1000 == 0:
+                print(f"[cora-sentinel] tick failed ({e.__class__.__name__}: {str(e)[:120]}); continuing "
+                      f"({self.tick_errors} so far)", file=sys.stderr)
+
     def tick(self, now: Optional[float] = None) -> None:
         now = time.monotonic() if now is None else now
         targets = self._targets()
@@ -522,7 +539,14 @@ class Sentinel:
                     by_inode[r["inode"]] = r
 
         for pid, cmd in targets.items():
-            vip = self.net.ensure(pid)
+            try:
+                vip = self.net.ensure(pid)
+            except Exception as e:                  # the /24 holds 245 VIPs: a task with more processes must not stop the watch
+                self.vip_skipped += 1
+                if self.vip_skipped <= 3 or self.vip_skipped % 1000 == 0:
+                    print(f"[cora-sentinel] no virtual IP for pid {pid} ({e.__class__.__name__}): it is not monitored this tick "
+                          f"({self.vip_skipped} skipped so far)", file=sys.stderr)
+                continue
             st = read_starttime(pid)
 
             rss = read_rss_kb(pid)
@@ -944,7 +968,7 @@ def main() -> int:
           file=sys.stderr)
     n = 0
     while not stop["v"]:
-        s.tick()
+        s.guarded_tick()
         n += 1
         if floor_ref["sync"] is not None:
             floor_ref["sync"].poll()            # reports the dead-man's outcome once

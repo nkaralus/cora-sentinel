@@ -84,11 +84,43 @@ class CgroupRoot:
             return []
 
     # ---- membership -------------------------------------------------------
-    def pids(self, name: str) -> List[int]:
+    # A task may put its workers in sub-cgroups (a browser, a flatpak: task/sub/worker). cgroup v2's cgroup.procs lists ONLY the
+    # processes directly in that cgroup, so without looking below the task directory such a task looks empty: the tap's owner lookup
+    # finds nobody and drops the event, and tick() never monitors the workers. The walk is bounded, so a runaway or hostile tree
+    # cannot make a tick expensive, and it never follows a symlink out of the root.
+    MAX_NEST_DEPTH = 8
+    MAX_SUBCGROUPS = 1024
+
+    @staticmethod
+    def _read_procs(d: Path) -> List[int]:
         try:
-            return [int(x) for x in (self._dir(name) / "cgroup.procs").read_text().split()]
+            return [int(x) for x in (d / "cgroup.procs").read_text().split() if x.isdigit()]
         except OSError:
             return []
+
+    def pids(self, name: str, nested: bool = True) -> List[int]:
+        """The task's processes: those directly in its cgroup first, then (nested=True) those in its sub-cgroups."""
+        top = self._dir(name)
+        out = self._read_procs(top)
+        if not nested:
+            return out
+        stack, seen = [(top, 0)], 0
+        while stack and seen < self.MAX_SUBCGROUPS:
+            d, depth = stack.pop()
+            if depth >= self.MAX_NEST_DEPTH:
+                continue
+            try:
+                with os.scandir(d) as it:
+                    kids = sorted((e.path for e in it if e.is_dir(follow_symlinks=False)), reverse=True)
+            except OSError:
+                continue
+            for k in kids:
+                if seen >= self.MAX_SUBCGROUPS:
+                    break
+                seen += 1
+                out += self._read_procs(Path(k))
+                stack.append((Path(k), depth + 1))
+        return out
 
     def discover(self) -> Dict[int, str]:
         out: Dict[int, str] = {}
@@ -107,15 +139,15 @@ class CgroupRoot:
         return None
 
     def cgroup_of(self, pid: int) -> Optional[str]:
-        """Task name the kernel says this pid is in right now, else None."""
+        """Task name the kernel says this pid is in right now (at any depth below the task directory), else None."""
         cur = self._read_proc_cgroup(pid)
         if cur is None:
             return None
         rel = "/" + os.path.relpath(self.root, self.mount).strip("/")
         if not cur.startswith(rel + "/"):
             return None
-        name = cur[len(rel) + 1:]
-        return name if NAME_RE.fullmatch(name) else None  # nested deeper -> not a task root
+        name = cur[len(rel) + 1:].split("/", 1)[0]       # a pid in task-a/sub/worker belongs to the task "task-a": no directory walk
+        return name if NAME_RE.fullmatch(name) else None
 
     # ---- actions ----------------------------------------------------------
     def _write(self, name: str, fname: str, val: str) -> None:

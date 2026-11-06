@@ -89,6 +89,25 @@
               ]
             }
           }
+        },
+        "proto": {
+          "enum": [
+            "tcp",
+            "udp",
+            "quic",
+            "dns",
+            "unknown"
+          ]
+        },
+        "via": {
+          "enum": [
+            "syn_tap",
+            "udp_tap",
+            "dns_tap",
+            "sock_diag",
+            "proc_tcp",
+            "unknown"
+          ]
         }
       }
     },

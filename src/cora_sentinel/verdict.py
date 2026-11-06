@@ -184,6 +184,10 @@ class Adjudicator:
         self._sink = sink
         self._pinned: set = set()                         # event_ids submit() pinned a VIP for (handle() unpins exactly these)
         self._pin_lock = threading.Lock()
+        self._in_flight: Dict[tuple, dict] = {}           # (task, kind) -> the evaluation queued or running for it
+        self._ifl_lock = threading.Lock()
+        self._clock = time.monotonic                      # tests replace it
+        self.coalesced = self.follow_ups = self.stale_in_flight = 0
 
     # ---- gate -------------------------------------------------------------
     # Actions that may still go ahead when the process that triggered the event has EXITED, provided its cgroup is provably the
@@ -231,6 +235,91 @@ class Adjudicator:
                 return False, "CGROUP_MISMATCH", "pid is no longer in the task cgroup", None
         return True, "OK", "", v
 
+    # ---- in-flight coalescing -----------------------------------------------
+    # A task that fires many events of one kind while the model is busy (3-4 s each, one at a time, 32 slots) would queue one evaluation
+    # per event and stall every other task's behind it. While an evaluation for (task, kind) is queued or running, a further event of that
+    # kind is COALESCED into it: counted and noted in that decision, but not queued. Strict rules:
+    #   * never across kinds: a path_violation is not covered by a pending connection verdict;
+    #   * never a blocklist hit: a deterministic detection is always pinned, contained at submit() and judged on its own;
+    #   * never pinned: a coalesced event takes no pin and registers nothing, so nothing of it can leak;
+    #   * never forever: a record older than IN_FLIGHT_MAX_AGE_S is ignored, so a lost evaluation cannot silence a task;
+    #   * never a hidden tail: if the verdict does not contain the task and the burst's latest event differs from the one judged, that
+    #     event is judged once afterwards (so a burst costs two evaluations at most, not twenty).
+    IN_FLIGHT_MAX_AGE_S = 300.0
+    CONTAINING = ("ISOLATE", "TERMINATE", "SUSPEND")
+    DESTS_KEPT = 10
+
+    @staticmethod
+    def _coalesce_key(ev: dict) -> Optional[tuple]:
+        evi = ev["anomaly"]["evidence"]
+        if evi.get("blocklist"):
+            return None
+        subj = ev["subject"]
+        return (subj.get("cgroup") or (subj["pid"], subj.get("starttime")), ev["anomaly"]["kind"])
+
+    @staticmethod
+    def _signature(ev: dict) -> tuple:
+        """What the model would be judging: two events with the same signature get the same verdict."""
+        evi, kind = ev["anomaly"]["evidence"], ev["anomaly"]["kind"]
+        if kind == "unauthorized_connection":
+            return (evi.get("remote_ip"), evi.get("remote_port"), evi.get("qname"), evi.get("proto"))
+        if kind == "path_violation":
+            return (evi.get("path"),)
+        if kind == "memory_spike":
+            return ()
+        return ("?", json.dumps(evi, sort_keys=True, default=str))
+
+    @staticmethod
+    def _where(ev: dict) -> str:
+        evi = ev["anomaly"]["evidence"]
+        return f"{evi['remote_ip']}:{evi.get('remote_port')}" if "remote_ip" in evi else str(evi.get("path") or ev["anomaly"]["kind"])
+
+    def _coalesce(self, key: tuple, ev: dict) -> bool:
+        """True: ev was folded into the evaluation already in flight for `key` (and nothing else happens to it). False: no evaluation is in
+        flight, so ev is registered as the one that is, and the caller must now pin and queue it."""
+        with self._ifl_lock:
+            rec, now = self._in_flight.get(key), self._clock()
+            if rec is not None and now - rec["t"] <= self.IN_FLIGHT_MAX_AGE_S:
+                rec["count"] += 1
+                self.coalesced += 1
+                where = self._where(ev)
+                if where not in rec["dests"] and len(rec["dests"]) < self.DESTS_KEPT:
+                    rec["dests"].append(where)
+                if self._signature(ev) != rec["sig"]:
+                    rec["follow"] = ev                         # the latest event that is NOT what is being judged
+                return True
+            if rec is not None:
+                self.stale_in_flight += 1                      # it never finished: stop suppressing this task
+            self._in_flight[key] = {"event_id": ev.get("event_id"), "sig": self._signature(ev), "t": now,
+                                    "count": 0, "dests": [], "follow": None}
+            return False
+
+    def _pop_in_flight(self, ev: dict) -> Optional[dict]:
+        key = self._coalesce_key(ev)
+        if key is None:
+            return None
+        with self._ifl_lock:
+            rec = self._in_flight.get(key)
+            if rec is None or rec["event_id"] != ev.get("event_id"):
+                return None                                    # not ours (replaced after a lease, or never registered)
+            return self._in_flight.pop(key)
+
+    def _forget_in_flight(self, ev: dict) -> None:
+        self._pop_in_flight(ev)
+
+    def _finish_in_flight(self, ev: dict, d: dict) -> Optional[dict]:
+        """The evaluation is done: note what was folded into it in the decision, and return the event (if any) that still needs judging."""
+        rec = self._pop_in_flight(ev)
+        if rec is None or not rec["count"]:
+            return None
+        d["coalesced"] = {"count": rec["count"], "destinations": rec["dests"]}
+        contained = d["final"] in self.CONTAINING and (str(d["action"]).startswith(("done:", "dry-run:")) or d["action"] == "already-contained")
+        if rec["follow"] is not None and not contained:
+            d["coalesced"]["follow_up"] = rec["follow"]["event_id"]
+            self.follow_ups += 1
+            return rec["follow"]
+        return None
+
     # ---- one event -> one decision ---------------------------------------
     def _unpin(self, ev: dict) -> None:
         with self._pin_lock:
@@ -241,12 +330,20 @@ class Adjudicator:
 
     def handle(self, ev: dict) -> dict:
         """Judge one event and record the decision. The VIP submit() pinned for it is released only after the decision is written."""
+        follow = None
         try:
-            return self._handle(ev)
+            d, follow = self._handle(ev)
         finally:
             self._unpin(ev)
+            self._forget_in_flight(ev)                    # (an exception path: never leave a record behind)
+        if follow is not None:                            # outside the finally: it must never mask the decision or its exception
+            try:
+                self.submit(follow)
+            except Exception as e:
+                print(f"[verdict] follow-up evaluation failed: {e!r}", file=sys.stderr)
+        return d
 
-    def _handle(self, ev: dict) -> dict:
+    def _handle(self, ev: dict) -> tuple:
         subj = ev["subject"]
         d = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
              "event_id": ev["event_id"], "pid": subj["pid"], "vip": subj["vip"],
@@ -309,13 +406,14 @@ class Adjudicator:
                     d["dyn"] = rec
             except Exception as e:
                 d["dyn"] = {"result": "error", "error": f"{e.__class__.__name__}: {str(e)[:100]}"}
+        follow = self._finish_in_flight(ev, d)
         self._record(d)
         if bl and self.reporter:
             try:
                 self.reporter.report(ev, d)
             except Exception as e:  # reporting must never break adjudication
                 print(f"[verdict] report failed: {e!r}", file=sys.stderr)
-        return d
+        return d, follow
 
     def _record(self, d: dict) -> None:
         line = json.dumps(d, separators=(",", ":"))
@@ -323,8 +421,8 @@ class Adjudicator:
             self._f.write(line + "\n")
         if self._sink:
             self._sink(d)
-        print(f"[verdict] pid={d['pid']} {d['kind']} -> {d['final']} ({d['action']})",
-              file=sys.stderr, flush=True)
+        print(f"[verdict] pid={d['pid']} {d['kind']} -> {d['final']} ({d['action']})"
+              + (f" +{d['coalesced']['count']} coalesced" if d.get("coalesced") else ""), file=sys.stderr, flush=True)
 
     # ---- worker thread ----------------------------------------------------
     def start(self) -> None:
@@ -362,6 +460,9 @@ class Adjudicator:
             print(f"[verdict] early containment failed: {e!r}", file=sys.stderr)
 
     def submit(self, ev: dict) -> None:
+        key = self._coalesce_key(ev)
+        if key is not None and self._coalesce(key, ev):
+            return                                        # nothing was pinned, registered or queued for it: nothing can leak
         pid = ev["subject"]["pid"]
         self.net.pin(pid)                                 # first thing: the process may exit while this waits behind the model
         with self._pin_lock:
@@ -371,6 +472,7 @@ class Adjudicator:
             self.q.put_nowait(ev)
         except queue.Full:
             self._unpin(ev)                               # it will never reach handle(), so nothing else would unpin it
+            self._forget_in_flight(ev)                    # ...nor release its in-flight record, which would silence the task
             # The queue is full because the model is slow. A contained task is still contained; an event that was
             # NOT contained and is dropped here is never judged at all, so say so loudly and keep a record.
             self.dropped += 1

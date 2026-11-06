@@ -303,3 +303,166 @@ def test_full_chain_listed_address_to_isolation_and_report(tmp_path):
                 cg.root.rmdir(); break
             except OSError:
                 time.sleep(0.1)
+
+
+# ---- proto and via: optional fields of a report, recorded by every connection detector (0.8.6) -----------------------
+import re as _re                                                    # noqa: E402
+from types import SimpleNamespace as _NS                            # noqa: E402
+
+from cora_sentinel.report import PROTOS, VIAS, protocol_of, validate_report as _validate   # noqa: E402
+
+
+def tap_event(proto=None, l7=None, via="syn_tap", detection=None, **kw):
+    ev = event(**kw)
+    evi = ev["anomaly"]["evidence"]
+    for k, v in (("proto", proto), ("l7", l7), ("via", via)):
+        if v:
+            evi[k] = v
+    if detection:
+        ev["detection"] = detection
+    return ev
+
+
+@pytest.mark.parametrize("evidence,want_proto,want_via", [
+    (dict(via="syn_tap"), "tcp", "syn_tap"),
+    (dict(proto="udp", via="udp_tap"), "udp", "udp_tap"),
+    (dict(proto="udp", l7="quic", via="udp_tap"), "quic", "udp_tap"),
+    (dict(proto="udp", l7="dns", via="udp_tap"), "dns", "udp_tap"),
+    (dict(proto="udp", l7="something-else", via="udp_tap"), "udp", "udp_tap"),
+])
+def test_a_report_carries_proto_and_via_and_both_validators_accept_it(rep, evidence, want_proto, want_via):
+    jsonschema = pytest.importorskip("jsonschema")
+    r = rep.build(tap_event(**evidence), decision())
+    assert r["violation"]["proto"] == want_proto and r["violation"]["via"] == want_via
+    _validate(r)
+    jsonschema.validate(r, JSON_SCHEMA)                              # the published schema agrees with the Python validator
+
+
+def test_the_detection_field_wins_over_the_evidence(rep):
+    r = rep.build(tap_event(via="syn_tap", detection={"proto": "quic", "via": "sock_diag"}), decision())
+    assert (r["violation"]["proto"], r["violation"]["via"]) == ("quic", "sock_diag")
+
+
+def test_an_event_with_no_provenance_reports_tcp_and_unknown(rep):
+    ev = event()                                                     # how every event looked before 0.8.6
+    assert "via" not in ev["anomaly"]["evidence"] and "detection" not in ev
+    r = rep.build(ev, decision())
+    assert (r["violation"]["proto"], r["violation"]["via"]) == ("tcp", "unknown")
+
+
+def test_an_unrecognised_value_degrades_to_something_valid_never_to_an_invalid_report(rep):
+    r = rep.build(tap_event(via=None, detection={"proto": "icmp", "via": "carrier-pigeon"}), decision())
+    assert r["violation"]["via"] == "unknown" and r["violation"]["proto"] == "tcp", "an invalid proto falls back to the evidence"
+    _validate(r)
+    r2 = rep.build(tap_event(proto="sctp", via=None), decision())
+    assert r2["violation"]["proto"] == "unknown"
+    _validate(r2)
+
+
+def test_the_two_fields_are_optional_so_a_report_from_before_them_is_still_valid(rep):
+    jsonschema = pytest.importorskip("jsonschema")
+    r = rep.build(tap_event(), decision())
+    del r["violation"]["proto"], r["violation"]["via"]
+    _validate(r)
+    jsonschema.validate(r, JSON_SCHEMA)
+    only_one = rep.build(tap_event(), decision())
+    del only_one["violation"]["via"]
+    _validate(only_one)
+    jsonschema.validate(only_one, JSON_SCHEMA)
+    assert "proto" not in JSON_SCHEMA["properties"]["violation"]["required"] and "via" not in JSON_SCHEMA["properties"]["violation"]["required"]
+
+
+@pytest.mark.parametrize("field,bad", [("proto", "icmp"), ("proto", ""), ("proto", None), ("proto", 6), ("via", "magic"), ("via", "SYN_TAP"), ("via", None)])
+def test_values_outside_the_enums_are_rejected_by_both_validators(rep, field, bad):
+    jsonschema = pytest.importorskip("jsonschema")
+    r = rep.build(tap_event(), decision())
+    r["violation"][field] = bad
+    with pytest.raises(ValueError):
+        _validate(r)
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(r, JSON_SCHEMA)
+
+
+def test_other_extra_keys_in_the_violation_are_still_rejected(rep):
+    jsonschema = pytest.importorskip("jsonschema")
+    r = rep.build(tap_event(), decision())
+    r["violation"]["transport"] = "tcp"
+    with pytest.raises(ValueError):
+        _validate(r)
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(r, JSON_SCHEMA)
+
+
+def test_the_enums_are_exactly_the_documented_ones():
+    assert PROTOS == ["tcp", "udp", "quic", "dns", "unknown"]
+    assert VIAS == ["syn_tap", "udp_tap", "dns_tap", "sock_diag", "proc_tcp", "unknown"]
+    props = JSON_SCHEMA["properties"]["violation"]["properties"]
+    assert props["proto"] == {"enum": PROTOS} and props["via"] == {"enum": VIAS}
+
+
+def test_every_via_the_code_can_emit_is_in_the_enum_and_none_of_them_is_left_unused():
+    src = "".join((ROOT / "src" / "cora_sentinel" / f).read_text() for f in ("netmon.py", "daemon.py"))
+    emitted = set(_re.findall(r'"(syn_tap|udp_tap|dns_tap|sock_diag|proc_tcp)"', src))
+    assert emitted <= set(VIAS)
+    assert set(VIAS) - emitted == {"dns_tap", "unknown"}, "dns_tap is reserved (DNS goes through the UDP tap); unknown is the fallback"
+
+
+def test_the_example_report_carries_the_fields_and_validates():
+    ex = json.loads((ROOT / "examples" / "violation.example.json").read_text())
+    assert ex["violation"]["proto"] in PROTOS and ex["violation"]["via"] in VIAS
+    _validate(ex)
+
+
+@pytest.mark.parametrize("copy,canonical", [("violation.schema.json", "schema/violation.schema.json"),
+                                            ("violation.example.json", "examples/violation.example.json")])
+def test_a_root_copy_of_the_schema_or_example_is_never_stale(copy, canonical):
+    if not (ROOT / copy).exists():
+        pytest.skip(f"{copy} is gone from the repository root")
+    assert (ROOT / copy).read_text() == (ROOT / canonical).read_text(), f"{copy} drifted from {canonical}"
+
+
+@pytest.mark.parametrize("evidence,want", [({}, "tcp"), ({"proto": "tcp"}, "tcp"), ({"proto": "udp"}, "udp"), ({"proto": "udp", "l7": "quic"}, "quic"),
+                                           ({"proto": "udp", "l7": "dns"}, "dns"), ({"proto": "udp", "l7": "x"}, "udp"), ({"proto": "icmp"}, "unknown")])
+def test_protocol_of_maps_what_conndetector_judge_produces(evidence, want):
+    assert protocol_of(evidence) == want
+
+
+# ---- every connection detector records them -------------------------------------------------------------------------
+def test_build_payload_adds_detection_only_when_it_is_given_and_the_model_never_sees_it():
+    from cora_sentinel.verdict import Qwen3B
+    plain = build_payload(1, "10.1.1.10", "x", "path_violation", "high", {}, 5)
+    assert "detection" not in plain, "path and memory events are unchanged"
+    ev = build_payload(1, "10.1.1.10", "x", "unauthorized_connection", "high", {"remote_ip": "1.2.3.4"}, 5,
+                       detection={"proto": "tcp", "via": "syn_tap"})
+    assert ev["detection"] == {"proto": "tcp", "via": "syn_tap"}
+    assert "syn_tap" not in Qwen3B.render(ev) and "detection" not in Qwen3B.render(ev)
+
+
+def test_the_proc_path_records_proc_tcp_and_only_for_connections():
+    s = Sentinel("CORA_TASK", ["/tmp"], 150, 10.0, lambda p: None)
+    conn = s._payload(7, "10.1.1.10", "x", "unauthorized_connection", "high", {"remote_ip": "1.2.3.4", "remote_port": 80}, 5)
+    assert conn["detection"] == {"proto": "tcp", "via": "proc_tcp"}
+    udp = s._payload(7, "10.1.1.10", "x", "unauthorized_connection", "high", {"remote_ip": "1.2.3.4", "proto": "udp", "l7": "dns"}, 5)
+    assert udp["detection"] == {"proto": "dns", "via": "proc_tcp"}
+    assert "detection" not in s._payload(7, "10.1.1.10", "x", "path_violation", "high", {"path": "/etc/shadow"}, 5)
+    assert "detection" not in s._payload(7, "10.1.1.10", "x", "memory_spike", "medium", {}, 5)
+
+
+def deliver(ev):
+    """Run netmon's _deliver on a bare object: no kernel, just what it builds and hands to the Sentinel."""
+    from cora_sentinel import netmon
+    cls = next(c for c in vars(netmon).values() if isinstance(c, type) and hasattr(c, "_deliver"))
+    sent = []
+    obj = object.__new__(cls)
+    obj.s = _NS(net=VirtualNet(), cgroup_id_of=lambda name: 99, _fire=lambda key, now, payload: sent.append(payload))
+    obj._deliver(("task-a", 4242, ["curl", "x"], 123, "high", ev, 1000.0))
+    return sent[0]
+
+
+def test_the_tap_and_the_live_scan_record_their_own_via_and_the_protocol():
+    base = {"remote_ip": "203.0.113.9", "remote_port": 443, "local_port": 50000, "dest_class": "public"}
+    assert deliver({**base, "via": "syn_tap"})["detection"] == {"proto": "tcp", "via": "syn_tap"}
+    assert deliver({**base, "proto": "udp", "l7": "quic", "via": "udp_tap"})["detection"] == {"proto": "quic", "via": "udp_tap"}
+    assert deliver({**base, "proto": "udp", "l7": "dns", "qname": "x.example", "via": "udp_tap"})["detection"] == {"proto": "dns", "via": "udp_tap"}
+    assert deliver(dict(base))["detection"] == {"proto": "tcp", "via": "sock_diag"}, "no via = the live sock_diag scan"
+    assert deliver({**base, "via": "syn_tap"})["subject"]["cgroup_id"] == 99, "and the 0.8.5 identity is still recorded"

@@ -49,6 +49,38 @@ Change the allow set and the next start asks again; `cora-floor unconfirm` bring
 
 If you are locked out anyway: wait for the window. The floor removes itself.
 
+## Many events from one task at once
+
+The model judges one event at a time (about 3.5 s each, 32 slots). A task that fires many events of one kind would queue one evaluation per
+event and stall every other task's behind it. Two things already limit that, and a third now closes the rest:
+
+- **The cooldown** (`_fire`, 30 s) drops an event whose `(task, kind, remote_ip, remote_port, qname)` fired in the last 30 s, so twenty connections
+  to *one* destination already reach the adjudicator as one event. A burst to twenty *different* hosts is twenty events.
+- **Coalescing** (`Adjudicator.submit`): while an evaluation for `(task, kind)` is queued or running, a further event of that kind is folded into
+  it: counted, noted in that decision as `coalesced: {count, destinations[, follow_up]}`, and not queued. It takes no pin and registers nothing, so
+  nothing of it can leak. The `[verdict]` line reads `... +9 coalesced`.
+- Strict rules: **never across kinds** (a `path_violation` is not covered by a pending connection verdict); **never a blocklist hit** (it is
+  always pinned, isolated at `submit()` and judged on its own); **never for ever** (a record older than `IN_FLIGHT_MAX_AGE_S`, 5 minutes, is
+  ignored, so a lost evaluation cannot silence a task); **never a hidden tail**: if the verdict did not contain the task (`ALLOW`, `THROTTLE`,
+  `ESCALATE`, or an `ISOLATE` that could not be carried out) and the burst's latest event differs from the one judged, that event is judged once
+  afterwards (`follow_up` names it). A burst therefore costs two evaluations at most, not twenty.
+- What it costs: a coalesced event does not get its own decision, so under `--dyn-policy` only the judged event's destination is considered for a
+  dynamic kernel drop (the whole cgroup is isolated by the verdict regardless). The events themselves are all in `events.jsonl`.
+
+## Tasks that keep their workers in sub-cgroups
+
+A browser or a flatpak puts its workers in `<root>/<task>/sub/worker`. cgroup v2's `cgroup.procs` lists only the processes directly in a cgroup, so
+such a task used to look empty: the tap flagged its connections, the owner lookup found nobody (`owner of task 'x' unresolvable: cgroup.procs empty`,
+`owner_gone` counting up) and the event was dropped, and `tick()` never monitored the workers.
+
+- `cgroup_of(pid)` takes the first path component below the root, by string parsing alone: a pid in `task-a/sub/worker` is the task `task-a`.
+- `pids(task)` and `discover()` look below the task directory with a bounded walk (`MAX_NEST_DEPTH` 8 levels, `MAX_SUBCGROUPS` 1024 per task, never
+  following a symlink), the task's own processes first. Freeze, kill and the nft rule already cover descendants.
+- The virtual-IP pool is a /24 and holds **245** processes. A task with more no longer ends the daemon (an exception in `tick()` did): the extra pids
+  are skipped and logged (`no virtual IP for pid N`, counted in `vip_skipped`), and `tick()` failures are caught by `guarded_tick()`.
+- Check on your host: `find /sys/fs/cgroup/cora -mindepth 2 -type d` lists sub-cgroups, and
+  `journalctl -u cora-sentinel | grep "cgroup.procs empty"` shows events that used to be dropped.
+
 ## A process that exits while its event waits
 
 A verdict takes 2-4 s and there are 32 slots, so a short task can be gone before the model gets to it. Two things used to follow: the

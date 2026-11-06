@@ -48,6 +48,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional
 
+from cora_sentinel.report import protocol_of
 from cora_sentinel.daemon import build_payload, read_argv, read_socket_inodes, read_starttime
 from cora_sentinel.sockdiag import TCP_LISTEN, DestroyListener, SockDiag
 
@@ -307,9 +308,10 @@ class NetMonitor:
 
     def _deliver(self, item: tuple) -> None:
         name, pid, argv, st, severity, ev, now = item
+        det = {"proto": protocol_of(ev), "via": ev.get("via") or "sock_diag"}      # the taps set ev["via"]; the live scan is sock_diag
         payload = build_payload(pid, self.s.net.ensure(pid), " ".join(argv),
                                 "unauthorized_connection", severity, ev, st, cgroup=name,
-                                cgroup_id=self.s.cgroup_id_of(name))
+                                cgroup_id=self.s.cgroup_id_of(name), detection=det)
         self.s._fire((name, "unauthorized_connection", ev["remote_ip"], ev["remote_port"], ev.get("qname")),
                      now, payload)
 

@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.8.6
+
+### Fixed
+- **A task whose workers live in sub-cgroups lost its events.** A browser or a flatpak puts its workers in `<root>/<task>/sub/worker`, and
+  cgroup v2's `cgroup.procs` lists only the processes *directly* in a cgroup. So the tap flagged the connection, the owner lookup found
+  nobody (`owner of task 'x' unresolvable: cgroup.procs empty`) and dropped the event, and `tick()` never monitored the workers.
+  Reproduced on the real kernel before the fix (`syn_hits=3 owner_gone=3 events=0`, `discover()` empty) and green after (`owner_gone=0 events=3`).
+  - `CgroupRoot.cgroup_of(pid)` takes the first path component below the root by string parsing alone (no directory walk): a pid in
+    `task-a/sub/worker` is the task `task-a`. Anything outside the root, the root itself, a sibling sharing the prefix, an invalid first
+    component and a removed task directory are still `None`.
+  - `CgroupRoot.pids(task, nested=True)` and so `discover()` look below the task directory with a **bounded** walk (`MAX_NEST_DEPTH` 8,
+    `MAX_SUBCGROUPS` 1024, `os.scandir`, never following a symlink out of the root, own processes first). This is the part that makes events
+    appear; the spec's `cgroup_of` change alone would not have, because events never come from a pid nothing enumerates.
+  - Freeze, kill and the per-task nft rule already cover descendants (cgroup v2 semantics; the nft match is not verified end to end here).
+- **A task with more than 245 processes ended the daemon.** The VIP pool is a /24; the 246th `ensure()` raised `RegistryError:
+  SUBNET_EXHAUSTED` out of `tick()`, and the main loop had no guard. Nested discovery makes this far easier to hit, so `tick()` now skips a
+  pid it cannot give a VIP (logged, rate-limited, `vip_skipped`) and the main loop calls `Sentinel.guarded_tick()`, which logs and counts a
+  failed tick and carries on (`tick_errors`).
+
+### Added
+- **In-flight coalescing** (`Adjudicator`). While an evaluation for `(task, kind)` is queued or running, a further event of that kind is
+  folded into it: counted, noted in its decision as `coalesced: {count, destinations[, follow_up]}`, and not queued. Invariants, each pinned by
+  a test and by a deliberate break: it **takes no pin and registers nothing** (nothing of a coalesced event can leak); **never across kinds**
+  (a `path_violation` is not covered by a pending connection verdict); **never a blocklist hit** (always pinned, isolated at `submit()`, judged on
+  its own); **never for ever** (`IN_FLIGHT_MAX_AGE_S`, 5 minutes, so a lost evaluation cannot silence a task); a full queue and an exception both
+  clear the record; and **never a hidden tail**: if the verdict did not contain the task (`ALLOW`, `THROTTLE`, `ESCALATE`, or an `ISOLATE` that
+  could not be carried out) and the burst's latest event differs from the one judged, it is judged once afterwards. A burst costs two
+  evaluations at most. Counters: `coalesced`, `follow_ups`, `stale_in_flight`; the `[verdict]` line reads `+N coalesced`.
+  - **A premise correction:** `_fire`'s 30 s cooldown already collapses twenty connections to *one destination* into one event (a test pins
+    that). What stalls the model is a burst to many *different* hosts, or the same host again after the cooldown while the queue is stalled.
+    Coalescing is keyed on `(task, kind)`, not on the destination, to cover the first case; the cost is that under `--dyn-policy` only the judged
+    event's destination is considered for a dynamic kernel drop (the whole cgroup is isolated by the verdict regardless).
+- **`violation.proto` and `violation.via`**, optional fields of `cora.security.violation/v1` (`schema/violation.schema.json` is regenerated from
+  `report.py`; the validator and the JSON Schema agree). `proto`: `tcp`, `udp`, `quic`, `dns`, `unknown`. `via`: `syn_tap`, `udp_tap`,
+  `dns_tap`, `sock_diag`, `proc_tcp`, `unknown`; `dns_tap` is reserved (DNS goes through the UDP tap, so it reads `proto: dns`, `via: udp_tap`),
+  and a test fails if the code emits a `via` the enum lacks or the enum holds one nothing emits.
+  - Every connection detector now records both, in a new top-level event field `detection` (not in `anomaly`, so **the model's prompt is
+    unchanged**): the SYN and UDP taps (`syn_tap`, `udp_tap`), the live scan (`sock_diag`) and the `/proc/net/tcp` path (`proc_tcp`).
+  - A schema v1 consumer built from a copy older than 0.8.6 rejects a report that carries them (the schema forbids other extra keys). No consumer
+    pins v1 yet; once one does, a further addition needs a new id. Documented in `docs/violation-reports.md`.
+- Tests: `tests/test_cgroup_nested.py` (36: the `cgroup_of` table, the bounded walk, the VIP pool, three real-kernel tests including the
+  reproduction), `tests/test_inflight.py` (49, +16: coalescing), `tests/test_report.py` (54, +32: proto/via and the plumbing at all three event
+  sources). Every invariant above was mutation-checked (24 deliberate breaks, each fails a test; one test was added because a break survived).
+
+### Changed
+- `README.md`: `Status: beta (0.8.6)` and the measured test counts. The root copies `violation.schema.json` and `violation.example.json` are synced, and
+  `test_a_root_copy_of_the_schema_or_example_is_never_stale` keeps them so (it skips once they are deleted).
+- `CgroupRoot.pids()` now includes sub-cgroup processes by default (`nested=False` for the old behaviour); `build_payload(..., detection=)`.
+
+### Housekeeping
+- `superseded-flat/` (21 old flat-layout `.py` files, not release patches) should be untracked: `git rm -r --cached superseded-flat/`. `.gitignore`
+  already lists it; ignore rules never untrack a file git already tracks, which is why it was still committed. Nothing in the tests or the
+  package needs it (checked on a clone without it).
+
 ## 0.8.5
 
 ### Fixed
