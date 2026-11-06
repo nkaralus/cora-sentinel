@@ -278,12 +278,15 @@ def env():
             time.sleep(0.1)
 
 
-def task(cg, fw, name, code, preinstall=True):
+def task(cg, fw, name, code, preinstall=True, python=None, cwd=None):
+    """Start `code` as a task. `python` is the interpreter the TASK runs (default: this one): cora-run itself always starts with this one,
+    as root, but the task may be dropped to another user, who has to be able to execute its interpreter."""
     e = {**os.environ, "CORA_CGROUP_ROOT": str(cg.root), "CORA_CGROUP_MOUNT": MOUNT,
          "CORA_NFT_TABLE": fw.table, "CORA_NFLOG_GROUP": str(GROUP)}
-    cmd = ([sys.executable, "-m", "cora_sentinel.run", name, sys.executable, "-c", code] if preinstall
-           else [sys.executable, "-c", code])
-    return subprocess.Popen(cmd, env=e, stdout=subprocess.PIPE, text=True)
+    py = python or sys.executable
+    cmd = ([sys.executable, "-m", "cora_sentinel.run", name, py, "-c", code] if preinstall
+           else [py, "-c", code])
+    return subprocess.Popen(cmd, env=e, stdout=subprocess.PIPE, text=True, cwd=cwd)
 
 
 def beacons(port, n, hold=1.5, host=None):

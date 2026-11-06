@@ -8,8 +8,11 @@ Unit tests need no kernel; the last three run on a real cgroup and nft table and
 Run: pytest -q tests/test_cgroup_nested.py"""
 import inspect
 import os
+import shutil
+import subprocess
 import sys
 import time
+from collections import namedtuple
 
 import pytest
 
@@ -208,27 +211,72 @@ def nested_worker(port=None, n=3, hold=1.5):
             "%stime.sleep(%r)\n" % (connect, hold))
 
 
-def move_into_sub_cgroup(cgroups, pid, timeout=10):
+Worker = namedtuple("Worker", "python uid cwd")           # the interpreter it runs with, the uid it must have (None: whatever), its cwd
+UNPRIVILEGED = 65534
+
+
+def python_that_runs_as(uid, gid, candidates=None):
+    """The first interpreter that `uid` can really execute, or None. It TRIES each one, dropping privileges the way cora-run does and then
+    executing, because that is what fails and what no permission check can predict: in CI the venv's python lives under /home/runner/work,
+    which `nobody` cannot enter, so cora-run's os.execvp died with EACCES and the worker never started (the test saw an empty line)."""
+    if candidates is None:
+        candidates = [sys.executable, os.path.realpath(sys.executable), "/usr/bin/python3", shutil.which("python3"),
+                      os.path.join(sys.base_exec_prefix, "bin", "python3")]
+    seen = set()
+    for cand in candidates:
+        if not cand or cand in seen or not os.path.exists(cand):
+            continue
+        seen.add(cand)
+        try:
+            r = subprocess.run([cand, "-c", "import os, socket, sys, time; print(os.getuid())"], capture_output=True, text=True,
+                               user=uid, group=gid, extra_groups=[], cwd="/", timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if r.returncode == 0 and r.stdout.strip() == str(uid):
+            return cand
+    return None
+
+
+def start_worker(cgroups, fw, worker, code):
+    return task(cgroups, fw, "nest", code, python=worker.python, cwd=worker.cwd)
+
+
+def worker_uid(p):
+    """The uid the worker says it runs as (it prints it first thing). An empty line means it never started: say so, with its exit status."""
+    line = p.stdout.readline().strip()
+    if not line:
+        p.wait(timeout=10)
+        pytest.fail(f"the worker died before it started (exit status {p.returncode}); its stderr is in the captured output above")
+    return int(line)
+
+
+def move_into_sub_cgroup(cgroups, p, timeout=10):
     """The launcher's part, done by the test (root), so it never depends on who the worker runs as."""
     end = time.monotonic() + timeout
-    while cgroups.cgroup_of(pid) != "nest" and time.monotonic() < end:
+    while cgroups.cgroup_of(p.pid) != "nest" and p.poll() is None and time.monotonic() < end:
         time.sleep(0.01)                                          # wait for cora-run to put the task in its cgroup
-    assert cgroups.cgroup_of(pid) == "nest", "cora-run never put the task in its cgroup"
+    assert p.poll() is None, f"the worker exited (status {p.returncode}) before it could be moved"
+    assert cgroups.cgroup_of(p.pid) == "nest", "cora-run never put the task in its cgroup"
     sub = cgroups.root / "nest" / "sub" / "worker"
     sub.mkdir(parents=True, exist_ok=True)
-    (sub / "cgroup.procs").write_text(str(pid))
+    (sub / "cgroup.procs").write_text(str(p.pid))
 
 
 @pytest.fixture(params=["as the test runs", "as an unprivileged user"])
 def worker_user(request, monkeypatch):
     """Who the worker runs as. `sudo pytest` (the privileged CI job) sets SUDO_UID, and cora-run then drops the worker to that user, so
-    the worker is NOT root there. Running both ways means the code is tested under that condition everywhere, not only in CI."""
-    if request.param == "as an unprivileged user":
-        if os.geteuid() != 0:
-            pytest.skip("cora-run only drops privileges when it starts as root")
-        monkeypatch.setenv("SUDO_UID", "65534")
-        monkeypatch.setenv("SUDO_GID", "65534")
-    return request.param
+    the worker is NOT root there. Running both ways means the code is tested under that condition everywhere, not only in CI. The second
+    way forces uid 65534 and picks an interpreter that user can actually execute (skipping, with the reason, if there is none)."""
+    if request.param == "as the test runs":
+        return Worker(sys.executable, None, None)
+    if os.geteuid() != 0:
+        pytest.skip("cora-run only drops privileges when it starts as root")
+    py = python_that_runs_as(UNPRIVILEGED, UNPRIVILEGED)
+    if py is None:
+        pytest.skip(f"no interpreter user {UNPRIVILEGED} can execute here (sys.executable is {sys.executable})")
+    monkeypatch.setenv("SUDO_UID", str(UNPRIVILEGED))
+    monkeypatch.setenv("SUDO_GID", str(UNPRIVILEGED))
+    return Worker(py, UNPRIVILEGED, "/")
 
 
 @pytest.fixture
@@ -262,12 +310,12 @@ def test_a_connection_from_a_nested_worker_becomes_an_event_instead_of_being_dro
     lis, port = listener()
     stop = drain(lis)
     s, nm = monitor(cgroups, fw, made, events, interval=0.2)
-    p = task(cgroups, fw, "nest", nested_worker(port))
-    move_into_sub_cgroup(cgroups, p.pid)
+    p = start_worker(cgroups, fw, worker_user, nested_worker(port))
+    uid = worker_uid(p)                                           # it has started, as the user it should be
+    if worker_user.uid is not None:
+        assert uid == worker_user.uid, "the worker really did run as the unprivileged user, not as root"
+    move_into_sub_cgroup(cgroups, p)
     assert p.pid not in cgroups.pids("nest", nested=False) and p.pid in cgroups.pids("nest"), "the worker really is nested"
-    uid = int(p.stdout.readline())
-    if worker_user == "as an unprivileged user":
-        assert uid == 65534, "the worker really did run as nobody, not as root"
     time.sleep(3.0)
     assert p.wait(30) == 0, "the worker connected (it only does once it is nested)"
     stop.set()
@@ -284,9 +332,12 @@ def test_a_connection_from_a_nested_worker_becomes_an_event_instead_of_being_dro
 @real
 def test_cgroup_of_and_pids_agree_with_the_kernel_for_a_nested_process(nested_env, worker_user):
     cgroups, fw, made = nested_env
-    p = task(cgroups, fw, "nest", nested_worker(hold=4))
+    p = start_worker(cgroups, fw, worker_user, nested_worker(hold=4))
     try:
-        move_into_sub_cgroup(cgroups, p.pid)
+        uid = worker_uid(p)                                       # a worker that never started must not pass by luck
+        if worker_user.uid is not None:
+            assert uid == worker_user.uid
+        move_into_sub_cgroup(cgroups, p)
         assert (cgroups._read_proc_cgroup(p.pid) or "").endswith("/nest/sub/worker")
         assert cgroups.cgroup_of(p.pid) == "nest", "the kernel says .../nest/sub/worker; the answer is the task"
         assert p.pid in cgroups.pids("nest") and p.pid not in cgroups.pids("nest", nested=False)
@@ -294,3 +345,37 @@ def test_cgroup_of_and_pids_agree_with_the_kernel_for_a_nested_process(nested_en
     finally:
         p.kill()
         p.wait()
+
+
+# ---------------------------------------------------------------------------------------------- choosing the worker's interpreter
+@pytest.mark.skipif(os.geteuid() != 0, reason="drops privileges, so it needs root")
+def test_an_interpreter_the_user_cannot_reach_is_rejected_and_a_reachable_one_is_chosen(tmp_path):
+    """The CI layout in miniature: the venv's python under a directory only its owner can enter."""
+    home = tmp_path / "runner-home"
+    home.mkdir()
+    blocked = home / "python"
+    blocked.write_text("#!/bin/sh\nexec %s \"$@\"\n" % (shutil.which("python3") or "/usr/bin/python3"))
+    blocked.chmod(0o755)                                          # executable by anyone, but only through a directory...
+    home.chmod(0o700)                                             # ...that only root can enter
+    try:
+        assert python_that_runs_as(UNPRIVILEGED, UNPRIVILEGED, [str(blocked)]) is None
+        fallback = python_that_runs_as(UNPRIVILEGED, UNPRIVILEGED)
+        if fallback is None:
+            pytest.skip("no interpreter at all that the unprivileged user can run on this machine")
+        chosen = python_that_runs_as(UNPRIVILEGED, UNPRIVILEGED, [str(blocked), fallback])
+        assert chosen == fallback and chosen != str(blocked), "it skips the unreachable one and takes the next that really runs"
+    finally:
+        home.chmod(0o755)
+
+
+def test_a_worker_that_never_started_is_reported_with_its_exit_status_not_as_a_parse_error():
+    p = subprocess.Popen([sys.executable, "-c", "import sys; sys.exit(7)"], stdout=subprocess.PIPE, text=True)
+    with pytest.raises(pytest.fail.Exception, match=r"died before it started \(exit status 7\)"):
+        worker_uid(p)
+
+
+def test_a_worker_that_exited_is_not_moved_and_says_so():
+    p = subprocess.Popen([sys.executable, "-c", "pass"])
+    p.wait()
+    with pytest.raises(AssertionError, match="exited"):
+        move_into_sub_cgroup(CgroupRoot("/sys/fs/cgroup/cora", "/sys/fs/cgroup"), p, timeout=1)

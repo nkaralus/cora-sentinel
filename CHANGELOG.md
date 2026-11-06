@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.8
+
+### Fixed
+- **One privileged-CI test failed**: `test_a_connection_from_a_nested_worker_becomes_an_event_instead_of_being_dropped[as an unprivileged user]`, with `ValueError: invalid literal for int() with base 10: ''`. 0.8.7 forced the worker to uid 65534 and assumed `nobody` could execute `sys.executable`. In CI that is the venv under `/home/runner/work/...`, which `nobody` cannot enter, so `cora-run`'s `os.execvp` failed with `EACCES`, the worker never started, and the test parsed an empty line. Only the test was wrong; no product code changed.
+  - **Reproduced** by recreating CI's layout: a venv inside a directory only its owner can enter (mode 0700), with the tests run from that venv's python. (A first by-hand check misled me: `setpriv` resolved the path itself before dropping privileges. Replicating `cora-run`'s own sequence, `setgroups`, `setgid`, `setuid`, `execvp`, gave the CI error.)
+  - **The worker's interpreter is now chosen by trying it.** `python_that_runs_as(uid, gid)` runs each candidate (this interpreter, its real path, `/usr/bin/python3`, `python3` on `PATH`, the base interpreter) as that user, dropping privileges as `cora-run` does and then executing, and takes the first that really runs. If none does, the variant skips and says why. Preferring `SUDO_USER` was not used: under CI's `sudo` that is the user the first variant already runs as, so the second variant would test nothing new, and as plain root without `sudo` it would be root.
+  - The shared `task()` helper takes `python=` (the interpreter the *task* runs; `cora-run` itself still starts with this one, as root) and `cwd=`.
+  - **A worker that fails to start is reported as such**, with its exit status (`the worker died before it started (exit status N)`), and a worker that has already exited is not "moved". Before, the other variant of the same test could pass by luck in that situation, because the pid was momentarily in the task cgroup.
+  - Checked: the reachability trial, the exit-status report and the exited-worker guard each fail a test when disabled (a first attempt at that break did not take effect and survived; the redone one is caught by three tests); 12 consecutive runs, six in the CI layout and six with sudo's variables set, were clean.
+- `tests/test_cgroup_nested.py` is 42 tests (+3: the probe, the empty-line report, the exited-worker guard).
+
 ## 0.8.7
 
 ### Fixed
