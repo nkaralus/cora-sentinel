@@ -301,12 +301,12 @@ class DomainResolver:
 def main(argv=None) -> int:
     import sys
     a = sys.argv[1:] if argv is None else list(argv)
-    if a[:1] and a[0] in ("pull", "diff", "accept", "status", "verify", "sync", "rollback") or (a[:1] == ["--dir"]):
+    if a[:1] and a[0] in ("pull", "diff", "accept", "status", "verify", "sync", "sync-rollback") or (a[:1] == ["--dir"]):
         from cora_sentinel.blocklist_store import main as store_main
         return store_main(a)
     if len(a) < 2 or a[0] != "check":
         print("usage: cora-blocklist check PATH [ip-or-domain ...]\n"
-              "       cora-blocklist [--dir D] pull | status | diff [NAME] | accept NAME --sha256 HEX | verify | sync | rollback")
+              "       cora-blocklist [--dir D] pull | status | diff [NAME] | accept NAME --sha256 HEX | verify | sync | sync-rollback")
         return 2
     bl = Blocklist()
     bl.load(a[1])
