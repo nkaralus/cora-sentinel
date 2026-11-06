@@ -38,8 +38,8 @@ from cora_sentinel.reload import ListError, Reloader, load_lists
 from cora_sentinel.cgroup import CgroupRoot
 
 try:
-    from subnetbus import AABB, Registry
-except ImportError:  # keeps the file testable on a box without the package
+    from cora_sentinel._vendor.subnetbus import AABB, Registry   # the vendored, pinned copy (cora_sentinel/_vendor)
+except ImportError:  # only if the install itself is damaged: the daemon then refuses to act (see verdict.py)
     AABB = Registry = None
 
 SCHEMA_EVENT = "cora.sentinel.event/v1"
@@ -543,7 +543,7 @@ def selftest() -> int:
     print(json.dumps(events[0], indent=2) if events else "no events")
     ok = kinds == {"path_violation", "memory_spike", "unauthorized_connection"} and not s.net.by_pid
     print(f"\nkinds={sorted(kinds)} vips={sorted(vips)} "
-          f"bus={'subnetbus' if Registry else 'STUB (not installed)'} "
+          f"bus={'subnetbus (vendored)' if Registry else 'STUB (vendored copy missing)'} "
           f"released={not s.net.by_pid}")
     print("SELFTEST", "PASS" if ok else "FAIL")
     return 0 if ok else 1
@@ -849,6 +849,8 @@ def main() -> int:
     if has_lists:
         print("[cora-sentinel] SIGHUP re-reads the blocklists without restarting (kill -HUP <pid>)",
               file=sys.stderr)
+    from cora_sentinel import _vendor
+    print(f"[cora-sentinel] {_vendor.describe()}", file=sys.stderr)       # the safety gate: where it came from, intact or not
     print(f"[cora-sentinel] watching '{a.match}' every {a.interval}s -> {a.out}",
           file=sys.stderr)
     n = 0

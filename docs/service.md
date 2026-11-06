@@ -9,6 +9,11 @@ sudo cora-floor confirm                                 # inside the --floor-con
 journalctl -u cora-sentinel -f
 ```
 
+**From the `.deb`** (`sudo dpkg -i cora-sentinel_*_all.deb`, built by `packaging/build_release.sh`) there is no installer step:
+the unit, the config and the log rotation are installed for you, and nothing is started. Everything below applies the
+same way; see [packaging.md](packaging.md) for what install, upgrade, remove and purge do (removal takes the kernel floor
+out, purge keeps the audit logs) and for running the model.
+
 The installer writes the unit with your `--bindir`, installs the config only if you have none (a reinstall never
 overwrites your edits), and does **not** enable or start anything. `deploy/install-service.sh --uninstall` removes the
 unit and leaves your config and `/var/lib/cora-sentinel` alone.

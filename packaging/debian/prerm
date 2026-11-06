@@ -1,0 +1,48 @@
+#!/bin/sh
+# prerm for cora-sentinel
+set -e
+
+case "$1" in
+    remove)
+        if [ -d /run/systemd/system ]; then
+            # stopping runs ExecStopPost (`cora-floor rollback`), which removes a floor nobody confirmed
+            systemctl stop cora-sentinel || true
+            systemctl disable cora-sentinel >/dev/null 2>&1 || true
+        fi
+        # Removing this package removes `cora-floor`. A CONFIRMED floor would then sit in the kernel with nothing left to
+        # take it out, so removal (a deliberate act; an upgrade never reaches this branch) takes it out first.
+        if command -v cora-floor >/dev/null 2>&1; then
+            if cora-floor remove >/dev/null 2>&1; then
+                echo "cora-sentinel: kernel floor removed"
+            fi
+        fi
+        # Per-task isolation rules are NOT touched: they contain tasks the daemon isolated, and releasing those is a
+        # decision for a person. Say so, while the tool that can do it is still installed. An EMPTY table (what is left
+        # once the floor is gone and nothing was isolated) is just tidied away.
+        if command -v nft >/dev/null 2>&1 && nft list table inet cora >/dev/null 2>&1; then
+            if nft list table inet cora 2>/dev/null | grep -q "chain "; then
+                echo "cora-sentinel: the nft table 'inet cora' still has chains (per-task isolation rules, if any, are kept on purpose)."
+                echo "               To release everything: cora-firewall purge   (run it now; the tool goes away with the package)"
+            else
+                nft delete table inet cora >/dev/null 2>&1 || true
+            fi
+        fi
+        if command -v py3clean >/dev/null 2>&1; then
+            py3clean -p cora-sentinel || true
+        fi
+        ;;
+    deconfigure)
+        if [ -d /run/systemd/system ]; then
+            systemctl stop cora-sentinel || true
+        fi
+        ;;
+    upgrade|failed-upgrade)
+        # nothing: the new version's postinst restarts a running service
+        ;;
+    *)
+        echo "prerm called with unknown argument '$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

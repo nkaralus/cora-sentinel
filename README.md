@@ -27,8 +27,9 @@ Ubuntu for the TCP tap and the demo. UDP/QUIC/DNS support has so far only been v
 - Linux with **cgroup v2**, **nftables** (UDP tapping needs `typeof` sets keyed on `socket cgroupv2`: verified
   on nft 1.0.9 / Linux 6.18; `--no-tap-udp` taps TCP only), `NETLINK_SOCK_DIAG`, and the `nfnetlink_log` module.
 - **Root.** Cgroups, nftables and NFLOG all require it. (`cora-selfcheck` says which pieces you have.)
-- Python 3.10+ (the code uses nothing newer than 3.7; the floor comes from `engine-telemetry-bus`).
-  Run on 3.12 only so far.
+- Python 3.10+. Run and tested on 3.12 only so far. **No other Python packages are needed**: the safety gate
+  (`engine-telemetry-bus`) is vendored, pinned to one commit and checked by `cora-selfcheck` (see
+  [docs/packaging.md](docs/packaging.md)).
 - Optional: a GGUF model such as Qwen 2.5 3B, through the `[model]` extra.
 
 ## Install
@@ -42,6 +43,11 @@ cora-selfcheck                          # what this machine can and cannot do, a
 ```
 
 For development: `pip install -e ".[dev]"`.
+
+**A package for Ubuntu/Debian.** `packaging/build_release.sh` builds an sdist, a wheel and a native `.deb`
+(`Architecture: all`, depends on `python3` and `nftables` only). Installing it does not start the service; removing it stops
+the service and removes the kernel floor; purging keeps the audit logs. See [docs/packaging.md](docs/packaging.md)
+(including how to side-install `llama-cpp-python` for the model under Ubuntu's PEP 668 restriction).
 
 ## Try it
 
@@ -280,6 +286,10 @@ need a cgroup v2 mount, or `CORA_TEST_CGROUP_MOUNT`).
 restored by the policy's decisions; they use a public address aliased inside the lab, because the policy refuses private
 ones). `tools/dyn_bench.py` measures the per-decision cost.
 
+0.8.0 adds `tests/test_vendor.py` (the vendored gate matches its lock, a shadowing `subnetbus` is ignored, the update tool)
+and `tests/test_packaging_deb.py` (wheel, sdist and `.deb` contents, reproducibility, and the maintainer scripts against
+stubbed commands). `packaging/lifecycle_test.sh` is the real install/upgrade/remove/purge, for a disposable machine only.
+
 0.7.0 adds `tests/test_dynreplay.py` (26, no kernel: the logs are produced by running the live policy over synthetic
 scenarios) and `tests/test_dynreplay_kernel.py` (4: the private-namespace mode; the host ruleset is compared before and
 after). The two daemon end-to-end tests also replay the real daemon's own logs with `--check`.
@@ -304,8 +314,8 @@ Commands: `cora-sentinel`, `cora-run`, `cora-demo`, `cora-cgroup`, `cora-firewal
 
 ## Related repositories
 
-[`engine-telemetry-bus`](https://github.com/nkaralus/engine-telemetry-bus) (the gates and registry this
-depends on) and [`cora-security`](https://github.com/nkaralus/cora-security) (blocklists and the report schema).
+[`engine-telemetry-bus`](https://github.com/nkaralus/engine-telemetry-bus) (the gates and registry, vendored here at
+commit `ac3f126` under `src/cora_sentinel/_vendor/subnetbus`; `tools/vendor_bus.py` updates it) and [`cora-security`](https://github.com/nkaralus/cora-security) (blocklists and the report schema).
 
 ## License
 

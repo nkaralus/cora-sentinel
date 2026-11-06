@@ -1,5 +1,7 @@
 [build-system]
-requires = ["setuptools>=77"]
+# 68 is what Ubuntu 24.04 ships, so the package builds with the distro toolchain (pybuild, no network). The license
+# is therefore the table form, which newer setuptools only warns about.
+requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,8 +10,7 @@ dynamic = ["version"]
 description = "Out-of-band security sentinel for Linux: per-task cgroups, nftables containment, connect-time attribution (NFLOG) for TCP/UDP/QUIC/DNS, and a grammar-constrained local LLM supervisor"
 readme = "README.md"
 requires-python = ">=3.10"
-license = "MIT"
-license-files = ["LICENSE"]
+license = { text = "MIT" }
 authors = [{ name = "Nick" }]
 keywords = ["security", "cgroups", "nftables", "nflog", "sock_diag", "netlink", "llm", "sentinel"]
 classifiers = [
@@ -21,9 +22,10 @@ classifiers = [
     "Topic :: Security",
     "Topic :: System :: Monitoring",
 ]
-# The only hard dependency is the author's own bus, installed straight from GitHub. (A direct URL
-# dependency is fine for `pip install` from GitHub; it would have to change before a PyPI upload.)
-dependencies = ["engine-telemetry-bus @ git+https://github.com/nkaralus/engine-telemetry-bus"]
+# No runtime dependencies. The safety gate (github.com/nkaralus/engine-telemetry-bus) is VENDORED, pinned to one commit,
+# under cora_sentinel/_vendor/subnetbus (see VENDOR.lock there and tools/vendor_bus.py), so a wheel installs offline and
+# the code that ships is the code the tests ran against.
+dependencies = []
 
 [project.optional-dependencies]
 model = ["llama-cpp-python"]          # the local GGUF supervisor; everything else runs without it
@@ -45,6 +47,10 @@ version = { attr = "cora_sentinel.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# the vendored bus's own MIT notice and its lock travel with it (the license requires the notice in every copy)
+[tool.setuptools.package-data]
+"cora_sentinel._vendor.subnetbus" = ["LICENSE", "VENDOR.lock"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

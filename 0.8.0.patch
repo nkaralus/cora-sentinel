@@ -1,0 +1,2826 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 5263699..574b339 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,62 @@
+ # Changelog
+ 
++## 0.8.0
++
++### Added
++- **The safety gate is vendored.** `engine-telemetry-bus` (module `subnetbus`: the GI_1-GI_3 gates and the registry) is
++  copied verbatim, pinned to commit `ac3f126946056b3b24eea9dbc15015b5a5639706` (bus version 0.1.0), into
++  `src/cora_sentinel/_vendor/subnetbus`. cora-sentinel now has **no runtime dependencies**: a wheel installs offline, and the
++  code that ships is the code the tests ran against (the full suite is unchanged: 657 passed in a clean venv with no
++  `subnetbus` installed).
++  - `_vendor/subnetbus/VENDOR.lock`: upstream URL, full commit, sha256 of every file (license included).
++  - The vendored copy always wins over any `subnetbus` on the path (tested). `cora-selfcheck` FAILS if a vendored file was
++    modified, added or removed; the daemon prints `vendored subnetbus 0.1.0 @ ac3f126 verified` (or `MODIFIED`) at start.
++  - `tools/vendor_bus.py check | update --commit SHA [--run-upstream-tests] | check-upstream`: the only way to change it. It
++    exports the commit with `git archive` (a dirty working tree cannot leak in), refuses a branch, tag or short unknown ref,
++    runs the bus's own tests first, and leaves the old copy alone if they fail. Re-vendoring reproduces the committed tree
++    byte for byte.
++  - `tests/test_vendor.py` (22): the copy matches the lock, the lock pins the confirmed commit, tampering is detected, a
++    shadowing `subnetbus` is ignored, nothing imports the old name, and the update tool against a fixture upstream repo.
++- **Build and packaging.** `pyproject.toml` asks for `setuptools>=68` with the table-form license, so Ubuntu 24.04's own
++  setuptools (68.1.2) can build it (the previous `setuptools>=77` and `license = "MIT"` did not). The vendored license and lock
++  ship as package data. `MANIFEST.in` makes the sdist an allow-list (the repository root also holds old patches and zips) and
++  complete enough to rebuild the wheel.
++- **A native `.deb`** (`packaging/build_deb.sh`, `dpkg-deb` only; `packaging/build_release.sh` builds sdist + wheel + `.deb` +
++  `SHA256SUMS`; the sdist is normalized so the set is reproducible). `Architecture: all`, `Depends: python3 (>= 3.10), nftables`, `Recommends: logrotate`. Installs the code to
++  `/usr/lib/python3/dist-packages`, the nine commands to `/usr/bin`, the unit to `/usr/lib/systemd/system` (with
++  `ExecStart=/usr/bin/cora-sentinel`), `/etc/cora-sentinel/cora-sentinel.conf` and `/etc/logrotate.d/cora-sentinel` as
++  conffiles, docs and a DEP-5 `copyright` crediting both licenses, plus `md5sums` so `dpkg -V` works. Byte-for-byte
++  reproducible from a given wheel and `SOURCE_DATE_EPOCH`.
++- **Lifecycle.** Install never starts or enables the service. Upgrade restarts it only if it was running and keeps a confirmed
++  floor and your edited config. **Removal** stops and disables the service and **removes the kernel floor** (the package takes
++  `cora-floor` away, which would strand a confirmed floor), tidies an empty `inet cora` table, and leaves per-task isolation
++  rules alone, saying so. **Purge** removes config and `/var/lib/cora-sentinel` and **keeps `/var/log/cora-sentinel`**.
++- `packaging/lifecycle_test.sh`: the real install, upgrade, remove and purge with assertions. It stops the service and
++  removes a floor, so it refuses unless `CORA_LIFECYCLE_TEST=disposable-machine` is set and the machine shows no sign of
++  running cora-sentinel.
++- `tests/test_packaging_deb.py` (33): wheel and sdist contents (no runtime dependencies, vendored license and lock present,
++  the sdist rebuilds the same wheel), `.deb` contents, ownership and modes, md5sums, reproducibility, and every maintainer
++  script run against stubbed `systemctl`/`nft`/`cora-floor` (never a real service or floor).
++- docs/packaging.md. The model for `.deb` users is a documented side-install of `llama-cpp-python` (verified: PyPI has no
++  prebuilt wheel; the project's CPU index does; `pip install --target` is accepted under PEP 668; system Python imports it
++  through `PYTHONPATH`; this repo's grammar parses in the real engine. Not verified: loading a model through the unit).
++
++### Changed
++- `cora-selfcheck`, `cora-demo` and the daemon look for the vendored gate, not a top-level `subnetbus`.
++
++### Not done
++- Tested on Ubuntu 24.04 / Python 3.12 only. 22.04 (3.10) and Debian 12 (3.11) are untested.
++- Newer setuptools warns that the table-form license is deprecated (by 2027-02-18); switch to PEP 639 when the oldest target
++  distro ships setuptools 77 or later.
++- `lintian` on the final package: 0 errors, 14 warnings (4 direct `systemctl` calls in the maintainer scripts, 9 commands without
++  man pages, and the Debian-archive-only `initial-upload-closes-no-bugs`). The first run found two real problems, both fixed: a
++  Markdown changelog where Debian requires its own format (now `changelog.Debian.gz`, with upstream's as `changelog.gz`), and an
++  absolute path to `cora-floor` in `prerm`.
++- Not a Debian source package (no `debian/` tree for a PPA or the archive), and not signed.
++- Reproducible on one toolchain (`packaging/build_release.sh` run twice gives identical wheel, sdist and `.deb`, and so identical
++  `SHA256SUMS`); across setuptools versions the wheel's bytes can differ. The sdist is rewritten deterministically
++  (`packaging/normalize_sdist.py`) because setuptools stamps build time into it.
++
+ ## 0.7.0
+ 
+ ### Added
+diff --git a/MANIFEST.in b/MANIFEST.in
+new file mode 100644
+index 0000000..b810368
+--- /dev/null
++++ b/MANIFEST.in
+@@ -0,0 +1,11 @@
++# The sdist is an explicit allow-list: the repository root also holds old patches, zips and the superseded layouts.
++include LICENSE README.md CHANGELOG.md pyproject.toml
++recursive-include src/cora_sentinel/_vendor *.py LICENSE VENDOR.lock
++recursive-include deploy *
++recursive-include packaging *
++recursive-include docs *.md
++recursive-include tools *.py
++recursive-include tests *.py
++recursive-include examples *
++recursive-include schema *
++global-exclude __pycache__ *.pyc
+diff --git a/README.md b/README.md
+index d609af1..ea6abc4 100644
+--- a/README.md
++++ b/README.md
+@@ -27,8 +27,9 @@ Ubuntu for the TCP tap and the demo. UDP/QUIC/DNS support has so far only been v
+ - Linux with **cgroup v2**, **nftables** (UDP tapping needs `typeof` sets keyed on `socket cgroupv2`: verified
+   on nft 1.0.9 / Linux 6.18; `--no-tap-udp` taps TCP only), `NETLINK_SOCK_DIAG`, and the `nfnetlink_log` module.
+ - **Root.** Cgroups, nftables and NFLOG all require it. (`cora-selfcheck` says which pieces you have.)
+-- Python 3.10+ (the code uses nothing newer than 3.7; the floor comes from `engine-telemetry-bus`).
+-  Run on 3.12 only so far.
++- Python 3.10+. Run and tested on 3.12 only so far. **No other Python packages are needed**: the safety gate
++  (`engine-telemetry-bus`) is vendored, pinned to one commit and checked by `cora-selfcheck` (see
++  [docs/packaging.md](docs/packaging.md)).
+ - Optional: a GGUF model such as Qwen 2.5 3B, through the `[model]` extra.
+ 
+ ## Install
+@@ -43,6 +44,11 @@ cora-selfcheck                          # what this machine can and cannot do, a
+ 
+ For development: `pip install -e ".[dev]"`.
+ 
++**A package for Ubuntu/Debian.** `packaging/build_release.sh` builds an sdist, a wheel and a native `.deb`
++(`Architecture: all`, depends on `python3` and `nftables` only). Installing it does not start the service; removing it stops
++the service and removes the kernel floor; purging keeps the audit logs. See [docs/packaging.md](docs/packaging.md)
++(including how to side-install `llama-cpp-python` for the model under Ubuntu's PEP 668 restriction).
++
+ ## Try it
+ 
+ ```bash
+@@ -280,6 +286,10 @@ need a cgroup v2 mount, or `CORA_TEST_CGROUP_MOUNT`).
+ restored by the policy's decisions; they use a public address aliased inside the lab, because the policy refuses private
+ ones). `tools/dyn_bench.py` measures the per-decision cost.
+ 
++0.8.0 adds `tests/test_vendor.py` (the vendored gate matches its lock, a shadowing `subnetbus` is ignored, the update tool)
++and `tests/test_packaging_deb.py` (wheel, sdist and `.deb` contents, reproducibility, and the maintainer scripts against
++stubbed commands). `packaging/lifecycle_test.sh` is the real install/upgrade/remove/purge, for a disposable machine only.
++
+ 0.7.0 adds `tests/test_dynreplay.py` (26, no kernel: the logs are produced by running the live policy over synthetic
+ scenarios) and `tests/test_dynreplay_kernel.py` (4: the private-namespace mode; the host ruleset is compared before and
+ after). The two daemon end-to-end tests also replay the real daemon's own logs with `--check`.
+@@ -304,8 +314,8 @@ Commands: `cora-sentinel`, `cora-run`, `cora-demo`, `cora-cgroup`, `cora-firewal
+ 
+ ## Related repositories
+ 
+-[`engine-telemetry-bus`](https://github.com/nkaralus/engine-telemetry-bus) (the gates and registry this
+-depends on) and [`cora-security`](https://github.com/nkaralus/cora-security) (blocklists and the report schema).
++[`engine-telemetry-bus`](https://github.com/nkaralus/engine-telemetry-bus) (the gates and registry, vendored here at
++commit `ac3f126` under `src/cora_sentinel/_vendor/subnetbus`; `tools/vendor_bus.py` updates it) and [`cora-security`](https://github.com/nkaralus/cora-security) (blocklists and the report schema).
+ 
+ ## License
+ 
+diff --git a/deploy/cora-sentinel.conf b/deploy/cora-sentinel.conf
+index dd915e5..0c1f4ad 100644
+--- a/deploy/cora-sentinel.conf
++++ b/deploy/cora-sentinel.conf
+@@ -14,6 +14,8 @@
+ #   --floor-allow 192.168.0.0/16   your LAN, always accepted by the floor
+ #   --floor-allow-detected         allow the default gateway and live SSH peers instead of refusing
+ #   --model /var/lib/cora-sentinel/models/model.gguf   (and later --enforce, once you trust it)
++#   PYTHONPATH=/opt/cora-sentinel/pylibs   (its own line) a llama-cpp-python installed beside the packaged
++#                                  code, for the .deb install; see docs/packaging.md, "The model"
+ #   --dyn-policy shadow            the default with --model: records what dynamic kernel drops WOULD happen
+ #   --dyn-policy enforce           only after reading `cora-floor dyn-report` (needs --model --enforce --floor)
+ CORA_ARGS=--cgroup-root /sys/fs/cgroup/cora --nft --nflog --floor --floor-confirm 120 --out /var/log/cora-sentinel/events.jsonl --decisions /var/log/cora-sentinel/decisions.jsonl --report-dir /var/lib/cora-sentinel/reports
+diff --git a/docs/packaging.md b/docs/packaging.md
+new file mode 100644
+index 0000000..085e037
+--- /dev/null
++++ b/docs/packaging.md
+@@ -0,0 +1,130 @@
++# Packaging and releases
++
++Three artifacts, all built from one tree with no network after the first fetch of the build tools:
++
++| Artifact | For | Runtime dependencies |
++|---|---|---|
++| `cora_sentinel-X-py3-none-any.whl` | `pip install` into a venv (the model path, development) | none |
++| `cora_sentinel-X.tar.gz` (sdist) | rebuilding from source | none |
++| `cora-sentinel_X-1_all.deb` | a clean install on Ubuntu/Debian with systemd | `python3 (>= 3.10)`, `nftables` |
++
++```bash
++pip install build                       # once
++packaging/build_release.sh              # checks the vendored gate, then builds all three + dist/SHA256SUMS
++sudo dpkg -i dist/cora-sentinel_*_all.deb
++```
++
++`CORA_BUILD_NO_ISOLATION=1` builds offline with the installed setuptools. `SOURCE_DATE_EPOCH` defaults to the last
++commit's time, and on one toolchain the same tree gives the same wheel, the same sdist (rewritten deterministically by
++`packaging/normalize_sdist.py`) and the same `.deb`, so `SHA256SUMS` is reproducible: building twice gave identical files.
++The epoch is the commit time, so a new commit changes the bytes; pass `SOURCE_DATE_EPOCH` to pin it. Across setuptools
++versions the wheel's bytes can differ (its contents do not).
++
++## The vendored safety gate
++
++The one thing cora-sentinel used to install from GitHub is [`engine-telemetry-bus`](https://github.com/nkaralus/engine-telemetry-bus)
++(the `subnetbus` module: the GI_1-GI_3 gates and the registry). It is the check the verdict code asks before it acts, and
++without it the daemon refuses to act at all. It is now **vendored**: a verbatim copy at one pinned commit lives in
++`src/cora_sentinel/_vendor/subnetbus/`, so the code that ships is the code the tests ran against, a wheel installs
++offline, and no `git+https` requirement is left (PyPI refuses those).
++
++- **`VENDOR.lock`** (beside the code, shipped with it) records the upstream URL, the full commit
++  (`ac3f126946056b3b24eea9dbc15015b5a5639706`, bus version 0.1.0) and the sha256 of every file, license included.
++- **The vendored copy always wins.** Another `subnetbus` on the path is ignored (tested).
++- **Drift is visible.** `cora-selfcheck` fails if a vendored file was modified, added or removed; the daemon prints
++  `vendored subnetbus 0.1.0 @ ac3f126 verified` (or `MODIFIED (...)`) at start; `pytest tests/test_vendor.py` and
++  `python tools/vendor_bus.py check` verify it offline. It warns rather than refuses at start, so a hotfix on a live box is
++  possible but loud.
++- **The license is bundled.** The bus's MIT notice ships as package data in the wheel and sdist, in the `.deb`'s
++  `copyright` file, and beside the code.
++
++Changing it is deliberate and has one entry point:
++
++```bash
++python tools/vendor_bus.py check                                   # offline: the files match the lock
++python tools/vendor_bus.py check-upstream                          # online: the lock matches GitHub at the pinned commit
++python tools/vendor_bus.py update --commit <40-char sha> --run-upstream-tests [--src ~/engine-telemetry-bus]
++```
++
++`update` exports exactly that commit with `git archive` (a dirty working tree cannot leak in), refuses a branch, a tag or
++a short unknown ref, runs the bus's own test-suite first and aborts if it fails, then replaces the tree and the lock. After
++it: run the whole suite, update `PINNED` in `tests/test_vendor.py`, and say why in the CHANGELOG. The upstream repo has no
++tags, so the commit is the only stable name; tagging `ac3f126` there as `v0.1.0` would make the lock easier to read.
++
++## The .deb
++
++Installing does **not** start or enable anything: the kernel floor the daemon can install is host-wide, so the first
++start is yours (the install prints the three steps). The package is `Architecture: all`, installs the code to
++`/usr/lib/python3/dist-packages`, the nine commands to `/usr/bin`, the unit to `/usr/lib/systemd/system`, and:
++
++| | |
++|---|---|
++| `/etc/cora-sentinel/cora-sentinel.conf` | conffile: the daemon's arguments (`CORA_ARGS`). dpkg keeps your edits across upgrades |
++| `/etc/logrotate.d/cora-sentinel` | conffile: size-based, `copytruncate` |
++| `/usr/share/doc/cora-sentinel/` | README, these docs, `changelog.gz`, `copyright` (both licenses) |
++
++The unit is in `/usr/lib/systemd/system`, not `/etc`, so it is not a conffile: files under `/usr` never are, and putting it
++in `/etc/systemd/system` would make it silently override the package's updates. Customize it with `systemctl edit
++cora-sentinel` (a drop-in). The venv installer (`deploy/install-service.sh`) is unchanged and uses the same unit template.
++
++### What each dpkg action does
++
++| Action | Service | Kernel floor | Config | `/var/lib/cora-sentinel` | `/var/log/cora-sentinel` |
++|---|---|---|---|---|---|
++| install | **not** started or enabled | untouched | installed | - | - |
++| upgrade | restarted **only if it was running** | **kept** (a confirmed floor survives; an unchanged allow set asks no new confirmation) | your edits kept | kept | kept |
++| remove | stopped and disabled (an unconfirmed floor goes with it) | **removed** | kept | kept | kept |
++| purge | (as remove) | (as remove) | removed | **removed** | **kept** (the audit trail) |
++
++On removal the package takes the floor out because it also removes `cora-floor`: a confirmed floor left in the kernel
++would have nothing left to remove it. **Per-task isolation rules are not touched** (they contain tasks the daemon
++isolated; releasing them is a person's decision). If any exist, removal says so and tells you to run
++`cora-firewall purge` first, while the tool is still installed. An empty `inet cora` table is tidied away.
++Files dpkg does not own (anything you put in `/etc/cora-sentinel`, the side-install below) are left alone.
++
++### The model
++
++The `.deb` is the core: the sentinel, the floor, the dynamic policy, the replay tool. Running the local model needs
++`llama-cpp-python`, which is not in the Ubuntu archive, and Ubuntu 24.04 refuses `pip install` into the system Python
++(PEP 668, `externally-managed-environment`; verified). A side-install into its own directory works:
++
++```bash
++sudo mkdir -p /opt/cora-sentinel/pylibs
++sudo python3 -m pip install --target /opt/cora-sentinel/pylibs --only-binary=:all: \
++    --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu llama-cpp-python
++echo 'PYTHONPATH=/opt/cora-sentinel/pylibs' | sudo tee -a /etc/cora-sentinel/cora-sentinel.conf
++```
++
++then add `--model /path/to/model.gguf` to `CORA_ARGS` and restart. What was **verified**: PyPI has no prebuilt
++`llama-cpp-python` wheel (a plain `pip install` compiles it and needs a compiler and cmake); the project's CPU wheel index
++has one (`py3-none-manylinux`, no compiler); `--target` is accepted under PEP 668; system Python imports it through
++`PYTHONPATH`; and this repo's `VERDICT_GBNF` parses in the real llama.cpp grammar engine. What was **not**: loading a model
++and running inference through the unit, and GPU builds (that index is the CPU one; for CUDA use the matching index or
++compile). `PYTHONPATH` is set in the config, not the unit, so the side-install is opt-in and visible. The venv install
++(`pip install 'cora-sentinel[model]'`) is unaffected.
++
++## Testing it
++
++- `pytest tests/test_vendor.py tests/test_packaging_deb.py`: the drift check, wheel/sdist/.deb contents, reproducibility,
++  and every maintainer script run against **stubbed** `systemctl`/`nft`/`cora-floor` in a temp dir. Non-destructive.
++- `packaging/lifecycle_test.sh`: the real `dpkg -i`, reinstall (upgrade), `-r` and `-P`, with assertions (the floor survives
++  the upgrade, the edited config survives, removal takes the floor out, purge cleans state and keeps the logs). It
++  **stops the service and removes a floor**, so it refuses to run unless `CORA_LIFECYCLE_TEST=disposable-machine` is set
++  and the machine shows no sign of running cora-sentinel (package, service, `inet cora` table, config or state). Use a
++  throwaway VM or container, never the live host.
++
++## Compatibility and caveats
++
++- Built and tested on Ubuntu 24.04 with Python 3.12. The package declares `python3 (>= 3.10)` and `requires-python >=3.10`;
++  22.04 (3.10) and Debian 12 (3.11) are **not tested**.
++- `pyproject.toml` asks for `setuptools>=68` and uses the table form of the license, so Ubuntu 24.04's own setuptools (68.1.2)
++  can build it. Newer setuptools prints a deprecation warning for that form (it announces 2027-02-18 as the date to move to
++  PEP 639); when the oldest distro you target ships setuptools 77 or later, switch to `license = "MIT"` and
++  `license-files`.
++- The `.deb` is built with `dpkg-deb` alone, so it is not a Debian *source* package (no `debian/` tree for a PPA or the
++  archive). `Maintainer:` defaults to a GitHub no-reply address; set `DEB_MAINTAINER` to change it.
++- `lintian` (run on the final package): **0 errors**, 14 warnings, all known and left alone. `maintainer-script-calls-systemctl`
++  (4): the scripts call `systemctl` directly, guarded by `/run/systemd/system`, instead of debhelper's generated
++  `deb-systemd-invoke` snippets. `no-manual-page` (9): the commands have `--help` but no man pages yet.
++  `initial-upload-closes-no-bugs`: only relevant to an upload to the Debian archive.
++- Not signed. To publish, put the files in an apt repository (`reprepro`, `aptly`) and sign that.
+diff --git a/docs/service.md b/docs/service.md
+index def4160..ba31bcf 100644
+--- a/docs/service.md
++++ b/docs/service.md
+@@ -9,6 +9,11 @@ sudo cora-floor confirm                                 # inside the --floor-con
+ journalctl -u cora-sentinel -f
+ ```
+ 
++**From the `.deb`** (`sudo dpkg -i cora-sentinel_*_all.deb`, built by `packaging/build_release.sh`) there is no installer step:
++the unit, the config and the log rotation are installed for you, and nothing is started. Everything below applies the
++same way; see [packaging.md](packaging.md) for what install, upgrade, remove and purge do (removal takes the kernel floor
++out, purge keeps the audit logs) and for running the model.
++
+ The installer writes the unit with your `--bindir`, installs the config only if you have none (a reinstall never
+ overwrites your edits), and does **not** enable or start anything. `deploy/install-service.sh --uninstall` removes the
+ unit and leaves your config and `/var/lib/cora-sentinel` alone.
+diff --git a/packaging/build_deb.sh b/packaging/build_deb.sh
+new file mode 100755
+index 0000000..ea5511a
+--- /dev/null
++++ b/packaging/build_deb.sh
+@@ -0,0 +1,158 @@
++#!/usr/bin/env bash
++# Build cora-sentinel_<version>-<rev>_all.deb with dpkg-deb only: no debhelper, no network, no compiler.
++#
++#   packaging/build_deb.sh [--wheel PATH] [--out DIR] [--revision N]
++#
++# The package is the wheel unpacked into /usr/lib/python3/dist-packages plus /usr/bin wrappers, the systemd unit
++# (deploy/cora-sentinel.service with @BINDIR@ = /usr/bin), the config and logrotate files as conffiles, docs, and the
++# maintainer scripts in packaging/debian. It is Architecture: all with no Python dependencies: the safety gate is vendored.
++#
++# Reproducible: the same wheel and the same SOURCE_DATE_EPOCH give the same bytes. Default epoch: the last commit's time
++# (git), else the mtime of pyproject.toml. DEB_MAINTAINER overrides the Maintainer field.
++set -euo pipefail
++
++here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++repo="$(cd "$here/.." && pwd)"
++wheel="" out="$repo/dist" rev="1"
++while [ $# -gt 0 ]; do
++    case "$1" in
++        --wheel) wheel="${2:?--wheel needs a path}"; shift 2 ;;
++        --out) out="${2:?--out needs a directory}"; shift 2 ;;
++        --revision) rev="${2:?--revision needs a number}"; shift 2 ;;
++        -h|--help) sed -n '2,13p' "${BASH_SOURCE[0]}"; exit 0 ;;
++        *) echo "unknown option: $1" >&2; exit 2 ;;
++    esac
++done
++command -v dpkg-deb >/dev/null || { echo "dpkg-deb not found (it is in the 'dpkg' package)" >&2; exit 1; }
++
++tmp="$(mktemp -d)"
++trap 'rm -rf "$tmp"' EXIT
++
++# ---- the wheel -------------------------------------------------------------------------------------------------------
++if [ -z "$wheel" ]; then
++    if python3 -c 'import setuptools' 2>/dev/null; then iso=(--no-build-isolation); else iso=(); fi   # offline when it can be
++    python3 -m pip wheel "$repo" --no-deps -q "${iso[@]}" -w "$tmp/wheel"
++    wheel="$(ls "$tmp"/wheel/*.whl)"
++fi
++[ -f "$wheel" ] || { echo "no such wheel: $wheel" >&2; exit 1; }
++version="$(python3 - "$wheel" <<'PY'
++import sys, zipfile
++z = zipfile.ZipFile(sys.argv[1])
++meta = next(n for n in z.namelist() if n.endswith(".dist-info/METADATA"))
++print(next(l.split(":", 1)[1].strip() for l in z.read(meta).decode().splitlines() if l.startswith("Version:")))
++PY
++)"
++sde="${SOURCE_DATE_EPOCH:-$(git -C "$repo" log -1 --format=%ct 2>/dev/null || stat -c %Y "$repo/pyproject.toml")}"
++maint="${DEB_MAINTAINER:-Nick <nkaralus@users.noreply.github.com>}"
++
++stage="$tmp/stage"
++site="$stage/usr/lib/python3/dist-packages"
++doc="$stage/usr/share/doc/cora-sentinel"
++mkdir -p "$site" "$stage/DEBIAN" "$stage/usr/bin" "$stage/usr/lib/systemd/system" "$stage/etc/cora-sentinel" \
++         "$stage/etc/logrotate.d" "$doc"
++
++# ---- code: the wheel, minus RECORD (stale once modes change), marked as dpkg's so pip will not uninstall it ------------
++python3 -m zipfile -e "$wheel" "$site"
++distinfo="$(echo "$site"/*.dist-info)"
++rm -f "$distinfo/RECORD"
++echo dpkg > "$distinfo/INSTALLER"
++
++# ---- /usr/bin wrappers from the wheel's console scripts -------------------------------------------------------------
++python3 - "$distinfo/entry_points.txt" "$stage/usr/bin" <<'PY'
++import configparser, os, sys
++cp = configparser.ConfigParser()
++cp.optionxform = str
++cp.read(sys.argv[1])
++for name, target in sorted(cp["console_scripts"].items()):
++    mod, func = target.split(":")
++    path = os.path.join(sys.argv[2], name)
++    with open(path, "w") as f:
++        f.write(f"#!/usr/bin/python3\nimport sys\nfrom {mod} import {func}\nif __name__ == '__main__':\n    sys.exit({func}())\n")
++    os.chmod(path, 0o755)
++PY
++
++# ---- service, config (conffiles), logrotate (conffile), docs -------------------------------------------------------
++sed 's|@BINDIR@|/usr/bin|g' "$repo/deploy/cora-sentinel.service" > "$stage/usr/lib/systemd/system/cora-sentinel.service"
++cp "$repo/deploy/cora-sentinel.conf" "$stage/etc/cora-sentinel/cora-sentinel.conf"
++cp "$repo/deploy/cora-sentinel.logrotate" "$stage/etc/logrotate.d/cora-sentinel"
++cp "$repo/README.md" "$doc/README.md"
++cp "$repo"/docs/*.md "$doc/"
++gzip -9n -c "$repo/CHANGELOG.md" > "$doc/changelog.gz"
++# Debian wants its own changelog format; the real history is upstream's CHANGELOG.md, shipped beside it
++gzip -9n -c > "$doc/changelog.Debian.gz" <<CHG
++cora-sentinel (${version}-${rev}) unstable; urgency=medium
++
++  * Packaged from cora-sentinel ${version} with packaging/build_deb.sh.
++  * The project's own history: /usr/share/doc/cora-sentinel/changelog.gz
++
++ -- ${maint}  $(date -u -d "@$sde" '+%a, %d %b %Y %H:%M:%S +0000')
++CHG
++
++vend="$site/cora_sentinel/_vendor/subnetbus"
++python3 - "$repo/LICENSE" "$vend/LICENSE" "$vend/VENDOR.lock" "$doc/copyright" <<'PY'
++import json, re, sys
++own, bus, lock, out = sys.argv[1:5]
++own_t, bus_t, lk = open(own).read(), open(bus).read(), json.load(open(lock))
++cr = lambda t: re.search(r"^Copyright.*$", t, re.M).group(0).replace("Copyright (c) ", "").replace("Copyright ", "")
++body = "\n".join(" " + l if l.strip() else " ." for l in own_t.strip().splitlines()[2:])        # the MIT text, after its title
++open(out, "w").write(f"""Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
++Upstream-Name: cora-sentinel
++Source: https://github.com/nkaralus/cora-sentinel
++
++Files: *
++Copyright: {cr(own_t)}
++License: MIT
++
++Files: usr/lib/python3/dist-packages/cora_sentinel/_vendor/subnetbus/*
++Copyright: {cr(bus_t)}
++Comment: Vendored verbatim from {lk['upstream']} at commit {lk['commit']}
++ ({lk['distribution']} {lk['version']}); VENDOR.lock beside the code records the sha256 of every file.
++License: MIT
++
++License: MIT
++{body}
++""")
++PY
++
++# ---- control, maintainer scripts --------------------------------------------------------------------------------------
++cp "$here/debian/conffiles" "$stage/DEBIAN/conffiles"
++install -m 0755 "$here/debian/postinst" "$here/debian/prerm" "$here/debian/postrm" "$stage/DEBIAN/"
++find "$stage" -type d -exec chmod 0755 {} +
++find "$stage" -type f ! -path "$stage/DEBIAN/*" ! -path "$stage/usr/bin/*" -exec chmod 0644 {} +
++# md5sums for everything dpkg does not track as a conffile, so `dpkg -V cora-sentinel` can verify an install
++( cd "$stage" && find . -type f ! -path './DEBIAN/*' | sed 's|^\./||' | LC_ALL=C sort \
++    | grep -vxFf <(sed 's|^/||' "$here/debian/conffiles") | xargs -d '\n' md5sum > DEBIAN/md5sums )
++size="$(du -sk --exclude=DEBIAN "$stage" | cut -f1)"
++cat > "$stage/DEBIAN/control" <<CTRL
++Package: cora-sentinel
++Version: ${version}-${rev}
++Architecture: all
++Maintainer: ${maint}
++Installed-Size: ${size}
++Depends: python3 (>= 3.10), nftables
++Recommends: logrotate
++Suggests: systemd
++Section: admin
++Priority: optional
++Homepage: https://github.com/nkaralus/cora-sentinel
++Description: out-of-band security sentinel for Linux
++ Per-task cgroups, nftables containment, connect-time attribution (NFLOG) for
++ TCP/UDP/QUIC/DNS, a kernel-side blocklist floor with a dead-man lockout guard,
++ and a grammar-constrained local LLM supervisor whose verdicts pass a vendored
++ safety gate before anything is acted on.
++ .
++ Installing does NOT start the service: the kernel floor it can install is
++ host-wide. Removing the package stops the service and removes the floor;
++ purging deletes /var/lib/cora-sentinel and keeps /var/log/cora-sentinel.
++ .
++ Running the local model needs llama-cpp-python, which is not in the Ubuntu
++ archive: see /usr/share/doc/cora-sentinel/packaging.md.
++CTRL
++chmod 0644 "$stage/DEBIAN/control" "$stage/DEBIAN/conffiles" "$stage/DEBIAN/md5sums"
++
++# ---- build ---------------------------------------------------------------------------------------------------------
++find "$stage" -exec touch -h -d "@$sde" {} +
++mkdir -p "$out"
++name="cora-sentinel_${version}-${rev}_all.deb"
++SOURCE_DATE_EPOCH="$sde" dpkg-deb --root-owner-group -Zxz -z6 --build "$stage" "$out/$name" >/dev/null
++echo "$out/$name"
+diff --git a/packaging/build_release.sh b/packaging/build_release.sh
+new file mode 100755
+index 0000000..74d585e
+--- /dev/null
++++ b/packaging/build_release.sh
+@@ -0,0 +1,23 @@
++#!/usr/bin/env bash
++# sdist + wheel + .deb + SHA256SUMS into dist/, after checking that the vendored safety gate is untouched.
++#
++#   packaging/build_release.sh            (CORA_BUILD_NO_ISOLATION=1 builds offline with the installed setuptools)
++#
++# Needs: python3 with `build` (pip install build), dpkg-deb. SOURCE_DATE_EPOCH defaults to the last commit's time.
++set -euo pipefail
++
++here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++repo="$(cd "$here/.." && pwd)"
++cd "$repo"
++export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct 2>/dev/null || stat -c %Y pyproject.toml)}"
++
++python3 tools/vendor_bus.py check
++python3 -c 'import build' 2>/dev/null || { echo "needs the 'build' package: pip install build" >&2; exit 1; }
++rm -rf dist
++mkdir -p dist
++flags=(); [ "${CORA_BUILD_NO_ISOLATION:-}" = 1 ] && flags=(--no-isolation)
++python3 -m build --outdir dist "${flags[@]}" >/dev/null
++python3 "$here/normalize_sdist.py" dist/*.tar.gz                 # setuptools stamps build time into the sdist
++"$here/build_deb.sh" --wheel "$(ls dist/*.whl)" --out dist >/dev/null
++(cd dist && sha256sum -- * > SHA256SUMS.tmp && mv SHA256SUMS.tmp SHA256SUMS)
++cat dist/SHA256SUMS
+diff --git a/packaging/debian/conffiles b/packaging/debian/conffiles
+new file mode 100644
+index 0000000..9b94113
+--- /dev/null
++++ b/packaging/debian/conffiles
+@@ -0,0 +1,2 @@
++/etc/cora-sentinel/cora-sentinel.conf
++/etc/logrotate.d/cora-sentinel
+diff --git a/packaging/debian/postinst b/packaging/debian/postinst
+new file mode 100755
+index 0000000..f430fb0
+--- /dev/null
++++ b/packaging/debian/postinst
+@@ -0,0 +1,38 @@
++#!/bin/sh
++# postinst for cora-sentinel
++set -e
++
++case "$1" in
++    configure)
++        if command -v py3compile >/dev/null 2>&1; then
++            py3compile -p cora-sentinel || true
++        fi
++        if [ -d /run/systemd/system ]; then
++            systemctl daemon-reload || true
++            # An UPGRADE of a running service restarts onto the new code (a confirmed floor survives it, and an unchanged
++            # allow set asks for no new confirmation). A fresh install is NEVER enabled or started here: the kernel floor
++            # this daemon can install is host-wide, so the first start is the operator's decision.
++            if [ -n "$2" ] && systemctl is-active --quiet cora-sentinel; then
++                systemctl try-restart cora-sentinel || true
++            fi
++        fi
++        if [ -z "$2" ]; then
++            cat <<'MSG'
++cora-sentinel is installed but NOT started (its kernel floor is host-wide, so the first start is yours to make):
++  1. edit /etc/cora-sentinel/cora-sentinel.conf        (add --model ... and your blocklists)
++  2. systemctl enable --now cora-sentinel
++  3. cora-floor confirm                                 (within the --floor-confirm window, the first time)
++Read /usr/share/doc/cora-sentinel/service.md and packaging.md first. Running a local model needs llama-cpp-python,
++which this package does not bring: see packaging.md ("The model").
++MSG
++        fi
++        ;;
++    abort-upgrade|abort-remove|abort-deconfigure)
++        ;;
++    *)
++        echo "postinst called with unknown argument '$1'" >&2
++        exit 1
++        ;;
++esac
++
++exit 0
+diff --git a/packaging/debian/postrm b/packaging/debian/postrm
+new file mode 100755
+index 0000000..fe7331d
+--- /dev/null
++++ b/packaging/debian/postrm
+@@ -0,0 +1,32 @@
++#!/bin/sh
++# postrm for cora-sentinel
++set -e
++
++case "$1" in
++    remove)
++        if [ -d /run/systemd/system ]; then
++            systemctl daemon-reload || true
++        fi
++        ;;
++    purge)
++        if [ -d /run/systemd/system ]; then
++            systemctl daemon-reload || true
++        fi
++        # state: the confirmed allow-set fingerprint, the dynamic-policy ledgers, violation reports
++        rm -rf /var/lib/cora-sentinel
++        # the conffiles themselves were already removed by dpkg; this only tidies an empty directory
++        rmdir --ignore-fail-on-non-empty /etc/cora-sentinel 2>/dev/null || true
++        # /var/log/cora-sentinel is KEPT on purpose: it is the audit trail (events, decisions)
++        if [ -d /var/log/cora-sentinel ]; then
++            echo "cora-sentinel: kept the audit logs in /var/log/cora-sentinel (delete them yourself if you want them gone)"
++        fi
++        ;;
++    upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
++        ;;
++    *)
++        echo "postrm called with unknown argument '$1'" >&2
++        exit 1
++        ;;
++esac
++
++exit 0
+diff --git a/packaging/debian/prerm b/packaging/debian/prerm
+new file mode 100755
+index 0000000..1ceb427
+--- /dev/null
++++ b/packaging/debian/prerm
+@@ -0,0 +1,48 @@
++#!/bin/sh
++# prerm for cora-sentinel
++set -e
++
++case "$1" in
++    remove)
++        if [ -d /run/systemd/system ]; then
++            # stopping runs ExecStopPost (`cora-floor rollback`), which removes a floor nobody confirmed
++            systemctl stop cora-sentinel || true
++            systemctl disable cora-sentinel >/dev/null 2>&1 || true
++        fi
++        # Removing this package removes `cora-floor`. A CONFIRMED floor would then sit in the kernel with nothing left to
++        # take it out, so removal (a deliberate act; an upgrade never reaches this branch) takes it out first.
++        if command -v cora-floor >/dev/null 2>&1; then
++            if cora-floor remove >/dev/null 2>&1; then
++                echo "cora-sentinel: kernel floor removed"
++            fi
++        fi
++        # Per-task isolation rules are NOT touched: they contain tasks the daemon isolated, and releasing those is a
++        # decision for a person. Say so, while the tool that can do it is still installed. An EMPTY table (what is left
++        # once the floor is gone and nothing was isolated) is just tidied away.
++        if command -v nft >/dev/null 2>&1 && nft list table inet cora >/dev/null 2>&1; then
++            if nft list table inet cora 2>/dev/null | grep -q "chain "; then
++                echo "cora-sentinel: the nft table 'inet cora' still has chains (per-task isolation rules, if any, are kept on purpose)."
++                echo "               To release everything: cora-firewall purge   (run it now; the tool goes away with the package)"
++            else
++                nft delete table inet cora >/dev/null 2>&1 || true
++            fi
++        fi
++        if command -v py3clean >/dev/null 2>&1; then
++            py3clean -p cora-sentinel || true
++        fi
++        ;;
++    deconfigure)
++        if [ -d /run/systemd/system ]; then
++            systemctl stop cora-sentinel || true
++        fi
++        ;;
++    upgrade|failed-upgrade)
++        # nothing: the new version's postinst restarts a running service
++        ;;
++    *)
++        echo "prerm called with unknown argument '$1'" >&2
++        exit 1
++        ;;
++esac
++
++exit 0
+diff --git a/packaging/lifecycle_test.sh b/packaging/lifecycle_test.sh
+new file mode 100755
+index 0000000..d7a6589
+--- /dev/null
++++ b/packaging/lifecycle_test.sh
+@@ -0,0 +1,81 @@
++#!/usr/bin/env bash
++# Real install -> reinstall(upgrade) -> remove -> purge of the .deb, with assertions.
++#
++#   sudo CORA_LIFECYCLE_TEST=disposable-machine packaging/lifecycle_test.sh dist/cora-sentinel_X_all.deb
++#
++# DESTRUCTIVE: removing the package stops the cora-sentinel service and removes the kernel floor, which is exactly what it
++# is meant to verify. Run it ONLY on a disposable VM or container. It refuses on a machine that looks like it is running
++# cora-sentinel (package installed, service active, nft table, config or state present) and without the token above.
++set -uo pipefail
++
++deb="${1:-}"
++die() { echo "REFUSING: $*" >&2; exit 2; }
++[ -n "$deb" ] && [ -f "$deb" ] || die "usage: lifecycle_test.sh PACKAGE.deb"
++[ "$(id -u)" = 0 ] || die "run as root"
++[ "${CORA_LIFECYCLE_TEST:-}" = "disposable-machine" ] || die "set CORA_LIFECYCLE_TEST=disposable-machine (this removes a kernel floor and stops the service)"
++command -v dpkg >/dev/null || die "needs dpkg"
++dpkg -s cora-sentinel >/dev/null 2>&1 && die "cora-sentinel is already installed here"
++command -v systemctl >/dev/null && systemctl is-active --quiet cora-sentinel 2>/dev/null && die "a cora-sentinel service is running here"
++command -v nft >/dev/null && nft list table inet cora >/dev/null 2>&1 && die "an nft table 'inet cora' exists here"
++for d in /etc/cora-sentinel /var/lib/cora-sentinel /var/log/cora-sentinel; do [ -e "$d" ] && die "$d exists"; done
++
++export DEBIAN_FRONTEND=noninteractive
++fail=0
++ok()  { echo "  ok    $*"; }
++bad() { echo "  FAIL  $*"; fail=$((fail + 1)); }
++check() { local what="$1"; shift; if "$@" >/dev/null 2>&1; then ok "$what"; else bad "$what"; fi; }
++floor_up() { nft list chain inet cora floor_in >/dev/null 2>&1; }
++gone() { ! "$@" >/dev/null 2>&1; }
++
++echo "== install"
++out="$(dpkg -i "$deb" 2>&1)"; rc=$?
++[ $rc = 0 ] && ok "dpkg -i" || { bad "dpkg -i: $out"; exit 1; }
++grep -q "NOT started" <<<"$out" && ok "tells you it did not start the service" || bad "no 'NOT started' notice"
++for f in /usr/bin/cora-sentinel /usr/bin/cora-floor /usr/lib/systemd/system/cora-sentinel.service /etc/cora-sentinel/cora-sentinel.conf \
++         /etc/logrotate.d/cora-sentinel /usr/lib/python3/dist-packages/cora_sentinel/_vendor/subnetbus/VENDOR.lock \
++         /usr/share/doc/cora-sentinel/copyright; do check "present: $f" test -e "$f"; done
++where="$(cd / && python3 -c 'import cora_sentinel; print(cora_sentinel.__file__)' 2>&1)"
++case "$where" in /usr/lib/python3/dist-packages/*) ok "python3 imports the packaged copy";; *) bad "python3 imports $where (something shadows the package)";; esac
++sc="$(cd / && cora-selfcheck 2>&1)"          # captured, not piped into grep -q: SIGPIPE + pipefail would fake a failure
++grep -q "ok .*vendored subnetbus .* verified" <<<"$sc" && ok "cora-selfcheck: vendored gate verified" || bad "cora-selfcheck did not verify the vendored gate"
++# a minimal image may path-exclude /usr/share/doc (dpkg then reports the docs missing); nothing else may be reported
++v="$(dpkg -V cora-sentinel | grep -v ' /usr/share/doc/' || true)"
++[ -z "$v" ] && ok "dpkg -V is clean (docs aside)" || bad "dpkg -V reports: $v"
++if [ -d /run/systemd/system ]; then
++    gone systemctl is-active --quiet cora-sentinel && ok "service not started" || bad "service was started"
++    gone systemctl is-enabled --quiet cora-sentinel && ok "service not enabled" || bad "service was enabled"
++    check "systemd accepts the unit" bash -c '[ -z "$(systemd-analyze verify --man=no /usr/lib/systemd/system/cora-sentinel.service 2>&1)" ]'
++fi
++
++echo "== reinstall (an upgrade): the floor and the edited config must survive"
++echo "# edited by lifecycle_test" >> /etc/cora-sentinel/cora-sentinel.conf
++cora-floor ensure >/dev/null 2>&1; floor_up && ok "floor installed" || bad "could not install a floor to test with"
++dpkg -i --force-confold "$deb" >/dev/null 2>&1 && ok "dpkg -i (upgrade)" || bad "upgrade failed"
++floor_up && ok "the floor survived the upgrade" || bad "the upgrade removed the floor"
++grep -q "edited by lifecycle_test" /etc/cora-sentinel/cora-sentinel.conf && ok "the edited config survived" || bad "the edited config was overwritten"
++
++echo "== remove"
++mkdir -p /var/lib/cora-sentinel /var/log/cora-sentinel
++echo state > /var/lib/cora-sentinel/floor.confirmed.json; echo audit > /var/log/cora-sentinel/decisions.jsonl
++out="$(dpkg -r cora-sentinel 2>&1)"; rc=$?
++[ $rc = 0 ] && ok "dpkg -r" || bad "dpkg -r: $out"
++grep -q "kernel floor removed" <<<"$out" && ok "reported removing the floor" || bad "no 'floor removed' message"
++gone floor_up && ok "the floor is gone" || bad "the floor is STILL THERE after removal"
++gone nft list table inet cora && ok "the empty nft table was tidied away" || bad "an empty nft table was left behind"
++gone test -e /usr/bin/cora-floor && ok "binaries removed" || bad "binaries left behind"
++check "config kept after remove" test -e /etc/cora-sentinel/cora-sentinel.conf
++check "state kept after remove" test -e /var/lib/cora-sentinel/floor.confirmed.json
++
++echo "== purge"
++out="$(dpkg -P cora-sentinel 2>&1)"; rc=$?
++[ $rc = 0 ] && ok "dpkg -P" || bad "dpkg -P: $out"
++gone test -e /etc/cora-sentinel && ok "config removed" || bad "config left behind"
++gone test -e /etc/logrotate.d/cora-sentinel && ok "logrotate config removed" || bad "logrotate config left behind"
++gone test -e /var/lib/cora-sentinel && ok "state removed" || bad "state left behind"
++check "audit logs KEPT" test -e /var/log/cora-sentinel/decisions.jsonl
++grep -q "kept the audit logs" <<<"$out" && ok "said so" || bad "no 'kept the audit logs' message"
++gone test -e /usr/lib/python3/dist-packages/cora_sentinel && ok "no package files left" || bad "package files left behind"
++rm -rf /var/log/cora-sentinel        # the test's own audit file
++
++echo
++[ "$fail" = 0 ] && echo "LIFECYCLE PASS" || { echo "LIFECYCLE FAIL ($fail)"; exit 1; }
+diff --git a/packaging/normalize_sdist.py b/packaging/normalize_sdist.py
+new file mode 100755
+index 0000000..b25418d
+--- /dev/null
++++ b/packaging/normalize_sdist.py
+@@ -0,0 +1,39 @@
++#!/usr/bin/env python3
++"""Rewrite an sdist (.tar.gz) deterministically, in place: members sorted, mtime = SOURCE_DATE_EPOCH, root ownership,
++fixed modes (the exec bit is kept), no pax headers, gzip header time 0. setuptools stamps build-time metadata into both the
++tar and the gzip, so two builds of the same tree differ; after this they do not.
++
++    SOURCE_DATE_EPOCH=1800000000 python packaging/normalize_sdist.py dist/cora_sentinel-X.tar.gz
++"""
++import gzip
++import io
++import os
++import sys
++import tarfile
++
++
++def normalize(path: str, epoch: int) -> None:
++    with tarfile.open(path) as tf:
++        members = sorted(tf.getmembers(), key=lambda m: m.name)
++        blobs = {m.name: tf.extractfile(m).read() for m in members if m.isfile()}
++    raw = io.BytesIO()
++    with tarfile.open(fileobj=raw, mode="w", format=tarfile.GNU_FORMAT) as out:
++        for m in members:
++            ti = tarfile.TarInfo(m.name)
++            ti.type = tarfile.DIRTYPE if m.isdir() else tarfile.REGTYPE
++            ti.mtime, ti.uid, ti.gid, ti.uname, ti.gname = epoch, 0, 0, "", ""
++            ti.mode = 0o755 if (m.isdir() or m.mode & 0o111) else 0o644
++            if m.isfile():
++                ti.size = len(blobs[m.name])
++                out.addfile(ti, io.BytesIO(blobs[m.name]))
++            else:
++                out.addfile(ti)
++    with open(path, "wb") as fh:
++        with gzip.GzipFile(filename="", mode="wb", fileobj=fh, mtime=0, compresslevel=9) as gz:
++            gz.write(raw.getvalue())
++
++
++if __name__ == "__main__":
++    epoch = int(os.environ.get("SOURCE_DATE_EPOCH", "0"))
++    for p in sys.argv[1:]:
++        normalize(p, epoch)
+diff --git a/pyproject.toml b/pyproject.toml
+index efa12c0..4745ee8 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,5 +1,7 @@
+ [build-system]
+-requires = ["setuptools>=77"]
++# 68 is what Ubuntu 24.04 ships, so the package builds with the distro toolchain (pybuild, no network). The license
++# is therefore the table form, which newer setuptools only warns about.
++requires = ["setuptools>=68"]
+ build-backend = "setuptools.build_meta"
+ 
+ [project]
+@@ -8,8 +10,7 @@ dynamic = ["version"]
+ description = "Out-of-band security sentinel for Linux: per-task cgroups, nftables containment, connect-time attribution (NFLOG) for TCP/UDP/QUIC/DNS, and a grammar-constrained local LLM supervisor"
+ readme = "README.md"
+ requires-python = ">=3.10"
+-license = "MIT"
+-license-files = ["LICENSE"]
++license = { text = "MIT" }
+ authors = [{ name = "Nick" }]
+ keywords = ["security", "cgroups", "nftables", "nflog", "sock_diag", "netlink", "llm", "sentinel"]
+ classifiers = [
+@@ -21,9 +22,10 @@ classifiers = [
+     "Topic :: Security",
+     "Topic :: System :: Monitoring",
+ ]
+-# The only hard dependency is the author's own bus, installed straight from GitHub. (A direct URL
+-# dependency is fine for `pip install` from GitHub; it would have to change before a PyPI upload.)
+-dependencies = ["engine-telemetry-bus @ git+https://github.com/nkaralus/engine-telemetry-bus"]
++# No runtime dependencies. The safety gate (github.com/nkaralus/engine-telemetry-bus) is VENDORED, pinned to one commit,
++# under cora_sentinel/_vendor/subnetbus (see VENDOR.lock there and tools/vendor_bus.py), so a wheel installs offline and
++# the code that ships is the code the tests ran against.
++dependencies = []
+ 
+ [project.optional-dependencies]
+ model = ["llama-cpp-python"]          # the local GGUF supervisor; everything else runs without it
+@@ -46,6 +48,10 @@ version = { attr = "cora_sentinel.__version__" }
+ [tool.setuptools.packages.find]
+ where = ["src"]
+ 
++# the vendored bus's own MIT notice and its lock travel with it (the license requires the notice in every copy)
++[tool.setuptools.package-data]
++"cora_sentinel._vendor.subnetbus" = ["LICENSE", "VENDOR.lock"]
++
+ [tool.pytest.ini_options]
+ testpaths = ["tests"]
+ addopts = "-ra"
+diff --git a/src/cora_sentinel/__init__.py b/src/cora_sentinel/__init__.py
+index 8874acc..4b31a66 100644
+--- a/src/cora_sentinel/__init__.py
++++ b/src/cora_sentinel/__init__.py
+@@ -5,4 +5,4 @@ local model (grammar-constrained) proposes a verdict; deterministic gates decide
+ See README.md.
+ """
+ 
+-__version__ = "0.7.0"
++__version__ = "0.8.0"
+diff --git a/src/cora_sentinel/_vendor/__init__.py b/src/cora_sentinel/_vendor/__init__.py
+new file mode 100644
+index 0000000..92d638f
+--- /dev/null
++++ b/src/cora_sentinel/_vendor/__init__.py
+@@ -0,0 +1,62 @@
++"""Vendored third-party code. Nothing in here is edited by hand.
++
++`subnetbus` is a verbatim copy of github.com/nkaralus/engine-telemetry-bus at one pinned commit. It is the safety gate
++(GI_1-GI_3) the verdict code asks before it acts, so the copy that ships is the copy the tests ran against, and anything
++that changes it is visible: `subnetbus/VENDOR.lock` records the upstream commit and the sha256 of every file, `verify()`
++recomputes them (cora-selfcheck and the daemon's start-up line call it), and `tools/vendor_bus.py` is the only thing that
++rewrites the tree. Imports always come from here, even if another `subnetbus` is installed.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++from pathlib import Path
++from typing import List, Optional
++
++LOCK_NAME = "VENDOR.lock"
++HERE = Path(__file__).resolve().parent / "subnetbus"
++
++
++def sha256_file(path: Path) -> str:
++    h = hashlib.sha256()
++    with open(path, "rb") as fh:
++        for chunk in iter(lambda: fh.read(65536), b""):
++            h.update(chunk)
++    return h.hexdigest()
++
++
++def read_lock(root: Optional[Path] = None) -> dict:
++    return json.loads(((Path(root) if root else HERE) / LOCK_NAME).read_text())
++
++
++def verify(root: Optional[Path] = None) -> List[str]:
++    """What is wrong with the vendored copy, as readable strings; [] means it is byte-for-byte what VENDOR.lock says."""
++    d = Path(root) if root else HERE
++    try:
++        lock = read_lock(d)
++        want = lock["files"]
++    except (OSError, ValueError, KeyError) as e:
++        return [f"{LOCK_NAME} unreadable: {e.__class__.__name__}: {e}"]
++    problems: List[str] = []
++    for name, digest in sorted(want.items()):
++        p = d / name
++        if not p.is_file():
++            problems.append(f"missing: {name}")
++        elif sha256_file(p) != digest:
++            problems.append(f"modified: {name}")
++    for p in sorted(d.rglob("*")):
++        rel = p.relative_to(d).as_posix()
++        if p.is_file() and "__pycache__" not in p.parts and p.suffix != ".pyc" and rel not in want and rel != LOCK_NAME:
++            problems.append(f"unexpected file: {rel}")
++    return problems
++
++
++def describe(root: Optional[Path] = None) -> str:
++    """One short line for logs: where it came from and whether it is intact."""
++    try:
++        lock = read_lock(root)
++    except (OSError, ValueError):
++        return "vendored subnetbus: NO LOCK FILE"
++    bad = verify(root)
++    return (f"vendored subnetbus {lock.get('version', '?')} @ {str(lock.get('commit', '?'))[:7]} "
++            + ("verified" if not bad else f"MODIFIED ({len(bad)} problem(s): {'; '.join(bad[:3])})"))
+diff --git a/src/cora_sentinel/_vendor/subnetbus/LICENSE b/src/cora_sentinel/_vendor/subnetbus/LICENSE
+new file mode 100644
+index 0000000..6e8a1b5
+--- /dev/null
++++ b/src/cora_sentinel/_vendor/subnetbus/LICENSE
+@@ -0,0 +1,21 @@
++MIT License
++
++Copyright (c) 2026 Nick and contributors
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all
++copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++SOFTWARE.
+diff --git a/src/cora_sentinel/_vendor/subnetbus/VENDOR.lock b/src/cora_sentinel/_vendor/subnetbus/VENDOR.lock
+new file mode 100644
+index 0000000..3219d87
+--- /dev/null
++++ b/src/cora_sentinel/_vendor/subnetbus/VENDOR.lock
+@@ -0,0 +1,20 @@
++{
++  "commit": "ac3f126946056b3b24eea9dbc15015b5a5639706",
++  "distribution": "engine-telemetry-bus",
++  "files": {
++    "LICENSE": "62541b2d5ef7dd900f5963f70bc51f482d9ea03dc126ca50604aec13ac6617b3",
++    "__init__.py": "b7c6fa0e6e6fd19d7b5e12ddd8bf2a46fac73ffac0002d04825cd070fded69d5",
++    "__main__.py": "aba8abd54676c8a8350f5903793025e28da521c0d0dc16f9712ebf8fc13a1e3f",
++    "addressing.py": "3a517caf0b172388370e36b14da5e67687d6a89d9ce89b9420231f5f489904d7",
++    "errors.py": "52755599dcc2a0840b8e4bfd98ccf6a8d1043beff34201a8ef4b4a17b5dbc608",
++    "fsguard.py": "6cd6dfea158a296ebf1673ba8a8e7d388a1caba41be04751b38e572371ad6b42",
++    "gates.py": "1341c3f55994545386d1c0460cb1517da45db7f37bdbb412128841c1dfefad37",
++    "geometry.py": "ea9d5aebec6e5690db0bc18eafa835869d586838b1e172c8774c8f8c6acee91c",
++    "registry.py": "efe454a0b1422a096493532e33907e8919c3a4a96ff72f51068cc9f76ad9bba3"
++  },
++  "license": "MIT",
++  "name": "subnetbus",
++  "schema": 1,
++  "upstream": "https://github.com/nkaralus/engine-telemetry-bus",
++  "version": "0.1.0"
++}
+diff --git a/src/cora_sentinel/_vendor/subnetbus/__init__.py b/src/cora_sentinel/_vendor/subnetbus/__init__.py
+new file mode 100644
+index 0000000..c4daa98
+--- /dev/null
++++ b/src/cora_sentinel/_vendor/subnetbus/__init__.py
+@@ -0,0 +1,14 @@
++"""Virtual subnet bus: resource addressing, registry, and pre-execution safety gates."""
++from .addressing import Subnet, parse_host, parse_subnet
++from .errors import BusError, PathError, RegistryError
++from .fsguard import PathGuard, active_mountpoints, lexical_segments
++from .gates import Action, GateResult, Verdict, check_all, gi_1, gi_2, gi_3
++from .geometry import AABB, find_overlaps
++from .registry import Node, Registry
++
++__version__ = "0.1.0"
++__all__ = [
++    "AABB", "Action", "BusError", "GateResult", "Node", "PathError", "PathGuard", "Registry",
++    "RegistryError", "Subnet", "Verdict", "active_mountpoints", "check_all", "find_overlaps",
++    "gi_1", "gi_2", "gi_3", "lexical_segments", "parse_host", "parse_subnet",
++]
+diff --git a/src/cora_sentinel/_vendor/subnetbus/__main__.py b/src/cora_sentinel/_vendor/subnetbus/__main__.py
+new file mode 100644
+index 0000000..f7c02d6
+--- /dev/null
++++ b/src/cora_sentinel/_vendor/subnetbus/__main__.py
+@@ -0,0 +1,75 @@
++"""CLI.  python -m subnetbus <command> FILE ...   Exit: 0 ok, 1 rejected, 2 error."""
++from __future__ import annotations
++
++import argparse
++import json
++import sys
++from typing import List, Optional
++
++from . import AABB, Action, BusError, PathGuard, Registry, check_all
++
++
++def _box(s: str) -> AABB:
++    try:
++        x, y, w, h = (float(v) for v in s.split(","))
++    except ValueError:
++        raise BusError("BAD_BOUNDS", "use x,y,w,h") from None
++    return AABB(x, y, w, h)
++
++
++def main(argv: Optional[List[str]] = None) -> int:
++    p = argparse.ArgumentParser(prog="subnetbus")
++    sub = p.add_subparsers(dest="cmd", required=True)
++    s = sub.add_parser("init");        s.add_argument("file")
++    s = sub.add_parser("add-subnet");  s.add_argument("file"); s.add_argument("cidr")
++    s.add_argument("--label", default=""); s.add_argument("--reserved-below", type=int, default=10)
++    s.add_argument("--world")
++    s = sub.add_parser("alloc");       s.add_argument("file"); s.add_argument("name"); s.add_argument("subnet")
++    s.add_argument("--ip"); s.add_argument("--kind", default="scene_node"); s.add_argument("--bounds")
++    s.add_argument("--no-solid", action="store_true"); s.add_argument("--path")
++    s = sub.add_parser("release");     s.add_argument("file"); s.add_argument("name")
++    s = sub.add_parser("show");        s.add_argument("file")
++    s = sub.add_parser("validate");    s.add_argument("file")
++    s = sub.add_parser("check");       s.add_argument("file"); s.add_argument("--task", required=True)
++    s.add_argument("--bounds"); s.add_argument("--path", action="append", default=[])
++    s.add_argument("--ref", action="append", default=[]); s.add_argument("--fs-op"); s.add_argument("--fs-root")
++    a = p.parse_args(argv)
++    try:
++        if a.cmd == "init":
++            Registry().save(a.file)
++            return 0
++        reg = Registry.load(a.file)
++        if a.cmd == "add-subnet":
++            reg.add_subnet(a.cidr, label=a.label, reserved_below=a.reserved_below,
++                           world=_box(a.world) if a.world else None)
++        elif a.cmd == "alloc":
++            n = reg.allocate(a.name, a.subnet, kind=a.kind, ip=a.ip, bounds=_box(a.bounds) if a.bounds else None,
++                             solid=not a.no_solid, path=a.path)
++            print(f"{n.name} {n.ip}")
++        elif a.cmd == "release":
++            reg.release(a.name)
++        elif a.cmd == "show":
++            print(json.dumps(reg.to_dict(), indent=2))
++            return 0
++        elif a.cmd == "validate":
++            errs = reg.validate()
++            print("\n".join(errs) if errs else "OK")
++            return 1 if errs else 0
++        elif a.cmd == "check":
++            guard = PathGuard(a.fs_root) if a.fs_root else None
++            act = Action(refs=tuple(a.ref), paths=tuple(a.path), fs_op=a.fs_op,
++                         proposed_bounds=_box(a.bounds) if a.bounds else None)
++            v = check_all(reg, json.loads(a.task), act, fs_guard=guard)
++            print(json.dumps({"ok": v.ok, "revision": v.revision,
++                              "results": [r.__dict__ for r in v.results]}))
++            return 0 if v.ok else 1
++        if a.cmd in ("add-subnet", "alloc", "release"):
++            reg.save(a.file)
++        return 0
++    except (BusError, OSError, ValueError) as e:
++        print(f"error: {e}", file=sys.stderr)
++        return 2
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/src/cora_sentinel/_vendor/subnetbus/addressing.py b/src/cora_sentinel/_vendor/subnetbus/addressing.py
+new file mode 100644
+index 0000000..5869b17
+--- /dev/null
++++ b/src/cora_sentinel/_vendor/subnetbus/addressing.py
+@@ -0,0 +1,71 @@
++"""Virtual subnets and host allocation. v1 scope: /24 networks inside 10.0.0.0/8."""
++from __future__ import annotations
++
++import ipaddress
++from dataclasses import dataclass
++from functools import cached_property
++from typing import Any, Iterable, Optional
++
++from .errors import RegistryError, show
++from .geometry import AABB
++
++__all__ = ["Subnet", "parse_subnet", "parse_host", "DEFAULT_RESERVED_BELOW"]
++
++_TEN = ipaddress.ip_network("10.0.0.0/8")
++DEFAULT_RESERVED_BELOW = 10   # hosts .1-.9 are reserved for infrastructure
++
++
++def parse_subnet(cidr: Any) -> ipaddress.IPv4Network:
++    if type(cidr) is not str or not cidr.isascii() or len(cidr) > 18:
++        raise RegistryError("BAD_SUBNET", show(cidr))
++    try:
++        n = ipaddress.ip_network(cidr, strict=True)
++    except ValueError:
++        raise RegistryError("BAD_SUBNET", show(cidr)) from None
++    if n.version != 4 or n.prefixlen != 24 or not n.subnet_of(_TEN) or str(n) != cidr:
++        raise RegistryError("BAD_SUBNET", f"{show(cidr)}: need canonical a.b.c.0/24 inside 10.0.0.0/8")
++    return n
++
++
++def parse_host(s: Any) -> ipaddress.IPv4Address:
++    if type(s) is not str or not s.isascii() or len(s) > 15:
++        raise RegistryError("BAD_IP", show(s))
++    try:
++        return ipaddress.IPv4Address(s)       # rejects leading zeros and octets > 255
++    except ValueError:
++        raise RegistryError("BAD_IP", show(s)) from None
++
++
++@dataclass(frozen=True)
++class Subnet:
++    cidr: str
++    label: str = ""
++    reserved_below: int = DEFAULT_RESERVED_BELOW
++    world: Optional[AABB] = None
++
++    def __post_init__(self):
++        parse_subnet(self.cidr)
++        if type(self.reserved_below) is not int or not 1 <= self.reserved_below <= 250:
++            raise RegistryError("BAD_SUBNET", "reserved_below must be an int in 1..250")
++        if type(self.label) is not str or not self.label.isascii() or not self.label.isprintable() or len(self.label) > 64:
++            raise RegistryError("BAD_SUBNET", "label must be printable ASCII, max 64")
++        if self.world is not None and not isinstance(self.world, AABB):
++            raise RegistryError("BAD_SUBNET", "world must be an AABB")
++
++    @cached_property
++    def network(self) -> ipaddress.IPv4Network:
++        return ipaddress.ip_network(self.cidr)
++
++    def usable(self, ip: ipaddress.IPv4Address) -> bool:
++        base = int(self.network.network_address)
++        return (ip in self.network and ip != self.network.broadcast_address
++                and int(ip) - base >= self.reserved_below)
++
++    def next_free(self, used: Iterable[ipaddress.IPv4Address]) -> ipaddress.IPv4Address:
++        taken = set(used)
++        base = int(self.network.network_address)
++        for host in range(self.reserved_below, 255):
++            ip = ipaddress.IPv4Address(base + host)
++            if ip not in taken:
++                return ip
++        raise RegistryError("SUBNET_EXHAUSTED", self.cidr)
+diff --git a/src/cora_sentinel/_vendor/subnetbus/errors.py b/src/cora_sentinel/_vendor/subnetbus/errors.py
+new file mode 100644
+index 0000000..cf83c14
+--- /dev/null
++++ b/src/cora_sentinel/_vendor/subnetbus/errors.py
+@@ -0,0 +1,25 @@
++"""Error types. Every error carries a machine-readable `code`."""
++from __future__ import annotations
++
++from typing import Any
++
++
++def show(v: Any) -> str:
++    """Bounded, ASCII-only rendering of untrusted values for messages and logs."""
++    s = ascii(v)
++    return s if len(s) <= 48 else s[:45] + "..."
++
++
++class BusError(Exception):
++    def __init__(self, code: str, detail: str = ""):
++        super().__init__(f"{code}: {detail}" if detail else code)
++        self.code = code
++        self.detail = detail
++
++
++class RegistryError(BusError):
++    pass
++
++
++class PathError(BusError):
++    pass
+diff --git a/src/cora_sentinel/_vendor/subnetbus/fsguard.py b/src/cora_sentinel/_vendor/subnetbus/fsguard.py
+new file mode 100644
+index 0000000..6865fd3
+--- /dev/null
++++ b/src/cora_sentinel/_vendor/subnetbus/fsguard.py
+@@ -0,0 +1,151 @@
++"""Filesystem guard (GI_3, filesystem half) and lexical path checks (GI_2).
++
++Two layers:
++  lexical_segments(p)  pure string check, no disk access. Used by GI_2.
++  PathGuard.check(p, op)  resolves against a project root and refuses symlinks,
++                          mountpoints, cross-device paths, root escapes, and
++                          project roots that are filesystem roots or system dirs.
++
++The guard is ADVISORY about the instant it ran. The harness must still open files
++with no-follow semantics and re-check the registry revision before committing.
++"""
++from __future__ import annotations
++
++import os
++import re
++from pathlib import Path
++from typing import Iterable, List, Optional
++
++from .errors import PathError, show
++
++__all__ = ["lexical_segments", "PathGuard", "active_mountpoints",
++           "READ_OPS", "WRITE_OPS", "DESTRUCTIVE_OPS"]
++
++READ_OPS = frozenset({"read", "stat", "list"})
++WRITE_OPS = frozenset({"write", "create", "overwrite", "chmod"})
++DESTRUCTIVE_OPS = frozenset({"delete", "rmdir", "move"})
++
++MAX_PATH_CHARS = 1024
++MAX_DEPTH = 32
++_SEGMENT = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,254}", re.ASCII)
++_RESERVED = frozenset({"con", "prn", "aux", "nul"}
++                      | {f"com{i}" for i in range(1, 10)} | {f"lpt{i}" for i in range(1, 10)})
++_SCHEMES = ("res://",)
++
++
++def lexical_segments(p: object) -> List[str]:
++    """Validate a project-relative path and return its segments. Raises PathError."""
++    if type(p) is not str:
++        raise PathError("PATH_TYPE", "path must be str")
++    if not p:
++        raise PathError("PATH_EMPTY")
++    if len(p) > MAX_PATH_CHARS:
++        raise PathError("PATH_TOO_LONG")
++    if not p.isascii():
++        raise PathError("PATH_NON_ASCII", show(p))
++    if not p.isprintable():
++        raise PathError("PATH_CONTROL_CHAR", show(p))
++    for s in _SCHEMES:
++        if p.startswith(s):
++            p = p[len(s):]
++            break
++    if ":" in p:
++        raise PathError("PATH_SCHEME", f"drive letters, URIs and ADS are not allowed: {show(p)}")
++    if "\\" in p:
++        raise PathError("PATH_BACKSLASH", show(p))
++    if p.startswith("/"):
++        raise PathError("PATH_ABSOLUTE", show(p))
++    segs = p.split("/")
++    if len(segs) > MAX_DEPTH:
++        raise PathError("PATH_TOO_DEEP")
++    for seg in segs:
++        if seg == "..":
++            raise PathError("PATH_TRAVERSAL", show(p))
++        if not _SEGMENT.fullmatch(seg) or seg.endswith("."):
++            raise PathError("PATH_SEGMENT", f"bad segment {show(seg)}")
++        if seg.split(".", 1)[0].casefold() in _RESERVED:
++            raise PathError("PATH_RESERVED_NAME", show(seg))
++    return segs
++
++
++def _unescape(s: str) -> str:
++    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), s)
++
++
++def active_mountpoints(mountinfo: str = "/proc/self/mountinfo") -> frozenset:
++    """Mount points of this process (Linux). Empty elsewhere; PathGuard then relies on
++    os.path.ismount and st_dev comparison per component."""
++    try:
++        text = Path(mountinfo).read_text(encoding="utf-8", errors="replace")
++    except OSError:
++        return frozenset()
++    out = set()
++    for line in text.splitlines():
++        parts = line.split(" ")
++        if len(parts) > 4:
++            out.add(_unescape(parts[4]))
++    return frozenset(out)
++
++
++_PROTECTED_EXACT = {"/", "/home", "/root", "/var", "/tmp", "/mnt", "/media", "/opt", "/srv"}
++_PROTECTED_TREES = ("/proc", "/sys", "/dev", "/boot", "/etc", "/bin", "/sbin", "/lib", "/lib64", "/usr")
++
++
++class PathGuard:
++    def __init__(self, root: "str | os.PathLike", *, mountpoints: Optional[Iterable[str]] = None,
++                 allow_symlinks: bool = False):
++        r = Path(root)
++        if not r.is_absolute():
++            raise PathError("ROOT_NOT_ABSOLUTE", show(str(root)))
++        real = Path(os.path.realpath(r))
++        if not real.is_dir():
++            raise PathError("ROOT_MISSING", show(str(real)))
++        if real == Path(real.anchor) or real.parent == real:
++            raise PathError("ROOT_IS_FS_ROOT", show(str(real)))
++        s = str(real)
++        if s in _PROTECTED_EXACT or real == Path.home() \
++                or any(s == t or s.startswith(t + "/") for t in _PROTECTED_TREES):
++            raise PathError("ROOT_PROTECTED", show(s))
++        sysroot = os.environ.get("SystemRoot")
++        if sysroot and (real == Path(sysroot) or Path(sysroot) in real.parents):
++            raise PathError("ROOT_PROTECTED", show(s))
++        self.root = real
++        self.allow_symlinks = allow_symlinks
++        mounts = active_mountpoints() if mountpoints is None else mountpoints
++        self._mounts = frozenset(os.path.realpath(m) for m in mounts)
++        self._root_dev = os.stat(real).st_dev
++
++    def _mount_inside(self, s: str) -> Optional[str]:
++        pre = s.rstrip(os.sep) + os.sep
++        return next((m for m in self._mounts if m.startswith(pre)), None)
++
++    def check(self, rel: object, op: object) -> Path:
++        """Return the resolved path if `op` on `rel` is safe. Raises PathError."""
++        if op not in READ_OPS | WRITE_OPS | DESTRUCTIVE_OPS:
++            raise PathError("UNKNOWN_FS_OP", show(op))
++        cur = self.root
++        for seg in lexical_segments(rel):
++            cur = cur / seg
++            s = str(cur)
++            if s in self._mounts or os.path.ismount(s):
++                raise PathError("MOUNTPOINT", show(s))
++            if os.path.islink(s) and not self.allow_symlinks:
++                raise PathError("SYMLINK", show(s))
++            try:
++                st = os.lstat(s)
++            except FileNotFoundError:
++                continue
++            except OSError as e:
++                raise PathError("FS_ERROR", type(e).__name__) from None
++            if st.st_dev != self._root_dev:
++                raise PathError("CROSS_DEVICE", show(s))
++        real = Path(os.path.realpath(cur))
++        if real == self.root or not real.is_relative_to(self.root):
++            raise PathError("ESCAPES_ROOT", show(str(real)))
++        if op in DESTRUCTIVE_OPS and real.is_dir():
++            inner = self._mount_inside(str(real))
++            if inner:
++                raise PathError("MOUNTPOINT_INSIDE", show(inner))
++        if op in WRITE_OPS and real.is_file() and os.lstat(real).st_nlink > 1:
++            raise PathError("HARDLINKED", show(str(real)))
++        return real
+diff --git a/src/cora_sentinel/_vendor/subnetbus/gates.py b/src/cora_sentinel/_vendor/subnetbus/gates.py
+new file mode 100644
+index 0000000..c65aa77
+--- /dev/null
++++ b/src/cora_sentinel/_vendor/subnetbus/gates.py
+@@ -0,0 +1,152 @@
++"""Gate Invariants. Pure functions: (registry, task, action) -> GateResult. Fail closed.
++
++  GI_1  boundary    target, ref, subnet and every extra ref exist in the registry
++  GI_2  isolation   nothing leaves the declared subnet; paths contain no traversal
++  GI_3  safety      pre-commit AABB overlap guard + filesystem guard
++
++`task` is any mapping with str fields subnet, target, ref (a validated Mule block fits).
++`action` carries facts the HARNESS extracted. Never feed it raw model text.
++"""
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Any, Mapping, Optional, Tuple
++
++from .errors import BusError, PathError, show
++from .fsguard import PathGuard, lexical_segments
++from .geometry import AABB
++from .registry import Registry
++
++__all__ = ["Action", "GateResult", "Verdict", "gi_1", "gi_2", "gi_3", "check_all"]
++
++
++@dataclass(frozen=True)
++class Action:
++    refs: Tuple[str, ...] = ()                 # extra node names / IPs the operation touches
++    paths: Tuple[str, ...] = ()                # project-relative paths the operation touches
++    fs_op: Optional[str] = None                # read/write/delete/... applied to `paths`
++    proposed_bounds: Optional[AABB] = None     # where the target will be after the operation
++
++    def __post_init__(self):
++        object.__setattr__(self, "refs", tuple(self.refs))
++        object.__setattr__(self, "paths", tuple(self.paths))
++        if not all(type(r) is str for r in self.refs) or not all(type(p) is str for p in self.paths):
++            raise TypeError("refs and paths must be strings")
++        if self.proposed_bounds is not None and not isinstance(self.proposed_bounds, AABB):
++            raise TypeError("proposed_bounds must be an AABB")
++
++
++@dataclass(frozen=True)
++class GateResult:
++    """No __bool__ on purpose: `if verdict.failed:` must mean "something failed". Test `.ok`."""
++    gate: str
++    ok: bool
++    code: str = "OK"
++    detail: str = ""
++
++
++@dataclass(frozen=True)
++class Verdict:
++    ok: bool
++    results: Tuple[GateResult, ...]
++    revision: int
++
++    @property
++    def failed(self) -> Optional[GateResult]:
++        return next((r for r in self.results if not r.ok), None)
++
++    def still_valid(self, reg: Registry) -> bool:
++        """TOCTOU check: call right before committing. False if the registry changed."""
++        return self.ok and reg.revision == self.revision
++
++
++def _ok(g: str) -> GateResult:
++    return GateResult(g, True)
++
++
++def _no(g: str, code: str, detail: str = "") -> GateResult:
++    return GateResult(g, False, code, detail)
++
++
++def _fields(task: Any) -> Optional[Tuple[str, str, str]]:
++    if not isinstance(task, Mapping):
++        return None
++    vals = tuple(task.get(k) for k in ("subnet", "target", "ref"))
++    return vals if all(type(v) is str for v in vals) else None
++
++
++def gi_1(reg: Registry, task: Mapping, action: Action = Action()) -> GateResult:
++    f = _fields(task)
++    if f is None:
++        return _no("GI_1", "MALFORMED_TASK", "subnet, target and ref must be strings")
++    subnet, target, ref = f
++    if reg.subnet(subnet) is None:
++        return _no("GI_1", "UNKNOWN_SUBNET", show(subnet))
++    node = reg.get(target)
++    if node is None:
++        return _no("GI_1", "UNKNOWN_TARGET", show(target))
++    if node.ip != ref:
++        return _no("GI_1", "REF_MISMATCH", f"{target} is bound to {node.ip}, task says {show(ref)}")
++    for r in action.refs:
++        if reg.resolve(r) is None:
++            return _no("GI_1", "UNKNOWN_REF", show(r))
++    return _ok("GI_1")
++
++
++def gi_2(reg: Registry, task: Mapping, action: Action = Action()) -> GateResult:
++    f = _fields(task)
++    node = reg.get(f[1]) if f else None
++    if f is None or node is None:
++        return _no("GI_2", "UNRESOLVED_TASK", "run GI_1 first")
++    subnet = f[0]
++    if node.subnet != subnet:
++        return _no("GI_2", "CROSS_SUBNET_TARGET", f"{node.name} lives in {node.subnet}, task says {subnet}")
++    for r in action.refs:
++        other = reg.resolve(r)
++        if other is None:
++            return _no("GI_2", "UNRESOLVED_REF", show(r))
++        if other.subnet != subnet:
++            return _no("GI_2", "CROSS_SUBNET_REF", f"{other.name} lives in {other.subnet}")
++    for p in action.paths:
++        try:
++            lexical_segments(p)
++        except PathError as e:
++            return _no("GI_2", e.code, e.detail)
++    return _ok("GI_2")
++
++
++def gi_3(reg: Registry, task: Mapping, action: Action = Action(), *,
++         fs_guard: Optional[PathGuard] = None) -> GateResult:
++    f = _fields(task)
++    node = reg.get(f[1]) if f else None
++    if f is None or node is None:
++        return _no("GI_3", "UNRESOLVED_TASK", "run GI_1 first")
++    if action.proposed_bounds is not None:
++        problems = reg.placement_problems(node.subnet, action.proposed_bounds,
++                                          ignore=node.name, solid=node.solid)
++        if problems:
++            return _no("GI_3", problems[0][0], problems[0][1])
++    if action.paths:
++        if fs_guard is None:
++            return _no("GI_3", "NO_FS_GUARD", "paths supplied but no PathGuard configured")
++        if action.fs_op is None:
++            return _no("GI_3", "NO_FS_OP", "paths supplied without fs_op")
++        for p in action.paths:
++            try:
++                fs_guard.check(p, action.fs_op)
++            except BusError as e:
++                return _no("GI_3", e.code, e.detail)
++    return _ok("GI_3")
++
++
++def check_all(reg: Registry, task: Mapping, action: Optional[Action] = None, *,
++              fs_guard: Optional[PathGuard] = None, fail_fast: bool = True) -> Verdict:
++    action = action or Action()
++    results = []
++    for gate in (lambda: gi_1(reg, task, action), lambda: gi_2(reg, task, action),
++                 lambda: gi_3(reg, task, action, fs_guard=fs_guard)):
++        r = gate()
++        results.append(r)
++        if not r.ok and fail_fast:
++            break
++    return Verdict(all(r.ok for r in results), tuple(results), reg.revision)
+diff --git a/src/cora_sentinel/_vendor/subnetbus/geometry.py b/src/cora_sentinel/_vendor/subnetbus/geometry.py
+new file mode 100644
+index 0000000..7cf4b14
+--- /dev/null
++++ b/src/cora_sentinel/_vendor/subnetbus/geometry.py
+@@ -0,0 +1,79 @@
++"""2D axis-aligned bounding boxes and the pre-commit overlap guard."""
++from __future__ import annotations
++
++import math
++from dataclasses import dataclass
++from typing import Any, Iterable, List, Mapping, Tuple
++
++from .errors import BusError
++
++__all__ = ["AABB", "find_overlaps", "MAX_COORD", "OVERLAP_TOLERANCE"]
++
++MAX_COORD = 1.0e7
++OVERLAP_TOLERANCE = 1.0e-6   # px. Touching edges are not an overlap.
++
++
++def _num(v: Any, field: str) -> float:
++    if type(v) not in (int, float):          # rejects bool, str, None
++        raise BusError("BAD_BOUNDS", f"{field} must be a number")
++    f = float(v)
++    if not math.isfinite(f) or abs(f) > MAX_COORD:
++        raise BusError("BAD_BOUNDS", f"{field} out of range")
++    return f
++
++
++@dataclass(frozen=True)
++class AABB:
++    x: float
++    y: float
++    w: float
++    h: float
++
++    def __post_init__(self):
++        for f in ("x", "y", "w", "h"):
++            object.__setattr__(self, f, _num(getattr(self, f), f))
++        if self.w <= 0 or self.h <= 0:
++            raise BusError("BAD_BOUNDS", "w and h must be > 0")
++
++    @property
++    def right(self) -> float:
++        return self.x + self.w
++
++    @property
++    def bottom(self) -> float:
++        return self.y + self.h
++
++    def overlap_depth(self, o: "AABB") -> Tuple[float, float]:
++        ox = min(self.right, o.right) - max(self.x, o.x)
++        oy = min(self.bottom, o.bottom) - max(self.y, o.y)
++        return max(ox, 0.0), max(oy, 0.0)
++
++    def intersects(self, o: "AABB", tolerance: float = OVERLAP_TOLERANCE) -> bool:
++        ox, oy = self.overlap_depth(o)
++        return ox > tolerance and oy > tolerance
++
++    def contains(self, o: "AABB", tolerance: float = OVERLAP_TOLERANCE) -> bool:
++        return (o.x >= self.x - tolerance and o.y >= self.y - tolerance
++                and o.right <= self.right + tolerance and o.bottom <= self.bottom + tolerance)
++
++    def to_dict(self) -> dict:
++        return {"x": self.x, "y": self.y, "w": self.w, "h": self.h}
++
++    @classmethod
++    def from_dict(cls, d: Any) -> "AABB":
++        if type(d) is not dict or set(d) != {"x", "y", "w", "h"}:
++            raise BusError("BAD_BOUNDS", "bounds must be an object with exactly x, y, w, h")
++        return cls(d["x"], d["y"], d["w"], d["h"])
++
++
++def find_overlaps(
++    proposed: AABB, others: Iterable[Tuple[str, AABB]], tolerance: float = OVERLAP_TOLERANCE
++) -> List[Tuple[str, float]]:
++    """Return [(name, penetration_depth)] for every box that overlaps `proposed`,
++    deepest first. Depth is the smaller axis overlap (the minimum translation)."""
++    hits = []
++    for name, box in others:
++        ox, oy = proposed.overlap_depth(box)
++        if ox > tolerance and oy > tolerance:
++            hits.append((name, min(ox, oy)))
++    return sorted(hits, key=lambda t: (-t[1], t[0]))
+diff --git a/src/cora_sentinel/_vendor/subnetbus/registry.py b/src/cora_sentinel/_vendor/subnetbus/registry.py
+new file mode 100644
+index 0000000..baca022
+--- /dev/null
++++ b/src/cora_sentinel/_vendor/subnetbus/registry.py
+@@ -0,0 +1,326 @@
++"""State registry: names <-> virtual IPs, with strict load/save and duplicate prevention."""
++from __future__ import annotations
++
++import hashlib
++import ipaddress
++import json
++import os
++import re
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any, Dict, Iterable, List, Optional, Tuple
++
++from .addressing import Subnet, parse_host, parse_subnet
++from .errors import BusError, PathError, RegistryError, show
++from .fsguard import lexical_segments
++from .geometry import AABB, find_overlaps
++
++__all__ = ["Registry", "Node", "NAME_RE", "REGISTRY_VERSION"]
++
++NAME_RE = re.compile(r"%[A-Z][a-zA-Z0-9]{0,63}", re.ASCII)   # same shape as Mule `target`
++KIND_RE = re.compile(r"[a-z][a-z0-9_]{0,31}", re.ASCII)
++REGISTRY_VERSION = "1.0.0"
++MAX_FILE_BYTES = 4 * 1024 * 1024
++MAX_NODES = 20000
++
++
++@dataclass(frozen=True)
++class Node:
++    name: str
++    ip: str
++    subnet: str
++    kind: str = "scene_node"
++    bounds: Optional[AABB] = None
++    solid: bool = True
++    path: Optional[str] = None
++
++    def to_dict(self) -> Dict[str, Any]:
++        d: Dict[str, Any] = {"ip": self.ip, "subnet": self.subnet, "kind": self.kind, "solid": self.solid}
++        if self.bounds is not None:
++            d["bounds"] = self.bounds.to_dict()
++        if self.path is not None:
++            d["path"] = self.path
++        return d
++
++
++def _no_dupes(pairs):
++    out: Dict[str, Any] = {}
++    for k, v in pairs:
++        if k in out:
++            raise RegistryError("DUPLICATE_KEY", show(k))
++        out[k] = v
++    return out
++
++
++def _no_const(name: str):
++    raise RegistryError("BAD_JSON", f"non-finite constant {name}")
++
++
++class Registry:
++    def __init__(self) -> None:
++        self._subnets: Dict[str, Subnet] = {}
++        self._nodes: Dict[str, Node] = {}
++        self._by_ip: Dict[str, str] = {}
++        self._fold: Dict[str, str] = {}
++        self.revision = 0
++
++    # ---- reads ------------------------------------------------------------
++    def subnet(self, cidr: str) -> Optional[Subnet]:
++        return self._subnets.get(cidr) if type(cidr) is str else None
++
++    def subnets(self) -> List[Subnet]:
++        return list(self._subnets.values())
++
++    def get(self, name: str) -> Optional[Node]:
++        return self._nodes.get(name) if type(name) is str else None
++
++    def by_ip(self, ip: str) -> Optional[Node]:
++        n = self._by_ip.get(ip) if type(ip) is str else None
++        return self._nodes[n] if n else None
++
++    def nodes(self, subnet: Optional[str] = None) -> List[Node]:
++        return [n for n in self._nodes.values() if subnet is None or n.subnet == subnet]
++
++    def resolve(self, ref: str) -> Optional[Node]:
++        """Resolve '%Name' or a dotted IP to a node. Unknown or malformed -> None."""
++        if type(ref) is not str:
++            return None
++        if ref.startswith("%"):
++            return self.get(ref)
++        try:
++            return self.by_ip(str(parse_host(ref)))
++        except BusError:
++            return None
++
++    def __len__(self) -> int:
++        return len(self._nodes)
++
++    # ---- geometry ---------------------------------------------------------
++    def placement_problems(self, subnet: str, bounds: AABB, *, ignore: Optional[str] = None,
++                           solid: bool = True) -> List[Tuple[str, str]]:
++        """[(code, detail)] explaining why `bounds` cannot be placed in `subnet`."""
++        sn = self.subnet(subnet)
++        if sn is None:
++            return [("UNKNOWN_SUBNET", show(subnet))]
++        out: List[Tuple[str, str]] = []
++        if sn.world is not None and not sn.world.contains(bounds):
++            out.append(("OUT_OF_WORLD", f"bounds leave the world of {subnet}"))
++        if solid:
++            others = [(n.name, n.bounds) for n in self._nodes.values()
++                      if n.subnet == subnet and n.solid and n.bounds is not None and n.name != ignore]
++            hits = find_overlaps(bounds, others)
++            if hits:
++                shown = ", ".join(f"{n} ({d:.4g}px)" for n, d in hits[:5])
++                out.append(("SOLID_OVERLAP", f"overlaps {len(hits)} solid node(s): {shown}"))
++        return out
++
++    # ---- mutations (all-or-nothing) ---------------------------------------
++    def add_subnet(self, cidr: str, *, label: str = "", reserved_below: int = 10,
++                   world: Optional[AABB] = None) -> Subnet:
++        if cidr in self._subnets:
++            raise RegistryError("DUPLICATE_SUBNET", show(cidr))
++        sn = Subnet(cidr, label, reserved_below, world)
++        self._subnets[cidr] = sn
++        self.revision += 1
++        return sn
++
++    def allocate(self, name: str, subnet: str, *, kind: str = "scene_node", ip: Optional[str] = None,
++                 bounds: Optional[AABB] = None, solid: bool = True, path: Optional[str] = None) -> Node:
++        sn = self.subnet(subnet)
++        if sn is None:
++            raise RegistryError("UNKNOWN_SUBNET", show(subnet))
++        used = {ipaddress.IPv4Address(i) for i, n in self._by_ip.items() if self._nodes[n].subnet == subnet}
++        if ip is None:
++            chosen = sn.next_free(used)
++        else:
++            chosen = parse_host(ip)
++            if not sn.usable(chosen):
++                raise RegistryError("IP_NOT_USABLE", f"{show(ip)} is outside {subnet}, reserved, or broadcast")
++        node = Node(name, str(chosen), subnet, kind, bounds, solid, path)
++        self._check_node(node)
++        if bounds is not None:
++            problems = self.placement_problems(subnet, bounds, solid=solid)
++            if problems:
++                raise RegistryError(problems[0][0], problems[0][1])
++        self._insert(node)
++        self.revision += 1
++        return node
++
++    def release(self, name: str) -> None:
++        node = self._nodes.pop(name, None)
++        if node is None:
++            raise RegistryError("UNKNOWN_NODE", show(name))
++        del self._by_ip[node.ip]
++        del self._fold[node.name.casefold()]
++        self.revision += 1
++
++    def set_bounds(self, name: str, bounds: AABB) -> Node:
++        node = self.get(name)
++        if node is None:
++            raise RegistryError("UNKNOWN_NODE", show(name))
++        problems = self.placement_problems(node.subnet, bounds, ignore=name, solid=node.solid)
++        if problems:
++            raise RegistryError(problems[0][0], problems[0][1])
++        new = Node(node.name, node.ip, node.subnet, node.kind, bounds, node.solid, node.path)
++        self._nodes[name] = new
++        self.revision += 1
++        return new
++
++    # ---- integrity --------------------------------------------------------
++    def _check_node(self, n: Node) -> None:
++        """Field-level and uniqueness checks against current state. Raises RegistryError."""
++        if type(n.name) is not str or not NAME_RE.fullmatch(n.name):
++            raise RegistryError("BAD_NAME", show(n.name))
++        if type(n.kind) is not str or not KIND_RE.fullmatch(n.kind):
++            raise RegistryError("BAD_KIND", show(n.kind))
++        if type(n.solid) is not bool:
++            raise RegistryError("BAD_SOLID", n.name)
++        if n.bounds is not None and not isinstance(n.bounds, AABB):
++            raise RegistryError("BAD_BOUNDS", n.name)
++        sn = self.subnet(n.subnet)
++        if sn is None:
++            raise RegistryError("UNKNOWN_SUBNET", f"{n.name}: {show(n.subnet)}")
++        ip = parse_host(n.ip)
++        if str(ip) != n.ip or not sn.usable(ip):
++            raise RegistryError("IP_NOT_USABLE", f"{n.name}: {show(n.ip)}")
++        if n.path is not None:
++            try:
++                lexical_segments(n.path)
++            except PathError as e:
++                raise RegistryError("BAD_PATH", f"{n.name}: {e.code}") from None
++        if n.name in self._nodes:
++            raise RegistryError("DUPLICATE_NAME", n.name)
++        if n.name.casefold() in self._fold:
++            raise RegistryError("DUPLICATE_NAME", f"{n.name} collides with {self._fold[n.name.casefold()]} (case-insensitive)")
++        if n.ip in self._by_ip:
++            raise RegistryError("DUPLICATE_IP", f"{n.ip} already bound to {self._by_ip[n.ip]}")
++        if len(self._nodes) >= MAX_NODES:
++            raise RegistryError("TOO_MANY_NODES", str(MAX_NODES))
++
++    def _insert(self, n: Node) -> None:
++        self._nodes[n.name] = n
++        self._by_ip[n.ip] = n.name
++        self._fold[n.name.casefold()] = n.name
++
++    def validate(self) -> List[str]:
++        """Full consistency report for a registry that was built or mutated by hand."""
++        errs: List[str] = []
++        probe = Registry()
++        probe._subnets = dict(self._subnets)
++        for n in self._nodes.values():
++            try:
++                probe._check_node(n)
++                probe._insert(n)
++            except BusError as e:
++                errs.append(str(e))
++        for n in self._nodes.values():
++            if n.bounds is not None:
++                for code, detail in self.placement_problems(n.subnet, n.bounds, ignore=n.name, solid=n.solid):
++                    errs.append(f"{code}: {n.name}: {detail}")
++        return errs
++
++    # ---- serialization ----------------------------------------------------
++    def to_dict(self) -> Dict[str, Any]:
++        subs = {}
++        for c, s in self._subnets.items():
++            d: Dict[str, Any] = {"label": s.label, "reserved_below": s.reserved_below}
++            if s.world is not None:
++                d["world"] = s.world.to_dict()
++            subs[c] = d
++        return {"registry_version": REGISTRY_VERSION, "revision": self.revision,
++                "subnets": subs, "nodes": {n: v.to_dict() for n, v in self._nodes.items()}}
++
++    def fingerprint(self) -> str:
++        d = self.to_dict()
++        d.pop("revision")
++        return hashlib.sha256(json.dumps(d, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
++
++    @classmethod
++    def from_dict(cls, d: Any) -> "Registry":
++        errs: List[str] = []
++
++        def bad(msg: str) -> None:
++            errs.append(msg)
++
++        if type(d) is not dict or set(d) != {"registry_version", "revision", "subnets", "nodes"}:
++            raise RegistryError("INVALID_REGISTRY", "top level must have exactly registry_version, revision, subnets, nodes")
++        if type(d["registry_version"]) is not str or d["registry_version"].split(".")[0] != REGISTRY_VERSION.split(".")[0]:
++            raise RegistryError("INVALID_REGISTRY", f"unsupported registry_version {show(d['registry_version'])}")
++        if type(d["revision"]) is not int or d["revision"] < 0:
++            raise RegistryError("INVALID_REGISTRY", "revision must be a non-negative int")
++        if type(d["subnets"]) is not dict or type(d["nodes"]) is not dict:
++            raise RegistryError("INVALID_REGISTRY", "subnets and nodes must be objects")
++        if len(d["nodes"]) > MAX_NODES:
++            raise RegistryError("TOO_MANY_NODES", str(MAX_NODES))
++        reg = cls()
++        for cidr, sd in d["subnets"].items():
++            try:
++                if type(sd) is not dict or not set(sd) <= {"label", "reserved_below", "world"}:
++                    raise RegistryError("BAD_SUBNET", f"{show(cidr)}: unknown or malformed fields")
++                world = AABB.from_dict(sd["world"]) if "world" in sd else None
++                reg._subnets[cidr] = Subnet(cidr, sd.get("label", ""), sd.get("reserved_below", 10), world)
++            except BusError as e:
++                bad(str(e))
++        for name, nd in d["nodes"].items():
++            try:
++                if type(nd) is not dict or not {"ip", "subnet"} <= set(nd) <= {"ip", "subnet", "kind", "bounds", "solid", "path"}:
++                    raise RegistryError("BAD_NODE", f"{show(name)}: unknown or missing fields")
++                node = Node(name, nd["ip"], nd["subnet"], nd.get("kind", "scene_node"),
++                            AABB.from_dict(nd["bounds"]) if "bounds" in nd else None,
++                            nd.get("solid", True), nd.get("path"))
++                reg._check_node(node)
++                reg._insert(node)
++            except BusError as e:
++                bad(str(e))
++        if not errs:
++            errs.extend(reg.validate())
++        if errs:
++            raise RegistryError("INVALID_REGISTRY", "; ".join(errs[:20]))
++        reg.revision = d["revision"]
++        return reg
++
++    @classmethod
++    def loads(cls, text: str) -> "Registry":
++        try:
++            data = json.loads(text, object_pairs_hook=_no_dupes, parse_constant=_no_const)
++        except BusError:
++            raise
++        except (ValueError, RecursionError) as e:
++            raise RegistryError("BAD_JSON", type(e).__name__) from None
++        return cls.from_dict(data)
++
++    @classmethod
++    def load(cls, path: "str | os.PathLike") -> "Registry":
++        p = Path(path)
++        if p.stat().st_size > MAX_FILE_BYTES:
++            raise RegistryError("FILE_TOO_LARGE", str(MAX_FILE_BYTES))
++        try:
++            text = p.read_bytes().decode("utf-8")
++        except UnicodeDecodeError:
++            raise RegistryError("BAD_JSON", "not valid UTF-8") from None
++        return cls.loads(text)
++
++    def save(self, path: "str | os.PathLike") -> None:
++        """Atomic: write temp file, fsync, rename. Refuses to persist an inconsistent registry."""
++        errs = self.validate()
++        if errs:
++            raise RegistryError("INVALID_REGISTRY", "; ".join(errs[:20]))
++        p = Path(path)
++        tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp")
++        try:
++            with open(tmp, "w", encoding="utf-8", newline="\n") as f:
++                f.write(json.dumps(self.to_dict(), indent=2) + "\n")
++                f.flush()
++                os.fsync(f.fileno())
++            os.replace(tmp, p)
++        finally:
++            if tmp.exists():
++                tmp.unlink()
++        try:
++            fd = os.open(p.parent, os.O_RDONLY)
++            try:
++                os.fsync(fd)
++            finally:
++                os.close(fd)
++        except OSError:
++            pass
+diff --git a/src/cora_sentinel/daemon.py b/src/cora_sentinel/daemon.py
+index 6bc660a..d118dd2 100644
+--- a/src/cora_sentinel/daemon.py
++++ b/src/cora_sentinel/daemon.py
+@@ -38,8 +38,8 @@ from cora_sentinel.reload import ListError, Reloader, load_lists
+ from cora_sentinel.cgroup import CgroupRoot
+ 
+ try:
+-    from subnetbus import AABB, Registry
+-except ImportError:  # keeps the file testable on a box without the package
++    from cora_sentinel._vendor.subnetbus import AABB, Registry   # the vendored, pinned copy (cora_sentinel/_vendor)
++except ImportError:  # only if the install itself is damaged: the daemon then refuses to act (see verdict.py)
+     AABB = Registry = None
+ 
+ SCHEMA_EVENT = "cora.sentinel.event/v1"
+@@ -543,7 +543,7 @@ def selftest() -> int:
+     print(json.dumps(events[0], indent=2) if events else "no events")
+     ok = kinds == {"path_violation", "memory_spike", "unauthorized_connection"} and not s.net.by_pid
+     print(f"\nkinds={sorted(kinds)} vips={sorted(vips)} "
+-          f"bus={'subnetbus' if Registry else 'STUB (not installed)'} "
++          f"bus={'subnetbus (vendored)' if Registry else 'STUB (vendored copy missing)'} "
+           f"released={not s.net.by_pid}")
+     print("SELFTEST", "PASS" if ok else "FAIL")
+     return 0 if ok else 1
+@@ -849,6 +849,8 @@ def main() -> int:
+     if has_lists:
+         print("[cora-sentinel] SIGHUP re-reads the blocklists without restarting (kill -HUP <pid>)",
+               file=sys.stderr)
++    from cora_sentinel import _vendor
++    print(f"[cora-sentinel] {_vendor.describe()}", file=sys.stderr)       # the safety gate: where it came from, intact or not
+     print(f"[cora-sentinel] watching '{a.match}' every {a.interval}s -> {a.out}",
+           file=sys.stderr)
+     n = 0
+diff --git a/src/cora_sentinel/demo.py b/src/cora_sentinel/demo.py
+index 0e9b43e..1e41f25 100644
+--- a/src/cora_sentinel/demo.py
++++ b/src/cora_sentinel/demo.py
+@@ -148,7 +148,7 @@ def preflight(a) -> Optional[tuple]:
+     chk(mount, f"cgroup v2 at {mount}", "no cgroup v2 mount found")
+     model = find_model(a.model)
+     chk(model, f"model {model}", "no model: pass --model PATH.gguf (or set CORA_GGUF)")
+-    for mod in ("llama_cpp", "subnetbus"):
++    for mod in ("llama_cpp", "cora_sentinel._vendor.subnetbus"):
+         try:
+             __import__(mod)
+             chk(True, f"python module {mod}", "")
+diff --git a/src/cora_sentinel/selfcheck.py b/src/cora_sentinel/selfcheck.py
+index a33cd62..6590020 100644
+--- a/src/cora_sentinel/selfcheck.py
++++ b/src/cora_sentinel/selfcheck.py
+@@ -73,10 +73,17 @@ def main() -> int:
+     _line("ok" if ok else "FAIL", "python >= 3.10", "" if ok else "this package needs Python 3.10+")
+     required_failed += not ok
+     try:
+-        importlib.import_module("subnetbus")
+-        _line("ok", "subnetbus (engine-telemetry-bus)")
++        importlib.import_module("cora_sentinel._vendor.subnetbus")
++        from cora_sentinel import _vendor
++        problems = _vendor.verify()
++        if problems:
++            _line("FAIL", "the vendored safety gate (subnetbus) was modified", "; ".join(problems[:4])
++                  + ". Reinstall the package, or re-vendor on purpose: tools/vendor_bus.py")
++            required_failed += 1
++        else:
++            _line("ok", _vendor.describe())
+     except ImportError:
+-        _line("FAIL", "subnetbus (engine-telemetry-bus)", "pip install git+https://github.com/nkaralus/engine-telemetry-bus")
++        _line("FAIL", "subnetbus (vendored safety gate)", "the install is damaged: reinstall cora-sentinel")
+         required_failed += 1
+     for mod, what, test in FEATURES:
+         try:
+diff --git a/src/cora_sentinel/verdict.py b/src/cora_sentinel/verdict.py
+index c1cd4e2..35fe069 100644
+--- a/src/cora_sentinel/verdict.py
++++ b/src/cora_sentinel/verdict.py
+@@ -30,7 +30,7 @@ from cora_sentinel.firewall import FirewallError
+ from cora_sentinel.daemon import VirtualNet, read_starttime
+ 
+ try:
+-    from subnetbus import Action, check_all
++    from cora_sentinel._vendor.subnetbus import Action, check_all   # the vendored, pinned copy
+ except ImportError:
+     Action = check_all = None
+ 
+@@ -187,7 +187,7 @@ class Adjudicator:
+     def _gate(self, subj: dict) -> tuple:
+         """Call with net.lock held. Returns (ok, code, detail, verdict_obj)."""
+         if self.net.reg is None or check_all is None:
+-            return False, "NO_BUS", "subnetbus unavailable; refusing to act", None
++            return False, "NO_BUS", "subnetbus unavailable (damaged install); refusing to act", None
+         task = {"subnet": subj["subnet"], "target": subj["name"], "ref": subj["vip"]}
+         v = check_all(self.net.reg, task, Action())
+         if not v.ok:
+diff --git a/tests/test_packaging_deb.py b/tests/test_packaging_deb.py
+new file mode 100644
+index 0000000..e71a012
+--- /dev/null
++++ b/tests/test_packaging_deb.py
+@@ -0,0 +1,434 @@
++"""Wheel, sdist and the native .deb: what is in them, that they are standalone and reproducible, and what the maintainer
++scripts do, run against STUBBED systemctl/nft/cora-floor in a temp dir. Nothing here installs a package, stops a service
++or touches a real floor (the real install/remove/purge is packaging/lifecycle_test.sh, for a disposable machine).
++Run: pytest -q tests/test_packaging_deb.py"""
++import configparser
++import gzip
++import hashlib
++import os
++import re
++import shutil
++import subprocess
++import sys
++import tarfile
++import textwrap
++import zipfile
++from pathlib import Path
++
++import pytest
++
++import cora_sentinel
++from cora_sentinel import _vendor
++
++ROOT = Path(__file__).resolve().parents[1]
++DEB_DIR = ROOT / "packaging" / "debian"
++BUILD = ROOT / "packaging" / "build_deb.sh"
++SCRIPTS = {"cora-sentinel", "cora-run", "cora-demo", "cora-cgroup", "cora-firewall", "cora-floor", "cora-blocklist",
++           "cora-report", "cora-selfcheck"}
++EPOCH = "1800000000"
++
++TOOLS_OK = bool(shutil.which("dpkg-deb") and shutil.which("bash") and (ROOT / "pyproject.toml").exists())
++have_tools = pytest.mark.skipif(not TOOLS_OK, reason="needs dpkg-deb, bash and the source tree")
++
++
++def sh(*cmd, cwd=None, env=None):
++    return subprocess.run(list(cmd), cwd=cwd, env=env, capture_output=True, text=True)
++
++
++# ---------------------------------------------------------------------------------------------------------------
++# artifacts, built once
++# ---------------------------------------------------------------------------------------------------------------
++@pytest.fixture(scope="module")
++def source(tmp_path_factory):
++    """A scratch copy of the files that make the package. Building in the repo itself would write build/ and egg-info into
++    the user's checkout (and fail on a read-only one)."""
++    if not (ROOT / "pyproject.toml").exists():
++        pytest.skip("no source tree here")
++    dst = tmp_path_factory.mktemp("source")
++    skip = shutil.ignore_patterns("__pycache__", "*.pyc", "*.egg-info", "build", "dist")
++    for d in ("src", "deploy", "packaging", "docs", "tools", "tests", "examples", "schema"):
++        if (ROOT / d).is_dir():
++            shutil.copytree(ROOT / d, dst / d, ignore=skip)
++    for f in ("pyproject.toml", "MANIFEST.in", "LICENSE", "README.md", "CHANGELOG.md"):
++        if (ROOT / f).exists():
++            shutil.copy2(ROOT / f, dst / f)
++    return dst
++
++
++@pytest.fixture(scope="module")
++def wheel(source, tmp_path_factory):
++    out = tmp_path_factory.mktemp("wheel")
++    for iso in (["--no-build-isolation"], []):                       # offline when setuptools is installed, else isolated
++        r = sh(sys.executable, "-m", "pip", "wheel", str(source), "--no-deps", "-q", *iso, "-w", str(out))
++        if r.returncode == 0:
++            return next(out.glob("*.whl"))
++    pytest.skip("cannot build a wheel here (no setuptools and no network)")
++
++
++@pytest.fixture(scope="module")
++def sdist(source, tmp_path_factory):
++    out = tmp_path_factory.mktemp("sdist")
++    env = dict(os.environ)
++    if sh(sys.executable, "-c", "import setuptools").returncode:                 # a bare venv: fetch a build backend, like the wheel fixture
++        tool = tmp_path_factory.mktemp("setuptools")
++        if sh(sys.executable, "-m", "pip", "install", "-q", "--target", str(tool), "setuptools>=68").returncode:
++            pytest.skip("setuptools is not available to build an sdist (no network either)")
++        env["PYTHONPATH"] = str(tool)
++    r = sh(sys.executable, "-c", f"from setuptools.build_meta import build_sdist; print(build_sdist({str(out)!r}))", cwd=source, env=env)
++    assert r.returncode == 0, r.stderr[-400:]
++    return out / r.stdout.strip().splitlines()[-1]
++
++
++def build_deb(wheel, out, **env):
++    r = sh("bash", str(BUILD), "--wheel", str(wheel), "--out", str(out), env=dict(os.environ, SOURCE_DATE_EPOCH=EPOCH, **env))
++    assert r.returncode == 0, r.stdout + r.stderr
++    return Path(r.stdout.strip().splitlines()[-1])
++
++
++@pytest.fixture(scope="module")
++def deb(wheel, tmp_path_factory):
++    if not TOOLS_OK:
++        pytest.skip("needs dpkg-deb, bash and the source tree")
++    return build_deb(wheel, tmp_path_factory.mktemp("deb"))
++
++
++@pytest.fixture(scope="module")
++def data(deb, tmp_path_factory):
++    d = tmp_path_factory.mktemp("data")
++    assert sh("dpkg-deb", "-x", str(deb), str(d)).returncode == 0
++    return d
++
++
++@pytest.fixture(scope="module")
++def ctl(deb, tmp_path_factory):
++    d = tmp_path_factory.mktemp("ctl")
++    assert sh("dpkg-deb", "-e", str(deb), str(d)).returncode == 0
++    return d
++
++
++def control(ctl):
++    out, key = {}, None
++    for line in (ctl / "control").read_text().splitlines():
++        if line.startswith(" "):
++            out[key] += "\n" + line
++        else:
++            key, _, v = line.partition(": ")
++            out[key] = v
++    return out
++
++
++# ---------------------------------------------------------------------------------------------------------------
++# wheel and sdist: zero dependencies, the vendored gate and its license travel with them
++# ---------------------------------------------------------------------------------------------------------------
++def test_the_wheel_has_no_runtime_dependencies(wheel):
++    meta = zipfile.ZipFile(wheel).read(next(n for n in zipfile.ZipFile(wheel).namelist() if n.endswith("/METADATA"))).decode()
++    meta = meta.split("\n\n", 1)[0]                                 # the header fields; the README follows as the long description
++    reqs = [l for l in meta.splitlines() if l.startswith("Requires-Dist:")]
++    assert all("extra ==" in r for r in reqs), reqs                  # only the optional model/dev extras
++    assert "Requires-Python: >=3.10" in meta and "git+" not in meta
++
++
++def test_the_wheel_carries_the_vendored_gate_its_license_and_its_lock(wheel):
++    z = zipfile.ZipFile(wheel)
++    names = set(z.namelist())
++    base = "cora_sentinel/_vendor/subnetbus/"
++    assert {base + "LICENSE", base + "VENDOR.lock", base + "gates.py", base + "registry.py", "cora_sentinel/_vendor/__init__.py"} <= names
++    assert any(n.endswith("dist-info/LICENSE") or n.endswith("dist-info/licenses/LICENSE") for n in names)
++    assert z.read(base + "LICENSE").decode().startswith("MIT License")
++    assert z.read(base + "VENDOR.lock") == (_vendor.HERE / "VENDOR.lock").read_bytes()
++    assert not [n for n in names if n.startswith(("tests/", "deploy/", "tools/")) or n.endswith(".pyc")]
++
++
++def test_the_wheel_builds_with_the_toolchain_ubuntu_ships(tmp_path):
++    """setuptools 68 (Ubuntu 24.04) must be able to read pyproject.toml: the license is the table form."""
++    text = (ROOT / "pyproject.toml").read_text()
++    assert 'requires = ["setuptools>=68"]' in text and 'license = { text = "MIT" }' in text
++    assert "license-files" not in text and "dependencies = []" in text
++
++
++def test_the_sdist_is_an_allow_list_and_complete_enough_to_rebuild_the_wheel(sdist, wheel, tmp_path):
++    with tarfile.open(sdist) as tf:
++        names = [n.split("/", 1)[1] for n in tf.getnames() if "/" in n]
++        tf.extractall(tmp_path / "x", filter="data") if hasattr(tarfile, "data_filter") else tf.extractall(tmp_path / "x")
++    must = ["src/cora_sentinel/_vendor/subnetbus/VENDOR.lock", "src/cora_sentinel/_vendor/subnetbus/LICENSE", "LICENSE",
++            "packaging/build_deb.sh", "packaging/debian/postinst", "deploy/cora-sentinel.service", "tools/vendor_bus.py",
++            "tests/test_vendor.py", "docs/packaging.md", "schema/violation.schema.json", "pyproject.toml", "MANIFEST.in"]
++    assert [m for m in must if m not in names] == []
++    assert not [n for n in names if n.endswith((".patch", ".zip", ".pyc")) or n.startswith(("cora-os", "superseded-flat", "models"))]
++    # and it really is enough: build a wheel from the unpacked sdist and get the same file list
++    src = tmp_path / "x" / sdist.name[:-len(".tar.gz")]
++    out = tmp_path / "w"
++    r = sh(sys.executable, "-m", "pip", "wheel", str(src), "--no-deps", "-q", "--no-build-isolation", "-w", str(out))
++    if r.returncode:
++        r = sh(sys.executable, "-m", "pip", "wheel", str(src), "--no-deps", "-q", "-w", str(out))
++    assert r.returncode == 0, r.stderr
++    assert sorted(zipfile.ZipFile(next(out.glob("*.whl"))).namelist()) == sorted(zipfile.ZipFile(wheel).namelist())
++
++
++def test_sdist_normalization_is_deterministic_and_loses_nothing(sdist, tmp_path):
++    import importlib.util
++    spec = importlib.util.spec_from_file_location("normalize_sdist", ROOT / "packaging" / "normalize_sdist.py")
++    mod = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    a, b = tmp_path / "a.tar.gz", tmp_path / "b.tar.gz"
++    shutil.copy(sdist, a)
++    with tarfile.open(sdist) as src, tarfile.open(b, "w:gz") as dst:                 # the same tree, other mtimes and owners
++        for m in src.getmembers():
++            m.mtime, m.uid, m.uname = m.mtime + 12345, 1000, "someone"
++            dst.addfile(m, src.extractfile(m) if m.isfile() else None)
++    mod.normalize(str(a), 1800000000)
++    mod.normalize(str(b), 1800000000)
++    assert a.read_bytes() == b.read_bytes()
++    with tarfile.open(a) as n, tarfile.open(sdist) as o:
++        assert n.getnames() == sorted(o.getnames())
++        assert all(m.mtime == 1800000000 and m.uid == 0 and m.gid == 0 for m in n.getmembers())
++        for m in o.getmembers():
++            if m.isfile():
++                assert n.extractfile(m.name).read() == o.extractfile(m).read(), m.name
++                assert bool(n.getmember(m.name).mode & 0o111) == bool(m.mode & 0o111), m.name        # the exec bit survives
++
++
++# ---------------------------------------------------------------------------------------------------------------
++# the .deb
++# ---------------------------------------------------------------------------------------------------------------
++@have_tools
++def test_control_metadata(ctl):
++    c = control(ctl)
++    assert c["Package"] == "cora-sentinel" and c["Architecture"] == "all" and c["Version"] == f"{cora_sentinel.__version__}-1"
++    assert c["Depends"] == "python3 (>= 3.10), nftables"            # nothing else: the gate is vendored
++    assert c["Recommends"] == "logrotate" and c["Section"] == "admin" and c["Installed-Size"].isdigit()
++    assert re.fullmatch(r".+ <[^@\s]+@[^@\s]+>", c["Maintainer"])
++    assert "NOT start" in c["Description"] and "llama-cpp-python" in c["Description"]
++
++
++@have_tools
++def test_the_maintainer_email_can_be_overridden(wheel, tmp_path):
++    d = build_deb(wheel, tmp_path, DEB_MAINTAINER="Someone Else <else@example.org>")
++    assert "Maintainer: Someone Else <else@example.org>" in sh("dpkg-deb", "-f", str(d)).stdout
++
++
++@have_tools
++def test_conffiles_are_the_config_and_the_logrotate_file_and_nothing_else(ctl, data):
++    listed = (ctl / "conffiles").read_text().split()
++    assert listed == ["/etc/cora-sentinel/cora-sentinel.conf", "/etc/logrotate.d/cora-sentinel"]
++    assert all((data / p.lstrip("/")).is_file() for p in listed)
++    assert sorted(str(p.relative_to(data)) for p in (data / "etc").rglob("*") if p.is_file()) == [l.lstrip("/") for l in listed]
++
++
++@have_tools
++def test_the_binaries_the_unit_and_the_layout(data):
++    ep = configparser.ConfigParser()
++    ep.optionxform = str
++    ep.read(next((data / "usr/lib/python3/dist-packages").glob("*.dist-info")) / "entry_points.txt")
++    assert set(ep["console_scripts"]) == SCRIPTS
++    for name in SCRIPTS:
++        f = data / "usr/bin" / name
++        mod, func = ep["console_scripts"][name].split(":")
++        text = f.read_text()
++        assert os.access(f, os.X_OK) and text.startswith("#!/usr/bin/python3\n") and f"from {mod} import {func}" in text
++    unit = (data / "usr/lib/systemd/system/cora-sentinel.service").read_text()
++    assert "ExecStart=/usr/bin/cora-sentinel $CORA_ARGS" in unit and "ExecStopPost=-/usr/bin/cora-floor rollback" in unit
++    assert "Restart=on-failure" in unit and "@BINDIR@" not in unit
++    assert sorted(p.name for p in data.iterdir()) == ["etc", "usr"]
++
++
++@have_tools
++def test_nothing_that_is_not_the_product_is_in_the_package(data):
++    files = [p.relative_to(data).as_posix() for p in data.rglob("*") if p.is_file()]
++    assert not [f for f in files if "__pycache__" in f or f.endswith((".pyc", ".patch", ".zip", ".sh")) or "/tests/" in f]
++    assert not [f for f in files if f.startswith(("usr/lib/python3/dist-packages/tools", "usr/lib/python3/dist-packages/deploy"))]
++    assert not any(f.endswith("RECORD") for f in files)
++    assert (next((data / "usr/lib/python3/dist-packages").glob("*.dist-info")) / "INSTALLER").read_text().strip() == "dpkg"
++
++
++@have_tools
++def test_every_entry_is_owned_by_root_with_sane_modes(deb):
++    for line in sh("dpkg-deb", "-c", str(deb)).stdout.splitlines():
++        perm, owner, *_ , path = line.split()
++        assert owner == "root/root", line
++        if path.endswith("/"):
++            assert perm == "drwxr-xr-x", line
++        elif path.startswith("./usr/bin/"):
++            assert perm == "-rwxr-xr-x", line
++        else:
++            assert perm == "-rw-r--r--", line
++
++
++@have_tools
++def test_the_packaged_code_is_self_contained_and_its_gate_verifies(data):
++    site = data / "usr/lib/python3/dist-packages"
++    code = "import cora_sentinel, sys; from cora_sentinel import _vendor; print(cora_sentinel.__file__); print(_vendor.verify()); print(_vendor.describe())"
++    r = sh(sys.executable, "-B", "-c", code, cwd="/", env=dict(os.environ, PYTHONPATH=str(site), PYTHONDONTWRITEBYTECODE="1"))
++    assert r.returncode == 0, r.stderr
++    path, problems, desc = r.stdout.strip().splitlines()
++    assert path.startswith(str(site)) and problems == "[]" and desc.endswith("@ ac3f126 verified")
++
++
++@have_tools
++def test_the_copyright_file_credits_both_licenses_and_names_the_vendored_commit(data):
++    c = (data / "usr/share/doc/cora-sentinel/copyright").read_text()
++    assert c.startswith("Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/")
++    assert c.count("License: MIT") >= 3 and "ac3f126946056b3b24eea9dbc15015b5a5639706" in c and "_vendor/subnetbus/*" in c
++    assert "Copyright: 2026 Nick and contributors" in c and "Permission is hereby granted" in c
++    doc = data / "usr/share/doc/cora-sentinel"
++    assert gzip.decompress((doc / "changelog.gz").read_bytes()).decode().startswith("# Changelog")
++    deb_log = gzip.decompress((doc / "changelog.Debian.gz").read_bytes()).decode()          # lintian insists on this format
++    assert re.match(rf"cora-sentinel \({re.escape(cora_sentinel.__version__)}-1\) unstable; urgency=medium\n\n  \* ", deb_log)
++    assert re.search(r"\n -- .+ <[^@\s]+@[^@\s]+>  \w{3}, \d\d \w{3} \d{4} \d\d:\d\d:\d\d \+0000\n$", deb_log)
++    assert "Fri, 15 Jan 2027 08:00:00 +0000" in deb_log                                      # SOURCE_DATE_EPOCH=1800000000
++    assert {"service.md", "packaging.md", "dyn-policy.md", "README.md"} <= {p.name for p in doc.iterdir()}
++
++
++@have_tools
++def test_md5sums_cover_every_file_except_the_conffiles_and_are_right(ctl, data):
++    lines = (ctl / "md5sums").read_text().splitlines()
++    got = {l.split("  ", 1)[1]: l.split("  ", 1)[0] for l in lines}
++    files = {p.relative_to(data).as_posix() for p in data.rglob("*") if p.is_file()} - {"etc/cora-sentinel/cora-sentinel.conf", "etc/logrotate.d/cora-sentinel"}
++    assert set(got) == files
++    assert all(hashlib.md5((data / f).read_bytes()).hexdigest() == h for f, h in got.items())
++
++
++@have_tools
++def test_the_same_wheel_and_epoch_give_the_same_bytes(wheel, deb, tmp_path):
++    again = build_deb(wheel, tmp_path)
++    assert hashlib.sha256(again.read_bytes()).hexdigest() == hashlib.sha256(deb.read_bytes()).hexdigest()
++
++
++# ---------------------------------------------------------------------------------------------------------------
++# the maintainer scripts, against stubs
++# ---------------------------------------------------------------------------------------------------------------
++@pytest.mark.parametrize("name", ["postinst", "prerm", "postrm"])
++def test_the_scripts_are_posix_sh_and_parse(name):
++    p = DEB_DIR / name
++    assert p.read_text().startswith("#!/bin/sh\n") and os.access(p, os.X_OK)
++    assert sh("sh", "-n", str(p)).returncode == 0
++    code = re.sub(r"<<'(\w+)'\n.*?\n\1\n", "", p.read_text(), flags=re.S)             # drop the text it prints (heredocs)
++    code = "\n".join(l for l in code.splitlines() if not l.lstrip().startswith(("#", "echo ")))
++    assert not re.search(r"systemctl\s+(enable|start|restart|reload-or-restart)\b|--now", code), \
++        f"{name} must never enable or start the service"
++    assert name != "postinst" or "try-restart" in code                                    # the only start it may do: an upgrade of a running one
++
++
++class Box:
++    """A scratch root for one script run: stub commands that log their calls, and the script's absolute paths redirected."""
++
++    def __init__(self, tmp, systemd=True, active=False, table=None):
++        self.tmp, self.log = tmp, tmp / "calls.log"
++        self.bin = tmp / "bin"
++        self.bin.mkdir()
++        for sub in ("run/systemd/system" if systemd else "run", "var/lib/cora-sentinel", "var/log/cora-sentinel", "etc/cora-sentinel", "usr/bin"):
++            (tmp / sub).mkdir(parents=True, exist_ok=True)
++        stub = lambda name, body: self._write(self.bin / name, f'#!/bin/sh\necho "{name} $*" >> "{self.log}"\n{body}\n')   # noqa: E731
++        stub("systemctl", 'case "$1" in is-active) [ -n "$STUB_ACTIVE" ] ;; esac')
++        stub("py3compile", "exit 0")
++        stub("py3clean", "exit 0")
++        stub("nft", 'case "$*" in "list table inet cora") '
++                    '[ "$STUB_TABLE" = chains ] && printf "table inet cora {\\n\\tchain egress {\\n\\t}\\n}\\n" && exit 0; '
++                    '[ "$STUB_TABLE" = empty ] && printf "table inet cora {\\n}\\n" && exit 0; exit 1 ;; esac')
++        stub("cora-floor", "exit 0")
++        self.env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", STUB_ACTIVE="1" if active else "", STUB_TABLE=table or "")
++
++    @staticmethod
++    def _write(p, text):
++        p.write_text(text)
++        p.chmod(0o755)
++
++    def run(self, script, *args):
++        text = (DEB_DIR / script).read_text()
++        for real, fake in (("/run/systemd/system", "run/systemd/system"),
++                           ("/var/lib/cora-sentinel", "var/lib/cora-sentinel"), ("/var/log/cora-sentinel", "var/log/cora-sentinel"),
++                           ("/etc/cora-sentinel", "etc/cora-sentinel")):
++            text = text.replace(real, str(self.tmp / fake))
++        s = self.tmp / script
++        self._write(s, text)
++        r = subprocess.run(["sh", str(s), *args], capture_output=True, text=True, env=self.env)
++        calls = self.log.read_text().splitlines() if self.log.exists() else []
++        return r.returncode, r.stdout + r.stderr, calls
++
++
++def test_a_fresh_install_prints_how_to_start_it_and_never_starts_or_enables_it(tmp_path):
++    rc, out, calls = Box(tmp_path).run("postinst", "configure")
++    assert rc == 0 and "NOT started" in out and "cora-floor confirm" in out and "llama-cpp-python" in out
++    assert "py3compile -p cora-sentinel" in calls and "systemctl daemon-reload" in calls
++    assert not [c for c in calls if re.search(r"enable|start|restart|try-restart", c)]
++
++
++def test_an_upgrade_restarts_a_running_service_and_only_a_running_one(tmp_path):
++    rc, out, calls = Box(tmp_path, active=True).run("postinst", "configure", "0.7.0-1")
++    assert rc == 0 and "systemctl try-restart cora-sentinel" in calls and "NOT started" not in out
++    (tmp_path / "again").mkdir()
++    rc, out, calls = Box(tmp_path / "again", active=False).run("postinst", "configure", "0.7.0-1")
++    assert not [c for c in calls if "restart" in c]
++
++
++def test_no_systemd_means_no_systemctl_calls(tmp_path):
++    rc, out, calls = Box(tmp_path, systemd=False, active=True).run("postinst", "configure", "0.7.0-1")
++    assert rc == 0 and not [c for c in calls if c.startswith("systemctl")]
++
++
++def test_remove_stops_the_service_removes_the_floor_and_tidies_an_empty_table(tmp_path):
++    rc, out, calls = Box(tmp_path, table="empty").run("prerm", "remove")
++    assert rc == 0 and "kernel floor removed" in out
++    order = [c for c in calls if c.startswith(("systemctl stop", "systemctl disable", "cora-floor", "nft delete", "py3clean"))]
++    assert order == ["systemctl stop cora-sentinel", "systemctl disable cora-sentinel", "cora-floor remove",
++                     "nft delete table inet cora", "py3clean -p cora-sentinel"]
++
++
++def test_remove_leaves_per_task_isolation_rules_alone_and_says_so(tmp_path):
++    rc, out, calls = Box(tmp_path, table="chains").run("prerm", "remove")
++    assert rc == 0 and "kept on purpose" in out and "cora-firewall purge" in out
++    assert "cora-floor remove" in calls and not [c for c in calls if c.startswith("nft delete")]
++
++
++def test_an_upgrade_never_touches_the_service_or_the_floor(tmp_path):
++    for arg in ("upgrade", "failed-upgrade"):
++        d = tmp_path / arg
++        d.mkdir()
++        rc, out, calls = Box(d, table="chains", active=True).run("prerm", arg, "0.8.0-1")
++        assert rc == 0 and calls == [], (arg, calls)
++
++
++def test_deconfigure_stops_the_service_but_does_not_remove_the_floor(tmp_path):
++    rc, out, calls = Box(tmp_path, table="chains").run("prerm", "deconfigure")
++    assert rc == 0 and "systemctl stop cora-sentinel" in calls and not [c for c in calls if "cora-floor" in c]
++
++
++def test_remove_does_not_need_the_binary_or_nft_to_exist(tmp_path):
++    b = Box(tmp_path)
++    (b.bin / "cora-floor").unlink()
++    (b.bin / "nft").unlink()
++    rc, out, calls = b.run("prerm", "remove")
++    assert rc == 0                                                   # a half-removed package must still remove cleanly
++
++
++def test_remove_keeps_everything_and_purge_cleans_state_but_keeps_the_audit_logs(tmp_path):
++    b = Box(tmp_path)
++    for f in ("var/lib/cora-sentinel/floor.confirmed.json", "var/log/cora-sentinel/decisions.jsonl", "etc/cora-sentinel/extra"):
++        (tmp_path / f).write_text("x")
++    rc, out, calls = b.run("postrm", "remove")
++    assert rc == 0 and (tmp_path / "var/lib/cora-sentinel/floor.confirmed.json").exists() and "systemctl daemon-reload" in calls
++    rc, out, calls = b.run("postrm", "purge")
++    assert rc == 0
++    assert not (tmp_path / "var/lib/cora-sentinel").exists(), "purge must clean the state directory"
++    assert (tmp_path / "var/log/cora-sentinel/decisions.jsonl").read_text() == "x", "purge must KEEP the audit logs"
++    assert (tmp_path / "etc/cora-sentinel/extra").exists()           # a file dpkg does not own is not ours to delete
++    assert "kept the audit logs" in out
++
++
++def test_purge_removes_an_empty_config_directory(tmp_path):
++    b = Box(tmp_path)
++    shutil.rmtree(tmp_path / "var/log/cora-sentinel")
++    rc, out, calls = b.run("postrm", "purge")
++    assert rc == 0 and not (tmp_path / "etc/cora-sentinel").exists() and "kept the audit logs" not in out
++
++
++@pytest.mark.parametrize("script,args", [("postinst", ("bogus",)), ("prerm", ("bogus",)), ("postrm", ("bogus",))])
++def test_an_unknown_argument_is_an_error(tmp_path, script, args):
++    rc, out, calls = Box(tmp_path).run(script, *args)
++    assert rc == 1 and "unknown argument" in out
++
++
++@pytest.mark.parametrize("script,args", [("postrm", ("upgrade", "0.8.0-1")), ("postrm", ("abort-install",)), ("postinst", ("abort-upgrade", "0.7.0-1"))])
++def test_the_other_dpkg_states_do_nothing(tmp_path, script, args):
++    rc, out, calls = Box(tmp_path, table="chains", active=True).run(script, *args)
++    assert rc == 0 and calls == []
+diff --git a/tests/test_vendor.py b/tests/test_vendor.py
+new file mode 100644
+index 0000000..2798251
+--- /dev/null
++++ b/tests/test_vendor.py
+@@ -0,0 +1,222 @@
++"""The vendored safety gate (cora_sentinel/_vendor/subnetbus): it is exactly what VENDOR.lock says, nothing can swap it
++quietly, the importers always use it, and tools/vendor_bus.py is the only way to change it.
++Run: pytest -q tests/test_vendor.py   (CORA_TEST_NETWORK=1 also compares the lock with GitHub)"""
++import json
++import os
++import re
++import shutil
++import subprocess
++import sys
++import textwrap
++from pathlib import Path
++
++import pytest
++
++from cora_sentinel import _vendor
++
++ROOT = Path(__file__).resolve().parents[1]
++TOOL = ROOT / "tools" / "vendor_bus.py"
++PINNED = "ac3f126946056b3b24eea9dbc15015b5a5639706"      # the commit that was confirmed and that the suite was run against
++git_needed = pytest.mark.skipif(not shutil.which("git"), reason="needs git")
++
++
++# ================= the shipped copy =================
++def test_the_vendored_copy_is_exactly_what_the_lock_says():
++    assert _vendor.verify() == []
++    assert _vendor.describe().endswith("verified")
++
++
++def test_the_lock_pins_the_confirmed_commit_and_covers_every_file():
++    lock = _vendor.read_lock()
++    assert lock["commit"] == PINNED, "re-vendoring to another commit must be a deliberate change to this test too"
++    assert re.fullmatch(r"[0-9a-f]{40}", lock["commit"])
++    assert (lock["schema"], lock["name"], lock["distribution"], lock["license"]) == (1, "subnetbus", "engine-telemetry-bus", "MIT")
++    assert lock["upstream"] == "https://github.com/nkaralus/engine-telemetry-bus" and lock["version"] == "0.1.0"
++    on_disk = {p.name for p in _vendor.HERE.iterdir() if p.is_file()} - {_vendor.LOCK_NAME}
++    assert set(lock["files"]) == on_disk and "LICENSE" in on_disk and "gates.py" in on_disk
++    assert all(re.fullmatch(r"[0-9a-f]{64}", h) for h in lock["files"].values())
++
++
++def test_the_bus_license_notice_is_present():
++    text = (_vendor.HERE / "LICENSE").read_text()
++    assert "MIT License" in text and "Copyright" in text
++
++
++def test_the_api_the_daemon_relies_on_is_there():
++    from cora_sentinel._vendor import subnetbus as bus
++    for name in ("AABB", "Registry", "Action", "check_all", "GateResult", "Verdict", "PathGuard"):
++        assert hasattr(bus, name), name
++    assert callable(bus.check_all)
++
++
++# ================= verify() notices tampering =================
++@pytest.fixture
++def copy(tmp_path):
++    d = tmp_path / "subnetbus"
++    shutil.copytree(_vendor.HERE, d, ignore=shutil.ignore_patterns("__pycache__"))
++    return d
++
++
++def test_verify_detects_a_modified_a_missing_and_an_unexpected_file(copy):
++    assert _vendor.verify(copy) == []
++    (copy / "gates.py").write_text((copy / "gates.py").read_text() + "\n# loosened\n")
++    (copy / "geometry.py").unlink()
++    (copy / "sneaky.py").write_text("x = 1\n")
++    problems = _vendor.verify(copy)
++    assert "modified: gates.py" in problems and "missing: geometry.py" in problems and "unexpected file: sneaky.py" in problems
++    assert _vendor.describe(copy).split("MODIFIED")[0].endswith("@ ac3f126 ") and "MODIFIED" in _vendor.describe(copy)
++
++
++def test_bytecode_caches_are_not_drift_but_a_broken_lock_is(copy):
++    (copy / "__pycache__").mkdir()
++    (copy / "__pycache__" / "gates.cpython-312.pyc").write_bytes(b"\0")
++    assert _vendor.verify(copy) == []
++    (copy / _vendor.LOCK_NAME).write_text("{not json")
++    assert _vendor.verify(copy)[0].startswith("VENDOR.lock unreadable")
++    (copy / _vendor.LOCK_NAME).unlink()
++    assert _vendor.verify(copy)[0].startswith("VENDOR.lock unreadable") and "NO LOCK FILE" in _vendor.describe(copy)
++
++
++def test_selfcheck_fails_loudly_when_the_gate_is_modified(monkeypatch, capsys):
++    from cora_sentinel import selfcheck
++    monkeypatch.setattr(_vendor, "verify", lambda root=None: ["modified: gates.py"])
++    rc = selfcheck.main()
++    out = capsys.readouterr().out
++    assert rc != 0 and "was modified" in out and "gates.py" in out
++
++
++# ================= the importers use the vendored copy, whatever else is installed =================
++def test_a_different_subnetbus_on_the_path_is_ignored(tmp_path):
++    fake = tmp_path / "fake" / "subnetbus"
++    fake.mkdir(parents=True)
++    (fake / "__init__.py").write_text("class Registry: FAKE = True\nclass AABB: FAKE = True\nclass Action: FAKE = True\n"
++                                      "def check_all(*a, **k): raise SystemExit('the fake gate was used')\n")
++    code = ("import sys; from cora_sentinel import daemon, verdict; "
++            "print(daemon.Registry.__module__, verdict.check_all.__module__, 'subnetbus' in sys.modules)")
++    env = dict(os.environ, PYTHONPATH=os.pathsep.join([str(tmp_path / "fake")] + [p for p in sys.path if p]))
++    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env)
++    assert r.returncode == 0, r.stderr
++    reg, gate, shadow = r.stdout.split()
++    assert reg.startswith("cora_sentinel._vendor.subnetbus") and gate.startswith("cora_sentinel._vendor.subnetbus") and shadow == "False"
++
++
++def test_nothing_imports_the_bus_by_its_old_name():
++    bad = re.compile(r"^\s*(from|import) subnetbus\b", re.M)
++    src = ROOT / "src" / "cora_sentinel"
++    offenders = [str(p.relative_to(ROOT)) for p in src.rglob("*.py") if "_vendor" not in p.parts and bad.search(p.read_text())]
++    assert offenders == []
++
++
++# ================= tools/vendor_bus.py =================
++def run_tool(*args):
++    return subprocess.run([sys.executable, str(TOOL), *args], capture_output=True, text=True)
++
++
++def sh(*cmd, cwd):
++    return subprocess.run(cmd, cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
++
++
++@pytest.fixture
++def upstream(tmp_path):
++    """A tiny stand-in for the bus repo: the same layout (subnetbus/, tests/, LICENSE), two commits."""
++    repo = tmp_path / "upstream"
++    (repo / "subnetbus").mkdir(parents=True)
++    (repo / "tests").mkdir()
++    (repo / "subnetbus" / "__init__.py").write_text('__version__ = "9.9.9"\nfrom .core import VALUE\n')
++    (repo / "subnetbus" / "core.py").write_text("VALUE = 1\n")
++    (repo / "LICENSE").write_text("MIT License\n\nCopyright (c) 2026 Somebody\n")
++    (repo / "tests" / "test_core.py").write_text("from subnetbus import VALUE\n\ndef test_value():\n    assert VALUE == 1\n")
++    sh("git", "init", "-q", "-b", "main", cwd=repo)
++    sh("git", "-c", "user.name=t", "-c", "user.email=t@t", "add", ".", cwd=repo)
++    sh("git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "one", cwd=repo)
++    (tmp_path / "first.sha").write_text(sh("git", "rev-parse", "HEAD", cwd=repo))
++    return repo
++
++
++def first_sha(upstream):
++    return (upstream.parent / "first.sha").read_text()
++
++
++@git_needed
++def test_update_vendors_exactly_a_commit_and_writes_a_complete_lock(upstream, tmp_path):
++    vend = tmp_path / "vend"
++    r = run_tool("--root", str(vend), "update", "--commit", first_sha(upstream), "--src", str(upstream), "--run-upstream-tests")
++    assert r.returncode == 0, r.stdout + r.stderr
++    assert "upstream tests: 1 passed" in r.stdout
++    lock = json.loads((vend / "VENDOR.lock").read_text())
++    assert lock["commit"] == first_sha(upstream) and lock["version"] == "9.9.9" and lock["distribution"] == "engine-telemetry-bus"
++    assert sorted(lock["files"]) == ["LICENSE", "__init__.py", "core.py"]
++    assert not (vend / "tests").exists() and (vend / "LICENSE").read_text().startswith("MIT License")
++    assert run_tool("--root", str(vend), "check").returncode == 0
++    assert run_tool("--root", str(vend), "check-upstream", "--src", str(upstream)).returncode == 0
++
++
++@git_needed
++def test_check_fails_on_drift_and_says_how_to_fix_it(upstream, tmp_path):
++    vend = tmp_path / "vend"
++    run_tool("--root", str(vend), "update", "--commit", first_sha(upstream), "--src", str(upstream))
++    (vend / "core.py").write_text("VALUE = 2\n")
++    r = run_tool("--root", str(vend), "check")
++    assert r.returncode == 1 and "modified: core.py" in r.stdout and "git checkout" in r.stdout
++
++
++@git_needed
++def test_a_dirty_working_tree_cannot_leak_into_the_vendored_copy(upstream, tmp_path):
++    (upstream / "subnetbus" / "core.py").write_text("VALUE = 1  # uncommitted\nBACKDOOR = True\n")
++    (upstream / "subnetbus" / "untracked.py").write_text("x = 1\n")
++    vend = tmp_path / "vend"
++    assert run_tool("--root", str(vend), "update", "--commit", first_sha(upstream), "--src", str(upstream)).returncode == 0
++    assert (vend / "core.py").read_text() == "VALUE = 1\n" and not (vend / "untracked.py").exists()
++
++
++@git_needed
++@pytest.mark.parametrize("ref", ["main", "HEAD", "v1.0", "abc", "zzzzzzz", "deadbeefdeadbeef"])
++def test_only_a_real_hex_commit_is_accepted(upstream, tmp_path, ref):
++    vend = tmp_path / "vend"
++    r = run_tool("--root", str(vend), "update", "--commit", ref, "--src", str(upstream))
++    assert r.returncode == 2 and not vend.exists()
++
++
++@git_needed
++def test_failing_upstream_tests_stop_the_update_and_leave_the_old_copy_alone(upstream, tmp_path):
++    vend = tmp_path / "vend"
++    run_tool("--root", str(vend), "update", "--commit", first_sha(upstream), "--src", str(upstream))
++    before = {p.name: p.read_bytes() for p in vend.iterdir()}
++    (upstream / "subnetbus" / "core.py").write_text("VALUE = 2\n")                 # breaks the upstream test (VALUE == 1)
++    sh("git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "break", cwd=upstream)
++    second = sh("git", "rev-parse", "HEAD", cwd=upstream)
++    r = run_tool("--root", str(vend), "update", "--commit", second, "--src", str(upstream), "--run-upstream-tests")
++    assert r.returncode == 2 and "own tests fail" in r.stderr
++    assert {p.name: p.read_bytes() for p in vend.iterdir()} == before
++
++
++@git_needed
++def test_update_replaces_the_tree_and_drops_files_upstream_removed(upstream, tmp_path):
++    vend = tmp_path / "vend"
++    run_tool("--root", str(vend), "update", "--commit", first_sha(upstream), "--src", str(upstream))
++    (upstream / "subnetbus" / "core.py").unlink()
++    (upstream / "subnetbus" / "__init__.py").write_text('__version__ = "10.0.0"\n')
++    sh("git", "-c", "user.name=t", "-c", "user.email=t@t", "add", "-A", cwd=upstream)
++    sh("git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "two", cwd=upstream)
++    second = sh("git", "rev-parse", "HEAD", cwd=upstream)
++    assert run_tool("--root", str(vend), "update", "--commit", second, "--src", str(upstream)).returncode == 0
++    assert sorted(p.name for p in vend.iterdir()) == ["LICENSE", "VENDOR.lock", "__init__.py"]
++    assert json.loads((vend / "VENDOR.lock").read_text())["version"] == "10.0.0"
++
++
++@git_needed
++def test_check_upstream_catches_a_lock_that_disagrees_with_upstream(upstream, tmp_path):
++    vend = tmp_path / "vend"
++    run_tool("--root", str(vend), "update", "--commit", first_sha(upstream), "--src", str(upstream))
++    lock = json.loads((vend / "VENDOR.lock").read_text())
++    lock["files"]["core.py"] = "0" * 64
++    (vend / "VENDOR.lock").write_text(json.dumps(lock))
++    r = run_tool("--root", str(vend), "check-upstream", "--src", str(upstream))
++    assert r.returncode == 1 and "core.py: differs from upstream" in r.stdout
++
++
++@git_needed
++@pytest.mark.skipif(not os.environ.get("CORA_TEST_NETWORK"), reason="set CORA_TEST_NETWORK=1 to compare with GitHub")
++def test_the_lock_matches_the_real_upstream_commit():
++    r = run_tool("check-upstream")
++    assert r.returncode == 0, r.stdout + r.stderr
+diff --git a/tools/vendor_bus.py b/tools/vendor_bus.py
+new file mode 100755
+index 0000000..d4fce18
+--- /dev/null
++++ b/tools/vendor_bus.py
+@@ -0,0 +1,171 @@
++#!/usr/bin/env python3
++"""
++vendor_bus - the ONLY thing that rewrites src/cora_sentinel/_vendor/subnetbus.
++
++That directory is a verbatim copy of github.com/nkaralus/engine-telemetry-bus at one pinned commit (the bus is the safety
++gate the verdict code asks before it acts, so the copy that ships must be the copy the tests ran against). VENDOR.lock
++records the upstream URL, the full commit and the sha256 of every file.
++
++  python tools/vendor_bus.py check                       verify the vendored files against VENDOR.lock (offline)
++  python tools/vendor_bus.py update --commit SHA         re-vendor from upstream at exactly that commit
++        [--src PATH | --url URL] [--run-upstream-tests]
++  python tools/vendor_bus.py check-upstream              fetch the pinned commit and compare it with what is vendored
++        [--src PATH | --url URL]
++
++`update` exports the commit with `git archive` (so a dirty working tree in --src cannot leak in), refuses a short or
++unknown ref, optionally runs the bus's own test-suite first, and only then replaces the tree. A moving branch is never
++vendored: you must name a commit, and the lock keeps the full 40-character hash.
++
++Exit status: 0 ok, 1 drift or mismatch, 2 could not do it (bad arguments, git or tests failed).
++Stdlib only. `--root DIR` points the tool at another tree (the tests do this).
++"""
++from __future__ import annotations
++
++import argparse
++import io
++import json
++import re
++import shutil
++import subprocess
++import sys
++import tarfile
++import tempfile
++from pathlib import Path
++
++REPO = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(REPO / "src"))
++from cora_sentinel import _vendor  # noqa: E402
++
++DEFAULT_ROOT = REPO / "src" / "cora_sentinel" / "_vendor" / "subnetbus"
++DEFAULT_URL = "https://github.com/nkaralus/engine-telemetry-bus"
++SHA_RE = re.compile(r"[0-9a-f]{7,40}")
++
++
++class ToolError(Exception):
++    pass
++
++
++def git(*args: str, cwd=None, binary: bool = False):
++    r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=not binary)
++    if r.returncode:
++        raise ToolError(f"git {' '.join(args[:2])} failed: {(r.stderr if not binary else r.stderr.decode()).strip()[:300]}")
++    return r.stdout
++
++
++def export_commit(commit: str, src: str | None, url: str | None, paths=("subnetbus", "LICENSE"),
++                  optional=()) -> tuple[Path, str, tempfile.TemporaryDirectory]:
++    """Check `commit` out of upstream into a temp dir WITHOUT touching a working tree. `paths` must exist at the commit;
++    `optional` ones are taken if they do. Returns (dir, full_sha, handle)."""
++    if not SHA_RE.fullmatch(commit):
++        raise ToolError(f"--commit must be a hex commit hash (7-40 chars), not {commit!r}: a branch or tag can move")
++    tmp = tempfile.TemporaryDirectory(prefix="vendorbus")
++    repo = src
++    if not repo:
++        repo = str(Path(tmp.name) / "clone")
++        git("clone", "--quiet", "--no-checkout", url or DEFAULT_URL, repo)
++    full = git("rev-parse", "--verify", f"{commit}^{{commit}}", cwd=repo).strip()
++    if not full.startswith(commit):
++        raise ToolError(f"{commit} resolved to {full}")
++    top = set(git("ls-tree", "--name-only", full, cwd=repo).split("\n"))
++    data = git("archive", "--format=tar", full, *paths, *[o for o in optional if o in top], cwd=repo, binary=True)
++    out = Path(tmp.name) / "export"
++    out.mkdir()
++    with tarfile.open(fileobj=io.BytesIO(data)) as tf:
++        tf.extractall(out, filter="data") if hasattr(tarfile, "data_filter") else tf.extractall(out)
++    return out, full, tmp
++
++
++def tree_hashes(d: Path) -> dict:
++    files = {p.relative_to(d).as_posix(): _vendor.sha256_file(p) for p in sorted(d.glob("*.py"))}
++    if (d / "LICENSE").is_file():
++        files["LICENSE"] = _vendor.sha256_file(d / "LICENSE")
++    return files
++
++
++def cmd_check(a) -> int:
++    root = Path(a.root)
++    problems = _vendor.verify(root)
++    if problems:
++        print(f"DRIFT in {root}:")
++        for p in problems:
++            print(f"  {p}")
++        print("The vendored copy is not what VENDOR.lock says. Restore it (git checkout) or re-vendor on purpose "
++              "(tools/vendor_bus.py update --commit SHA).")
++        return 1
++    lock = _vendor.read_lock(root)
++    print(f"ok: {len(lock['files'])} files match VENDOR.lock ({lock['distribution']} {lock['version']} @ {lock['commit']})")
++    return 0
++
++
++def cmd_update(a) -> int:
++    root = Path(a.root)
++    out, full, tmp = export_commit(a.commit, a.src, a.url, optional=("tests", "pyproject.toml") if a.run_upstream_tests else ())
++    with tmp:
++        up = out / "subnetbus"
++        if not up.is_dir() or not (out / "LICENSE").is_file():
++            raise ToolError(f"{full} has no subnetbus/ package and LICENSE at its top level")
++        if a.run_upstream_tests:
++            r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"], cwd=out,
++                               capture_output=True, text=True, env={"PYTHONPATH": str(out), "PATH": "/usr/bin:/bin"})
++            print("upstream tests:", (r.stdout.strip().splitlines() or ["(no output)"])[-1])
++            if r.returncode:
++                raise ToolError("the bus's own tests fail at that commit; not vendoring it")
++        ver = re.search(r'__version__\s*=\s*"([^"]+)"', (up / "__init__.py").read_text())
++        stage = Path(tmp.name) / "stage"
++        stage.mkdir()
++        for p in sorted(up.glob("*.py")):
++            shutil.copy2(p, stage / p.name)
++        shutil.copy2(out / "LICENSE", stage / "LICENSE")
++        files = tree_hashes(stage)
++        lock = {"schema": 1, "name": "subnetbus", "distribution": "engine-telemetry-bus", "upstream": a.url or DEFAULT_URL,
++                "commit": full, "version": ver.group(1) if ver else "unknown", "license": "MIT", "files": files}
++        root.mkdir(parents=True, exist_ok=True)
++        for old in list(root.iterdir()):
++            if old.is_file():
++                old.unlink()
++        for p in stage.iterdir():
++            shutil.copy2(p, root / p.name)
++        (root / _vendor.LOCK_NAME).write_text(json.dumps(lock, indent=2, sort_keys=True) + "\n")
++    print(f"vendored {len(files)} files from {lock['upstream']} @ {full} (version {lock['version']}) into {root}")
++    return cmd_check(a)
++
++
++def cmd_check_upstream(a) -> int:
++    root = Path(a.root)
++    lock = _vendor.read_lock(root)
++    out, full, tmp = export_commit(lock["commit"], a.src, a.url or lock.get("upstream"))
++    with tmp:
++        up = tree_hashes(out / "subnetbus")
++        up["LICENSE"] = _vendor.sha256_file(out / "LICENSE")
++    bad = [f"{k}: {'missing upstream' if k not in up else 'differs from upstream'}" for k, v in lock["files"].items() if up.get(k) != v]
++    bad += [f"{k}: upstream has it, the lock does not" for k in up if k not in lock["files"]]
++    if bad:
++        print(f"the lock does not match upstream @ {full}:")
++        print("\n".join(f"  {b}" for b in bad))
++        return 1
++    print(f"ok: the lock matches upstream @ {full} ({len(up)} files)")
++    return 0
++
++
++def main(argv=None) -> int:
++    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("--root", default=str(DEFAULT_ROOT), help="the vendored directory (default: the repo's)")
++    sub = ap.add_subparsers(dest="cmd", required=True)
++    sub.add_parser("check")
++    for name in ("update", "check-upstream"):
++        p = sub.add_parser(name)
++        p.add_argument("--src", help="a local clone of the upstream repo (default: clone --url)")
++        p.add_argument("--url", help=f"upstream URL (default {DEFAULT_URL})")
++        if name == "update":
++            p.add_argument("--commit", required=True, help="the upstream commit to vendor (hex, not a branch or tag)")
++            p.add_argument("--run-upstream-tests", action="store_true", help="run the bus's own tests at that commit first")
++    a = ap.parse_args(argv)
++    try:
++        return {"check": cmd_check, "update": cmd_update, "check-upstream": cmd_check_upstream}[a.cmd](a)
++    except ToolError as e:
++        print(f"error: {e}", file=sys.stderr)
++        return 2
++
++
++if __name__ == "__main__":
++    sys.exit(main())

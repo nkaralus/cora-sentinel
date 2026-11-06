@@ -1,0 +1,20 @@
+{
+  "commit": "ac3f126946056b3b24eea9dbc15015b5a5639706",
+  "distribution": "engine-telemetry-bus",
+  "files": {
+    "LICENSE": "62541b2d5ef7dd900f5963f70bc51f482d9ea03dc126ca50604aec13ac6617b3",
+    "__init__.py": "b7c6fa0e6e6fd19d7b5e12ddd8bf2a46fac73ffac0002d04825cd070fded69d5",
+    "__main__.py": "aba8abd54676c8a8350f5903793025e28da521c0d0dc16f9712ebf8fc13a1e3f",
+    "addressing.py": "3a517caf0b172388370e36b14da5e67687d6a89d9ce89b9420231f5f489904d7",
+    "errors.py": "52755599dcc2a0840b8e4bfd98ccf6a8d1043beff34201a8ef4b4a17b5dbc608",
+    "fsguard.py": "6cd6dfea158a296ebf1673ba8a8e7d388a1caba41be04751b38e572371ad6b42",
+    "gates.py": "1341c3f55994545386d1c0460cb1517da45db7f37bdbb412128841c1dfefad37",
+    "geometry.py": "ea9d5aebec6e5690db0bc18eafa835869d586838b1e172c8774c8f8c6acee91c",
+    "registry.py": "efe454a0b1422a096493532e33907e8919c3a4a96ff72f51068cc9f76ad9bba3"
+  },
+  "license": "MIT",
+  "name": "subnetbus",
+  "schema": 1,
+  "upstream": "https://github.com/nkaralus/engine-telemetry-bus",
+  "version": "0.1.0"
+}

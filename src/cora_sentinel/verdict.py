@@ -30,7 +30,7 @@ from cora_sentinel.firewall import FirewallError
 from cora_sentinel.daemon import VirtualNet, read_starttime
 
 try:
-    from subnetbus import Action, check_all
+    from cora_sentinel._vendor.subnetbus import Action, check_all   # the vendored, pinned copy
 except ImportError:
     Action = check_all = None
 
@@ -187,7 +187,7 @@ class Adjudicator:
     def _gate(self, subj: dict) -> tuple:
         """Call with net.lock held. Returns (ok, code, detail, verdict_obj)."""
         if self.net.reg is None or check_all is None:
-            return False, "NO_BUS", "subnetbus unavailable; refusing to act", None
+            return False, "NO_BUS", "subnetbus unavailable (damaged install); refusing to act", None
         task = {"subnet": subj["subnet"], "target": subj["name"], "ref": subj["vip"]}
         v = check_all(self.net.reg, task, Action())
         if not v.ok:

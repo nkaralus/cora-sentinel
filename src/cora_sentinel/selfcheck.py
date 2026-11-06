@@ -73,10 +73,17 @@ def main() -> int:
     _line("ok" if ok else "FAIL", "python >= 3.10", "" if ok else "this package needs Python 3.10+")
     required_failed += not ok
     try:
-        importlib.import_module("subnetbus")
-        _line("ok", "subnetbus (engine-telemetry-bus)")
+        importlib.import_module("cora_sentinel._vendor.subnetbus")
+        from cora_sentinel import _vendor
+        problems = _vendor.verify()
+        if problems:
+            _line("FAIL", "the vendored safety gate (subnetbus) was modified", "; ".join(problems[:4])
+                  + ". Reinstall the package, or re-vendor on purpose: tools/vendor_bus.py")
+            required_failed += 1
+        else:
+            _line("ok", _vendor.describe())
     except ImportError:
-        _line("FAIL", "subnetbus (engine-telemetry-bus)", "pip install git+https://github.com/nkaralus/engine-telemetry-bus")
+        _line("FAIL", "subnetbus (vendored safety gate)", "the install is damaged: reinstall cora-sentinel")
         required_failed += 1
     for mod, what, test in FEATURES:
         try:

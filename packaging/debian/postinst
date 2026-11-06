@@ -1,0 +1,38 @@
+#!/bin/sh
+# postinst for cora-sentinel
+set -e
+
+case "$1" in
+    configure)
+        if command -v py3compile >/dev/null 2>&1; then
+            py3compile -p cora-sentinel || true
+        fi
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload || true
+            # An UPGRADE of a running service restarts onto the new code (a confirmed floor survives it, and an unchanged
+            # allow set asks for no new confirmation). A fresh install is NEVER enabled or started here: the kernel floor
+            # this daemon can install is host-wide, so the first start is the operator's decision.
+            if [ -n "$2" ] && systemctl is-active --quiet cora-sentinel; then
+                systemctl try-restart cora-sentinel || true
+            fi
+        fi
+        if [ -z "$2" ]; then
+            cat <<'MSG'
+cora-sentinel is installed but NOT started (its kernel floor is host-wide, so the first start is yours to make):
+  1. edit /etc/cora-sentinel/cora-sentinel.conf        (add --model ... and your blocklists)
+  2. systemctl enable --now cora-sentinel
+  3. cora-floor confirm                                 (within the --floor-confirm window, the first time)
+Read /usr/share/doc/cora-sentinel/service.md and packaging.md first. Running a local model needs llama-cpp-python,
+which this package does not bring: see packaging.md ("The model").
+MSG
+        fi
+        ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+    *)
+        echo "postinst called with unknown argument '$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.8.0
+
+### Added
+- **The safety gate is vendored.** `engine-telemetry-bus` (module `subnetbus`: the GI_1-GI_3 gates and the registry) is
+  copied verbatim, pinned to commit `ac3f126946056b3b24eea9dbc15015b5a5639706` (bus version 0.1.0), into
+  `src/cora_sentinel/_vendor/subnetbus`. cora-sentinel now has **no runtime dependencies**: a wheel installs offline, and the
+  code that ships is the code the tests ran against (the full suite is unchanged: 657 passed in a clean venv with no
+  `subnetbus` installed).
+  - `_vendor/subnetbus/VENDOR.lock`: upstream URL, full commit, sha256 of every file (license included).
+  - The vendored copy always wins over any `subnetbus` on the path (tested). `cora-selfcheck` FAILS if a vendored file was
+    modified, added or removed; the daemon prints `vendored subnetbus 0.1.0 @ ac3f126 verified` (or `MODIFIED`) at start.
+  - `tools/vendor_bus.py check | update --commit SHA [--run-upstream-tests] | check-upstream`: the only way to change it. It
+    exports the commit with `git archive` (a dirty working tree cannot leak in), refuses a branch, tag or short unknown ref,
+    runs the bus's own tests first, and leaves the old copy alone if they fail. Re-vendoring reproduces the committed tree
+    byte for byte.
+  - `tests/test_vendor.py` (22): the copy matches the lock, the lock pins the confirmed commit, tampering is detected, a
+    shadowing `subnetbus` is ignored, nothing imports the old name, and the update tool against a fixture upstream repo.
+- **Build and packaging.** `pyproject.toml` asks for `setuptools>=68` with the table-form license, so Ubuntu 24.04's own
+  setuptools (68.1.2) can build it (the previous `setuptools>=77` and `license = "MIT"` did not). The vendored license and lock
+  ship as package data. `MANIFEST.in` makes the sdist an allow-list (the repository root also holds old patches and zips) and
+  complete enough to rebuild the wheel.
+- **A native `.deb`** (`packaging/build_deb.sh`, `dpkg-deb` only; `packaging/build_release.sh` builds sdist + wheel + `.deb` +
+  `SHA256SUMS`; the sdist is normalized so the set is reproducible). `Architecture: all`, `Depends: python3 (>= 3.10), nftables`, `Recommends: logrotate`. Installs the code to
+  `/usr/lib/python3/dist-packages`, the nine commands to `/usr/bin`, the unit to `/usr/lib/systemd/system` (with
+  `ExecStart=/usr/bin/cora-sentinel`), `/etc/cora-sentinel/cora-sentinel.conf` and `/etc/logrotate.d/cora-sentinel` as
+  conffiles, docs and a DEP-5 `copyright` crediting both licenses, plus `md5sums` so `dpkg -V` works. Byte-for-byte
+  reproducible from a given wheel and `SOURCE_DATE_EPOCH`.
+- **Lifecycle.** Install never starts or enables the service. Upgrade restarts it only if it was running and keeps a confirmed
+  floor and your edited config. **Removal** stops and disables the service and **removes the kernel floor** (the package takes
+  `cora-floor` away, which would strand a confirmed floor), tidies an empty `inet cora` table, and leaves per-task isolation
+  rules alone, saying so. **Purge** removes config and `/var/lib/cora-sentinel` and **keeps `/var/log/cora-sentinel`**.
+- `packaging/lifecycle_test.sh`: the real install, upgrade, remove and purge with assertions. It stops the service and
+  removes a floor, so it refuses unless `CORA_LIFECYCLE_TEST=disposable-machine` is set and the machine shows no sign of
+  running cora-sentinel.
+- `tests/test_packaging_deb.py` (33): wheel and sdist contents (no runtime dependencies, vendored license and lock present,
+  the sdist rebuilds the same wheel), `.deb` contents, ownership and modes, md5sums, reproducibility, and every maintainer
+  script run against stubbed `systemctl`/`nft`/`cora-floor` (never a real service or floor).
+- docs/packaging.md. The model for `.deb` users is a documented side-install of `llama-cpp-python` (verified: PyPI has no
+  prebuilt wheel; the project's CPU index does; `pip install --target` is accepted under PEP 668; system Python imports it
+  through `PYTHONPATH`; this repo's grammar parses in the real engine. Not verified: loading a model through the unit).
+
+### Changed
+- `cora-selfcheck`, `cora-demo` and the daemon look for the vendored gate, not a top-level `subnetbus`.
+
+### Not done
+- Tested on Ubuntu 24.04 / Python 3.12 only. 22.04 (3.10) and Debian 12 (3.11) are untested.
+- Newer setuptools warns that the table-form license is deprecated (by 2027-02-18); switch to PEP 639 when the oldest target
+  distro ships setuptools 77 or later.
+- `lintian` on the final package: 0 errors, 14 warnings (4 direct `systemctl` calls in the maintainer scripts, 9 commands without
+  man pages, and the Debian-archive-only `initial-upload-closes-no-bugs`). The first run found two real problems, both fixed: a
+  Markdown changelog where Debian requires its own format (now `changelog.Debian.gz`, with upstream's as `changelog.gz`), and an
+  absolute path to `cora-floor` in `prerm`.
+- Not a Debian source package (no `debian/` tree for a PPA or the archive), and not signed.
+- Reproducible on one toolchain (`packaging/build_release.sh` run twice gives identical wheel, sdist and `.deb`, and so identical
+  `SHA256SUMS`); across setuptools versions the wheel's bytes can differ. The sdist is rewritten deterministically
+  (`packaging/normalize_sdist.py`) because setuptools stamps build time into it.
+
 ## 0.7.0
 
 ### Added

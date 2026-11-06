@@ -1,0 +1,11 @@
+# The sdist is an explicit allow-list: the repository root also holds old patches, zips and the superseded layouts.
+include LICENSE README.md CHANGELOG.md pyproject.toml
+recursive-include src/cora_sentinel/_vendor *.py LICENSE VENDOR.lock
+recursive-include deploy *
+recursive-include packaging *
+recursive-include docs *.md
+recursive-include tools *.py
+recursive-include tests *.py
+recursive-include examples *
+recursive-include schema *
+global-exclude __pycache__ *.pyc

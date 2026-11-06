@@ -148,7 +148,7 @@ def preflight(a) -> Optional[tuple]:
     chk(mount, f"cgroup v2 at {mount}", "no cgroup v2 mount found")
     model = find_model(a.model)
     chk(model, f"model {model}", "no model: pass --model PATH.gguf (or set CORA_GGUF)")
-    for mod in ("llama_cpp", "subnetbus"):
+    for mod in ("llama_cpp", "cora_sentinel._vendor.subnetbus"):
         try:
             __import__(mod)
             chk(True, f"python module {mod}", "")
