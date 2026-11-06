@@ -1,0 +1,955 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 7214841..746b100 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,36 @@
+ # Changelog
+ 
++## 0.8.2
++
++### Added
++- **Man pages for all nine commands** (`cora-sentinel`, `cora-run`, `cora-cgroup`, `cora-firewall`, `cora-floor`, `cora-blocklist`,
++  `cora-report`, `cora-demo`, `cora-selfcheck`), installed by the `.deb` to `/usr/share/man/man1/*.1.gz`.
++  `tools/gen_man.py` builds them at build time; nothing generated is checked in. The OPTIONS and COMMANDS sections come from the
++  real argparse parsers (including `cora-floor`'s subcommands and `dyn-replay`'s options), so they cannot drift; the descriptions,
++  signals, files, environment, exit status and examples are in the generator. The page date is the build epoch, so the `.deb` stays
++  byte-reproducible.
++- `tests/test_man.py` (19): every console script has a page; every page is clean roff (`groff -ww`) and has the standard sections
++  and an EXIT STATUS; no option or command is listed without a description; every option and subcommand the parsers accept is in
++  the page; every subcommand in the hand-parsed tools' usage text is in theirs; every `CORA_*` environment variable a tool reads is
++  documented; `SEE ALSO` points only at pages that exist; reproducible output; roff escaping. Mutation-checked (a new undocumented
++  environment variable, subcommand and option each fail it). The `.deb` test checks the nine `.1.gz` files, their date and version,
++  and that they pass `groff -ww`.
++- `tests/test_ci.py` (+1): a `pytest` line in the CI `package` job must set `PYTHONPATH=src` or the job must install the project. The
++  first real GitHub run failed there with `ModuleNotFoundError` (fixed upstream in `de26085`); a local emulation could not show it,
++  because the project was installed on the machine that ran it. The test fails on the original workflow and passes on the fix.
++- `packaging/lifecycle_test.sh` checks the installed man pages (and `man -w`) and that purge removes them, and skips that on an image
++  that excludes `/usr/share/man`.
++
++### Fixed
++- Twenty-three options had no description in the code, so they were blank in `--help` as well as in the new pages. They now say what
++  they do (`--spike-mb`, `--window`, `--interval`, `--out`, `--decisions`, `--min-conf`, `--selftest`, `--threads`, `--cgroup-mount`,
++  `--report-salt`, `cora-floor --table`, and `dyn-replay`'s tuning and output options).
++- `CORA_NFT_NATIVE` (read by `cora-firewall` and the daemon, default 1; 0 reads the ruleset with `nft -j list` instead of netlink)
++  was undocumented. The man page test found it.
++
++### Changed
++- `lintian` on the package: 14 warnings down to 5 (the nine `no-manual-page` warnings are gone; nothing new appeared).
++
+ ## 0.8.1
+ 
+ ### Fixed
+diff --git a/README.md b/README.md
+index faa7f5c..1ff332b 100644
+--- a/README.md
++++ b/README.md
+@@ -47,7 +47,8 @@ For development: `pip install -e ".[dev]"`.
+ **A package for Ubuntu/Debian.** `packaging/build_release.sh` builds an sdist, a wheel and a native `.deb`
+ (`Architecture: all`, depends on `python3` and `nftables` only). Installing it does not start the service; removing it stops
+ the service and removes the kernel floor; purging keeps the audit logs. See [docs/packaging.md](docs/packaging.md)
+-(including how to side-install `llama-cpp-python` for the model under Ubuntu's PEP 668 restriction).
++(including how to side-install `llama-cpp-python` for the model under Ubuntu's PEP 668 restriction). The package installs a man
++page for each of the nine commands (`man cora-floor`), generated at build time from the real argument parsers.
+ 
+ ## Try it
+ 
+diff --git a/docs/packaging.md b/docs/packaging.md
+index 085e037..c44635c 100644
+--- a/docs/packaging.md
++++ b/docs/packaging.md
+@@ -62,11 +62,23 @@ start is yours (the install prints the three steps). The package is `Architectur
+ | `/etc/cora-sentinel/cora-sentinel.conf` | conffile: the daemon's arguments (`CORA_ARGS`). dpkg keeps your edits across upgrades |
+ | `/etc/logrotate.d/cora-sentinel` | conffile: size-based, `copytruncate` |
+ | `/usr/share/doc/cora-sentinel/` | README, these docs, `changelog.gz`, `copyright` (both licenses) |
++| `/usr/share/man/man1/cora-*.1.gz` | a man page for each of the nine commands (below) |
+ 
+ The unit is in `/usr/lib/systemd/system`, not `/etc`, so it is not a conffile: files under `/usr` never are, and putting it
+ in `/etc/systemd/system` would make it silently override the package's updates. Customize it with `systemctl edit
+ cora-sentinel` (a drop-in). The venv installer (`deploy/install-service.sh`) is unchanged and uses the same unit template.
+ 
++### Man pages
++
++`man cora-sentinel`, `cora-run`, `cora-cgroup`, `cora-firewall`, `cora-floor`, `cora-blocklist`, `cora-report`, `cora-demo` and
++`cora-selfcheck`. They are generated at build time by `tools/gen_man.py` (`python tools/gen_man.py --out DIR` writes them) and
++nothing generated is kept in git. The OPTIONS and COMMANDS sections are read from the real argparse parsers, so an option cannot be
++added to the code and forgotten here; the hand-parsed tools (`cora-run`, `cora-cgroup`, `cora-firewall`, `cora-selfcheck`) are
++written out in the generator. `tests/test_man.py` fails when an option has no description, when a subcommand in a tool's usage text
++or an environment variable it reads is missing from its page, when a page is not clean roff (`groff -ww`), or when a `SEE ALSO`
++points nowhere; it has already caught one real gap (`CORA_NFT_NATIVE` was undocumented). The page date is the build epoch, so the
++`.deb` stays reproducible.
++
+ ### What each dpkg action does
+ 
+ | Action | Service | Kernel floor | Config | `/var/lib/cora-sentinel` | `/var/log/cora-sentinel` |
+@@ -123,8 +135,8 @@ compile). `PYTHONPATH` is set in the config, not the unit, so the side-install i
+   `license-files`.
+ - The `.deb` is built with `dpkg-deb` alone, so it is not a Debian *source* package (no `debian/` tree for a PPA or the
+   archive). `Maintainer:` defaults to a GitHub no-reply address; set `DEB_MAINTAINER` to change it.
+-- `lintian` (run on the final package): **0 errors**, 14 warnings, all known and left alone. `maintainer-script-calls-systemctl`
++- `lintian` (run on the final package): **0 errors**, 5 warnings, all known and left alone. `maintainer-script-calls-systemctl`
+   (4): the scripts call `systemctl` directly, guarded by `/run/systemd/system`, instead of debhelper's generated
+-  `deb-systemd-invoke` snippets. `no-manual-page` (9): the commands have `--help` but no man pages yet.
+-  `initial-upload-closes-no-bugs`: only relevant to an upload to the Debian archive.
++  `deb-systemd-invoke` snippets. `initial-upload-closes-no-bugs`: only relevant to an upload to the Debian archive. (The nine
++  `no-manual-page` warnings were cleared in 0.8.2 by the man pages above.)
+ - Not signed. To publish, put the files in an apt repository (`reprepro`, `aptly`) and sign that.
+diff --git a/packaging/build_deb.sh b/packaging/build_deb.sh
+index ea5511a..96b2bf9 100755
+--- a/packaging/build_deb.sh
++++ b/packaging/build_deb.sh
+@@ -49,7 +49,7 @@ stage="$tmp/stage"
+ site="$stage/usr/lib/python3/dist-packages"
+ doc="$stage/usr/share/doc/cora-sentinel"
+ mkdir -p "$site" "$stage/DEBIAN" "$stage/usr/bin" "$stage/usr/lib/systemd/system" "$stage/etc/cora-sentinel" \
+-         "$stage/etc/logrotate.d" "$doc"
++         "$stage/etc/logrotate.d" "$doc" "$stage/usr/share/man/man1"
+ 
+ # ---- code: the wheel, minus RECORD (stale once modes change), marked as dpkg's so pip will not uninstall it ------------
+ python3 -m zipfile -e "$wheel" "$site"
+@@ -78,6 +78,9 @@ cp "$repo/deploy/cora-sentinel.logrotate" "$stage/etc/logrotate.d/cora-sentinel"
+ cp "$repo/README.md" "$doc/README.md"
+ cp "$repo"/docs/*.md "$doc/"
+ gzip -9n -c "$repo/CHANGELOG.md" > "$doc/changelog.gz"
++# the man pages are generated from the real argument parsers (tools/gen_man.py); nothing generated is kept in git
++python3 "$repo/tools/gen_man.py" --out "$tmp/man" --date "$(date -u -d "@$sde" +%Y-%m-%d)" >/dev/null
++for page in "$tmp"/man/*.1; do gzip -9n -c "$page" > "$stage/usr/share/man/man1/$(basename "$page").gz"; done
+ # Debian wants its own changelog format; the real history is upstream's CHANGELOG.md, shipped beside it
+ gzip -9n -c > "$doc/changelog.Debian.gz" <<CHG
+ cora-sentinel (${version}-${rev}) unstable; urgency=medium
+diff --git a/packaging/lifecycle_test.sh b/packaging/lifecycle_test.sh
+index d7a6589..9f4e7b7 100755
+--- a/packaging/lifecycle_test.sh
++++ b/packaging/lifecycle_test.sh
+@@ -38,9 +38,15 @@ where="$(cd / && python3 -c 'import cora_sentinel; print(cora_sentinel.__file__)
+ case "$where" in /usr/lib/python3/dist-packages/*) ok "python3 imports the packaged copy";; *) bad "python3 imports $where (something shadows the package)";; esac
+ sc="$(cd / && cora-selfcheck 2>&1)"          # captured, not piped into grep -q: SIGPIPE + pipefail would fake a failure
+ grep -q "ok .*vendored subnetbus .* verified" <<<"$sc" && ok "cora-selfcheck: vendored gate verified" || bad "cora-selfcheck did not verify the vendored gate"
+-# a minimal image may path-exclude /usr/share/doc (dpkg then reports the docs missing); nothing else may be reported
+-v="$(dpkg -V cora-sentinel | grep -v ' /usr/share/doc/' || true)"
++# a minimal image may path-exclude /usr/share/doc and /usr/share/man (dpkg then reports them missing); nothing else may be reported
++v="$(dpkg -V cora-sentinel | grep -vE ' /usr/share/(doc|man)/' || true)"
+ [ -z "$v" ] && ok "dpkg -V is clean (docs aside)" || bad "dpkg -V reports: $v"
++if grep -qs "^path-exclude=/usr/share/man" /etc/dpkg/dpkg.cfg /etc/dpkg/dpkg.cfg.d/* 2>/dev/null; then
++    echo "  skip  man pages (this image excludes /usr/share/man from packages)"
++else
++    for c in sentinel run cgroup firewall floor blocklist report demo selfcheck; do check "man page: cora-$c(1)" test -s "/usr/share/man/man1/cora-$c.1.gz"; done
++    man -w cora-floor >/dev/null 2>&1 && ok "man finds cora-floor(1)" || bad "man cannot find cora-floor(1)"
++fi
+ if [ -d /run/systemd/system ]; then
+     gone systemctl is-active --quiet cora-sentinel && ok "service not started" || bad "service was started"
+     gone systemctl is-enabled --quiet cora-sentinel && ok "service not enabled" || bad "service was enabled"
+@@ -75,6 +81,7 @@ gone test -e /var/lib/cora-sentinel && ok "state removed" || bad "state left beh
+ check "audit logs KEPT" test -e /var/log/cora-sentinel/decisions.jsonl
+ grep -q "kept the audit logs" <<<"$out" && ok "said so" || bad "no 'kept the audit logs' message"
+ gone test -e /usr/lib/python3/dist-packages/cora_sentinel && ok "no package files left" || bad "package files left behind"
++gone test -e /usr/share/man/man1/cora-floor.1.gz && ok "man pages removed" || bad "man pages left behind"
+ rm -rf /var/log/cora-sentinel        # the test's own audit file
+ 
+ echo
+diff --git a/src/cora_sentinel/__init__.py b/src/cora_sentinel/__init__.py
+index f093be7..881444a 100644
+--- a/src/cora_sentinel/__init__.py
++++ b/src/cora_sentinel/__init__.py
+@@ -5,4 +5,4 @@ local model (grammar-constrained) proposes a verdict; deterministic gates decide
+ See README.md.
+ """
+ 
+-__version__ = "0.8.1"
++__version__ = "0.8.2"
+diff --git a/src/cora_sentinel/daemon.py b/src/cora_sentinel/daemon.py
+index d118dd2..b151e75 100644
+--- a/src/cora_sentinel/daemon.py
++++ b/src/cora_sentinel/daemon.py
+@@ -575,7 +575,9 @@ def main() -> int:
+                          "floor, and let the model only add to it; see docs/containment-latency.md)")
+     ap.add_argument("--report-dir", default="cora_reports",
+                     help="anonymized violation reports for blocklist hits ('' disables)")
+-    ap.add_argument("--report-salt", default="~/.config/cora/report_salt")
++    ap.add_argument("--report-salt", default="~/.config/cora/report_salt",
++                    help="file holding the secret salt that pseudonymizes task names in violation reports; created if missing, "
++                         "and kept OUTSIDE the report directory on purpose (default %(default)s)")
+     ap.add_argument("--report-include-process", action="store_true",
+                     help="include the executable basename in reports (off by default)")
+     ap.add_argument("--net-source", choices=("auto", "sockdiag", "proc"), default="auto",
+@@ -631,18 +633,22 @@ def main() -> int:
+     ap.add_argument("--nft", action="store_true",
+                     help="enable the ISOLATE verdict: per-cgroup egress drop via nftables "
+                          "(needs --cgroup-root and root/CAP_NET_ADMIN)")
+-    ap.add_argument("--cgroup-mount", default="/sys/fs/cgroup")
+-    ap.add_argument("--spike-mb", type=int, default=150)
+-    ap.add_argument("--window", type=float, default=10.0)
+-    ap.add_argument("--interval", type=float, default=1.0)
+-    ap.add_argument("--out", default="sentinel_events.jsonl")
+-    ap.add_argument("--selftest", action="store_true")
++    ap.add_argument("--cgroup-mount", default="/sys/fs/cgroup", help="where cgroup v2 is mounted (default %(default)s)")
++    ap.add_argument("--spike-mb", type=int, default=150,
++                    help="report a memory spike when a task's resident memory rises by at least this many MB above its minimum "
++                         "within --window (default %(default)s)")
++    ap.add_argument("--window", type=float, default=10.0, help="seconds of memory history a spike is measured over (default %(default)s)")
++    ap.add_argument("--interval", type=float, default=1.0, help="seconds between checks (default %(default)s)")
++    ap.add_argument("--out", default="sentinel_events.jsonl", help="write events here, one JSON object per line (default %(default)s)")
++    ap.add_argument("--selftest", action="store_true", help="run the built-in self-test, which provokes each kind of event once, and exit (0 on PASS)")
+     ap.add_argument("--model", help="path to Qwen GGUF; enables the verdict stage")
+     ap.add_argument("--enforce", action="store_true",
+                     help="actually act on verdicts (default: dry-run)")
+-    ap.add_argument("--min-conf", type=float, default=0.6)
+-    ap.add_argument("--decisions", default="sentinel_decisions.jsonl")
+-    ap.add_argument("--threads", type=int, default=None)
++    ap.add_argument("--min-conf", type=float, default=0.6,
++                    help="minimum model confidence (0 to 1) for an actionable verdict; below it the verdict becomes ESCALATE (default %(default)s)")
++    ap.add_argument("--decisions", default="sentinel_decisions.jsonl",
++                    help="write each adjudicator decision here, one JSON object per line (default %(default)s)")
++    ap.add_argument("--threads", type=int, default=None, help="CPU threads for the language model (default: the library's choice)")
+     a = ap.parse_args()
+ 
+     if a.selftest:
+diff --git a/src/cora_sentinel/demo.py b/src/cora_sentinel/demo.py
+index 1e41f25..73154c7 100644
+--- a/src/cora_sentinel/demo.py
++++ b/src/cora_sentinel/demo.py
+@@ -186,7 +186,7 @@ def main() -> int:
+                          "only the NFLOG tap can see this")
+     ap.add_argument("--no-nflog", action="store_true", help="do not use the NFLOG flow tap")
+     ap.add_argument("--timeout", type=float, default=150, help="seconds to wait for the whole chain")
+-    ap.add_argument("--threads", type=int, default=None)
++    ap.add_argument("--threads", type=int, default=None, help="CPU threads for the language model (default: the library's choice)")
+     ap.add_argument("--workdir", help="keep files here (default: a temp dir)")
+     a = ap.parse_args()
+ 
+diff --git a/src/cora_sentinel/dynreplay.py b/src/cora_sentinel/dynreplay.py
+index 1e7c1f5..b6f4058 100644
+--- a/src/cora_sentinel/dynreplay.py
++++ b/src/cora_sentinel/dynreplay.py
+@@ -523,9 +523,14 @@ def build_parser() -> argparse.ArgumentParser:
+     ap.add_argument("--until", metavar="ISO", help="only decisions before this time")
+     g = ap.add_argument_group("policy settings (rehearsing: a tweak, run as B against the defaults as A; "
+                               "with --as-recorded/--check: the live daemon's settings)")
+-    g.add_argument("--min-conf", type=float), g.add_argument("--write-budget", type=int, metavar="PER_MIN")
+-    g.add_argument("--max-live", type=int), g.add_argument("--task-cap", type=int), g.add_argument("--promote-tasks", type=int)
+-    g.add_argument("--flow-ttl", type=int, metavar="SEC"), g.add_argument("--ip-ttl", type=int, metavar="SEC")
++    g.add_argument("--min-conf", type=float, help="model confidence needed to block (default 0.9)")
++    g.add_argument("--write-budget", type=int, metavar="PER_MIN", help="kernel writes per minute (default 20)")
++    g.add_argument("--max-live", type=int, help="live dynamic elements (default 512)")
++    g.add_argument("--task-cap", type=int, help="distinct targets per task per hour (default 8)")
++    g.add_argument("--promote-tasks", type=int,
++                   help="distinct tasks on non-web ports of one address that promote its flow block to the whole address (default 2)")
++    g.add_argument("--flow-ttl", type=int, metavar="SEC", help="lifetime of a first flow block, in seconds (default 600)")
++    g.add_argument("--ip-ttl", type=int, metavar="SEC", help="lifetime of a first whole-address block, in seconds (default 1800)")
+     g.add_argument("--allow", action="append", default=[], metavar="CIDR", help="never block these (exemption)")
+     g.add_argument("--protect", action="append", default=[], metavar="ADDR", help="never block this address")
+     w = ap.add_argument_group("world")
+@@ -535,9 +540,11 @@ def build_parser() -> argparse.ArgumentParser:
+     w.add_argument("--diff-recorded", action="store_true", help="also compare the result with what shadow recorded")
+     ap.add_argument("--kernel", choices=("auto", "on", "off"), default="auto",
+                     help="mirror writes into a private namespace and cross-check (auto: if root, nft and unshare)")
+-    ap.add_argument("--json", action="store_true"), ap.add_argument("--outcomes", action="store_true", help="with --json: every decision")
+-    ap.add_argument("--top", type=int, default=10), ap.add_argument("--changes", type=int, default=15)
+-    ap.add_argument("--timeline", action="store_true")
++    ap.add_argument("--json", action="store_true", help="print machine-readable JSON instead of text")
++    ap.add_argument("--outcomes", action="store_true", help="with --json: every decision")
++    ap.add_argument("--top", type=int, default=10, help="how many targets to list (default %(default)s)")
++    ap.add_argument("--changes", type=int, default=15, help="how many changed decisions to list in a diff (default %(default)s)")
++    ap.add_argument("--timeline", action="store_true", help="add an hour-by-hour timeline")
+     ap.add_argument("--in-ns", action="store_true", help=argparse.SUPPRESS)
+     return ap
+ 
+diff --git a/src/cora_sentinel/nftsets.py b/src/cora_sentinel/nftsets.py
+index 2f4e0c8..fcc20dc 100644
+--- a/src/cora_sentinel/nftsets.py
++++ b/src/cora_sentinel/nftsets.py
+@@ -604,7 +604,8 @@ def main(argv: Optional[List[str]] = None) -> int:
+         from cora_sentinel import dynreplay
+         return dynreplay.main(args[args.index("dyn-replay") + 1:])
+     ap = argparse.ArgumentParser(prog="cora-floor", description="Inspect and drive the kernel-side blocklist floor.")
+-    ap.add_argument("--table", default=os.environ.get("CORA_NFT_TABLE", "cora"))
++    ap.add_argument("--table", default=os.environ.get("CORA_NFT_TABLE", "cora"),
++                    help="the nftables table (default cora, or $CORA_NFT_TABLE)")
+     ap.add_argument("--state-dir", default=os.environ.get("CORA_STATE_DIR", floorguard.DEFAULT_STATE_DIR),
+                     help="where the confirmation state lives (default /var/lib/cora-sentinel)")
+     sub = ap.add_subparsers(dest="cmd", required=True)
+diff --git a/tests/test_ci.py b/tests/test_ci.py
+index 614bfb2..9fa446e 100644
+--- a/tests/test_ci.py
++++ b/tests/test_ci.py
+@@ -85,6 +85,17 @@ def test_the_build_job_checks_the_gate_the_checksums_reproducibility_and_lintian
+     assert "python tools/vendor_bus.py check" in job("unprivileged")
+ 
+ 
++def test_the_package_job_can_import_the_project_wherever_it_runs_pytest():
++    """The package job installs build tools, not the project. A pytest line there must say where the code is (PYTHONPATH=src), or the
++    first run on a real runner fails with ModuleNotFoundError (it did, and a local run could not show it: there the project was installed)."""
++    runs = [l for l in job("package").splitlines() if "pytest" in l and not l.lstrip().startswith(("#", "python -m pip install"))
++            and "pip install" not in l]
++    installs_project = re.search(r"pip install (-e )?[\"']?\.", job("package")) is not None
++    assert runs, "the package job runs no tests?"
++    for l in runs:
++        assert installs_project or "PYTHONPATH=src" in l, f"pytest cannot import cora_sentinel here: {l.strip()}"
++
++
+ def test_every_script_the_workflows_call_exists_and_is_executable():
+     for rel in ("packaging/build_release.sh", "packaging/lifecycle_test.sh", "tools/vendor_bus.py"):
+         p = ROOT / rel
+diff --git a/tests/test_man.py b/tests/test_man.py
+new file mode 100644
+index 0000000..85890b4
+--- /dev/null
++++ b/tests/test_man.py
+@@ -0,0 +1,154 @@
++"""The man pages for the nine commands: generated from the real parsers, so a new option, subcommand or environment variable
++that is not documented fails here. Run: pytest -q tests/test_man.py"""
++import re
++import shutil
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++ROOT = Path(__file__).resolve().parents[1]
++TOOLS = ROOT / "tools"
++pytestmark = pytest.mark.skipif(not (TOOLS / "gen_man.py").exists(), reason="no tools/ in this tree")
++if (TOOLS / "gen_man.py").exists():
++    sys.path.insert(0, str(TOOLS))
++    import gen_man
++
++SRC = ROOT / "src" / "cora_sentinel"
++
++
++@pytest.fixture(scope="module")
++def pages(tmp_path_factory):
++    out = tmp_path_factory.mktemp("man")
++    assert gen_man.main(["--out", str(out), "--date", "2026-01-01"]) == 0
++    return {p.stem: p.read_text() for p in out.glob("*.1")} | {"_dir": out}
++
++
++def only_pages(pages):
++    return {k: v for k, v in pages.items() if k != "_dir"}
++
++
++def scripts():
++    text = (ROOT / "pyproject.toml").read_text().split("[project.scripts]", 1)[1].split("\n[", 1)[0]
++    return set(re.findall(r"^(cora-[\w-]+)\s*=", text, re.M))
++
++
++def test_every_console_script_has_a_page_and_no_page_is_for_nothing(pages):
++    assert set(only_pages(pages)) == scripts() == set(gen_man.ORDER) == set(gen_man.PAGES)
++
++
++@pytest.mark.skipif(not shutil.which("groff"), reason="needs groff")
++def test_every_page_is_clean_roff(pages):
++    for name in only_pages(pages):
++        r = subprocess.run(["groff", "-man", "-ww", "-z", str(pages["_dir"] / f"{name}.1")], capture_output=True, text=True)
++        assert r.returncode == 0 and r.stderr == "", f"{name}: {r.stderr}"
++
++
++@pytest.mark.skipif(not shutil.which("groff"), reason="needs groff")
++def test_a_page_renders_with_its_sections(pages):
++    """Rendered with groff itself, so it does not depend on man-db (a minimized image has only a stub `man`)."""
++    r = subprocess.run(["groff", "-man", "-Tascii", str(pages["_dir"] / "cora-floor.1")], capture_output=True, text=True)
++    assert r.returncode == 0
++    out = re.sub(r".\x08", "", r.stdout)
++    for head in ("NAME", "SYNOPSIS", "DESCRIPTION", "OPTIONS", "COMMANDS", "DYN-REPLAY OPTIONS", "EXIT STATUS", "EXAMPLES", "SEE ALSO"):
++        assert head in out, head
++
++
++def test_each_page_has_the_standard_skeleton(pages):
++    for name, t in only_pages(pages).items():
++        first = t.splitlines()[0]
++        assert first.startswith(f".TH {name.upper().replace('-', chr(92) + '-')} 1 ")
++        assert '"2026-01-01"' in first and "cora-sentinel " in first
++        for sec in ("NAME", "SYNOPSIS", "DESCRIPTION", "SEE ALSO", "REPORTING BUGS"):
++            assert f".SH {sec}\n" in t, (name, sec)
++        assert re.search(rf"\.SH NAME\n{re.escape(name.replace('-', chr(92) + '-'))} \\\-\s+\S", t), name
++        assert ".SH EXIT STATUS" in t, f"{name} must say what its exit status means"
++        assert t.isascii()
++
++
++def test_no_option_or_command_is_listed_without_a_description(pages):
++    for name, t in only_pages(pages).items():
++        L = t.splitlines()
++        empty = [L[i + 1] for i, l in enumerate(L) if l == ".TP" and i + 2 < len(L) and L[i + 2].startswith(".")]
++        assert not empty, f"{name}: no description for {empty}: give the option a help= in the code"
++
++
++def _documented(page: str, flag: str) -> bool:
++    return flag.replace("-", "\\-") in page
++
++
++PARSERS = {"cora-sentinel": ("cora_sentinel.daemon", "main"), "cora-floor": ("cora_sentinel.nftsets", "main"),
++           "cora-blocklist": ("cora_sentinel.blocklist_store", "main"), "cora-report": ("cora_sentinel.report", "main"),
++           "cora-demo": ("cora_sentinel.demo", "main")}
++
++
++@pytest.mark.parametrize("name", sorted(PARSERS))
++def test_every_option_and_subcommand_the_parser_accepts_is_in_the_page(pages, name):
++    import argparse
++    parsers = [gen_man.capture(*PARSERS[name], prog=name)]
++    if name == "cora-floor":
++        parsers.append(importlib_dynreplay().build_parser())
++    page = pages[name]
++    for p in parsers:
++        for act in p._actions:
++            if act.help == argparse.SUPPRESS or isinstance(act, argparse._HelpAction):
++                continue
++            if isinstance(act, argparse._SubParsersAction):
++                shown = {a.dest for a in act._choices_actions if a.help != argparse.SUPPRESS}
++                for sub, sp in act.choices.items():
++                    if sub in shown:
++                        assert f"\\fB{sub.replace('-', chr(92) + '-')}\\fR" in page, f"{name}: subcommand {sub}"
++                        for a in sp._actions:
++                            for o in a.option_strings:
++                                if a.help != argparse.SUPPRESS and not isinstance(a, argparse._HelpAction):
++                                    assert _documented(page, o), f"{name} {sub}: {o}"
++                continue
++            for o in act.option_strings:
++                assert _documented(page, o), f"{name}: {o}"
++
++
++def importlib_dynreplay():
++    import importlib
++    return importlib.import_module("cora_sentinel.dynreplay")
++
++
++def test_the_hand_parsed_tools_document_every_subcommand_in_their_usage_text(pages):
++    import importlib
++    for name, mod in (("cora-cgroup", "cora_sentinel.cgroup"), ("cora-firewall", "cora_sentinel.firewall")):
++        doc = importlib.import_module(mod).__doc__
++        usage = next(l for l in doc.splitlines() if l.strip().startswith(name + " "))
++        words = {chunk.strip().split()[0] for chunk in usage.strip()[len(name):].split("|")}
++        assert len(words) >= 3, (name, words)
++        for w in words:
++            assert f"\\fB{w}\\fR" in pages[name], f"{name}: subcommand {w} is in its usage text but not in its page"
++
++
++@pytest.mark.parametrize("name,module", [("cora-run", "run"), ("cora-cgroup", "cgroup"), ("cora-firewall", "firewall"),
++                                         ("cora-floor", "nftsets"), ("cora-blocklist", "blocklist_store")])
++def test_every_environment_variable_a_tool_reads_is_documented(pages, name, module):
++    src = (SRC / f"{module}.py").read_text()
++    for var in sorted(set(re.findall(r'os\.environ\.get\("(CORA_[A-Z_]+)"', src))):
++        assert var.replace("_", "\\_") in pages[name] or var in pages[name], f"{name} reads {var} but its page does not say so"
++
++
++def test_see_also_points_only_at_pages_that_exist(pages):
++    for name, t in only_pages(pages).items():
++        refs = re.findall(r"\\fB([\w\\-]+)\\fR\(1\)", t.split(".SH SEE ALSO", 1)[1])
++        assert refs, name
++        for r in refs:
++            assert r.replace("\\-", "-") in only_pages(pages), f"{name} points at {r}(1), which does not exist"
++
++
++def test_the_pages_are_reproducible(tmp_path):
++    a, b = tmp_path / "a", tmp_path / "b"
++    gen_man.main(["--out", str(a), "--date", "2026-01-01"])
++    gen_man.main(["--out", str(b), "--date", "2026-01-01"])
++    assert {p.name: p.read_bytes() for p in a.iterdir()} == {p.name: p.read_bytes() for p in b.iterdir()}
++
++
++def test_escaping_keeps_roff_safe():
++    assert gen_man.esc("--flag a\\b") == "\\-\\-flag a\\eb"
++    assert gen_man.esc("a \u2192 b \u00e9") == "a \\-> b \\[u00E9]".replace("\\->", "\\->")
++    assert gen_man.guard(".TH injected").startswith("\\&.") and gen_man.guard("'quote").startswith("\\&'")
++    assert gen_man.text("use **--out** and //FILE//") == "use \\fB\\-\\-out\\fR and \\fIFILE\\fR"
+diff --git a/tests/test_packaging_deb.py b/tests/test_packaging_deb.py
+index e71a012..3277c35 100644
+--- a/tests/test_packaging_deb.py
++++ b/tests/test_packaging_deb.py
+@@ -264,6 +264,20 @@ def test_the_packaged_code_is_self_contained_and_its_gate_verifies(data):
+     assert path.startswith(str(site)) and problems == "[]" and desc.endswith("@ ac3f126 verified")
+ 
+ 
++@have_tools
++def test_the_man_pages_are_installed_gzipped_with_the_build_date_and_the_version(data):
++    man = data / "usr/share/man/man1"
++    assert sorted(p.name for p in man.iterdir()) == sorted(f"{c}.1.gz" for c in SCRIPTS)
++    for c in SCRIPTS:
++        raw = (man / f"{c}.1.gz").read_bytes()
++        page = gzip.decompress(raw).decode()
++        assert page.startswith(f'.TH {c.upper().replace("-", chr(92) + "-")} 1 "2027-01-15" "cora-sentinel {cora_sentinel.__version__}"')
++        assert raw[4:8] == b"\0\0\0\0"                                  # gzip -n: no timestamp in the header, so the .deb is reproducible
++        if shutil.which("groff"):
++            r = subprocess.run(["groff", "-man", "-ww", "-z"], input=page, capture_output=True, text=True)
++            assert r.returncode == 0 and r.stderr == "", f"{c}: {r.stderr}"
++
++
+ @have_tools
+ def test_the_copyright_file_credits_both_licenses_and_names_the_vendored_commit(data):
+     c = (data / "usr/share/doc/cora-sentinel/copyright").read_text()
+diff --git a/tools/gen_man.py b/tools/gen_man.py
+new file mode 100755
+index 0000000..d9cb796
+--- /dev/null
++++ b/tools/gen_man.py
+@@ -0,0 +1,473 @@
++#!/usr/bin/env python3
++"""
++gen_man - the man pages for the nine cora-sentinel commands, generated at build time.
++
++    python tools/gen_man.py --out DIR [--date YYYY-MM-DD]       write DIR/<command>.1 for every command
++    python tools/gen_man.py --list                              the commands
++
++Nothing generated is checked in. For the tools that use argparse (cora-sentinel, cora-floor and its dyn-replay, cora-blocklist,
++cora-report, cora-demo) the OPTIONS and COMMANDS sections are read from the real parsers, so an option cannot be added to the
++code and forgotten here. The hand-parsed tools (cora-run, cora-cgroup, cora-firewall, cora-selfcheck) are written out below, and
++tests/test_man.py checks that each subcommand in their usage text is in their page. Everything else (descriptions, files, signals,
++exit status, examples) lives in PAGES.
++
++packaging/build_deb.sh calls this and installs the gzipped pages under /usr/share/man/man1. Stdlib only.
++"""
++from __future__ import annotations
++
++import argparse
++import importlib
++import re
++import sys
++from pathlib import Path
++from typing import Callable, List, Optional, Tuple
++
++sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
++
++URL = "https://github.com/nkaralus/cora-sentinel"
++DOCS = "/usr/share/doc/cora-sentinel"
++
++
++# --------------------------------------------------------------------------------------------------------------------
++# what the pages say
++# --------------------------------------------------------------------------------------------------------------------
++PAGES = {
++    "cora-sentinel": dict(
++        summary="out-of-band security sentinel for Linux tasks",
++        synopsis=["**cora-sentinel** [//OPTIONS//]"],
++        parser=("cora_sentinel.daemon", "main"),
++        description=[
++            ("p", "**cora-sentinel** is an out-of-band security sentinel for Linux. It watches //tasks//: processes started with "
++                  "**cora-run**(1), each in its own cgroup v2 under one delegated root (see **--cgroup-root**). It reports path "
++                  "violations, memory spikes and unauthorized network connections as one JSON object per line, to the file named "
++                  "by **--out**."),
++            ("p", "Network detection has two sources. With **--nflog**, a connect-time tap in nftables NFLOG sees the first packet "
++                  "of every TCP connection attempt and every UDP flow (including QUIC and DNS), attributes it to its task by "
++                  "cgroup, and so catches connections that live for less than a polling interval. The sock_diag netlink interface "
++                  "(or /proc/net/tcp, see **--net-source**) audits live sockets and socket destruction; a connection to a blocklisted "
++                  "destination that closed before it could be attributed is reported as a //slip//."),
++            ("p", "With **--model**, each event is adjudicated by a local, grammar-constrained language model. A verdict never acts "
++                  "directly: it passes a vendored safety gate (the engine-telemetry-bus gates GI_1 to GI_3), and without the gate "
++                  "the daemon refuses to act at all. Actions are per task: suspend, terminate or throttle through cgroup v2, and "
++                  "isolate through a per-task nftables egress rule. Without **--enforce** actions are only logged (a dry run). A "
++                  "verdict that needs a person is marked ESCALATE and never acts."),
++            ("p", "**--floor** additionally installs a kernel-side blocklist floor (nftables sets) that drops listed addresses before "
++                  "the first packet leaves or arrives. It is host-wide and outlives the daemon. **--floor-confirm** adds a "
++                  "dead-man switch, and a pre-check refuses a floor that would drop the default gateway or a live SSH peer. "
++                  "**--dyn-policy** can turn the model's ISOLATE verdicts into short-lived kernel drops of the destination; its "
++                  "default, //shadow//, only records what it would do."),
++            ("p", f"The design and the service setup are in {DOCS}/ (service.md, dyn-policy.md, packaging.md). The packaged systemd "
++                  "unit reads its arguments from /etc/cora-sentinel/cora-sentinel.conf."),
++        ],
++        sections=[
++            ("ENVIRONMENT", [
++                ("tp", "**CORA_NFT_NATIVE**", "Set to 0 to read the nftables ruleset by running **nft -j list** instead of directly over netlink. The direct read is the default and is far faster when there are many tasks; the fallback is for debugging."),
++            ]),
++            ("SIGNALS", [
++                ("tp", "**SIGHUP**", "Re-read the blocklist files and apply them (including the kernel floor sets) without a restart."),
++                ("tp", "**SIGTERM**, **SIGINT**", "Stop. The kernel floor and any per-task isolation rules deliberately stay in place."),
++            ]),
++            ("FILES", [
++                ("tp", "/etc/cora-sentinel/cora-sentinel.conf", "The packaged unit's arguments (CORA_ARGS). Not read by the daemon itself."),
++                ("tp", "/usr/lib/systemd/system/cora-sentinel.service", "The packaged unit."),
++                ("tp", "/var/log/cora-sentinel/events.jsonl", "Events, one JSON object per line (the packaged **--out**)."),
++                ("tp", "/var/log/cora-sentinel/decisions.jsonl", "Adjudicator decisions (the packaged **--decisions**); created at the first verdict."),
++                ("tp", "/var/lib/cora-sentinel/", "State: the confirmed floor allow set, the dynamic-policy ledgers, violation reports (**--state-dir**)."),
++                ("tp", "/sys/fs/cgroup/cora/", "The default task cgroup root (**--cgroup-root**)."),
++            ]),
++            ("EXIT STATUS", [("p", "0 after a clean stop. 1 if it could not start: invalid options, a floor refused by the pre-check or "
++                                   "that nft cannot install, or a damaged install.")]),
++            ("EXAMPLES", [
++                ("p", "Watch tasks, with the connect-time tap, without acting:"),
++                ("code", "cora-sentinel --cgroup-root /sys/fs/cgroup/cora --nft --nflog --out events.jsonl"),
++                ("p", "With the model, the kernel floor (confirm it within 120 seconds), your blocklists, and decisions logged:"),
++                ("code", "cora-sentinel --cgroup-root /sys/fs/cgroup/cora --nft --nflog --floor --floor-confirm 120 \\\n"
++                         "    --model model.gguf --blocklist /etc/cora-sentinel/blocklists \\\n"
++                         "    --out events.jsonl --decisions decisions.jsonl"),
++            ]),
++        ],
++        see_also=["cora-run(1)", "cora-floor(1)", "cora-firewall(1)", "cora-cgroup(1)", "cora-blocklist(1)", "cora-selfcheck(1)"],
++    ),
++
++    "cora-run": dict(
++        summary="run a command as a cora-sentinel task",
++        synopsis=["**cora-run** //NAME// //CMD// [//ARGS//...]"],
++        description=[
++            ("p", "**cora-run** runs //CMD// as a task named //NAME//. It creates the cgroup //root///NAME//, moves itself into it, "
++                  "and then replaces itself with //CMD//, so the task and everything it forks are in that cgroup from their first "
++                  "instruction: there is no race and no marker argument. The default root is /sys/fs/cgroup/cora."),
++            ("p", "If a sentinel is running the connect-time tap, **cora-run** installs the task's tap rule before the move, so the "
++                  "task's very first connection is already attributed. This is best effort: if it cannot, the task starts anyway and "
++                  "the sentinel installs the rule within one polling interval."),
++            ("p", "Moving into a cgroup needs root. If it was started through sudo, **cora-run** drops back to the invoking user "
++                  "(SUDO_UID and SUDO_GID) before executing //CMD//, so the task does not keep root."),
++        ],
++        sections=[
++            ("ENVIRONMENT", [
++                ("tp", "**CORA_CGROUP_ROOT**", "The task cgroup root. Default /sys/fs/cgroup/cora."),
++                ("tp", "**CORA_CGROUP_MOUNT**", "Where cgroup v2 is mounted. Default /sys/fs/cgroup."),
++                ("tp", "**CORA_NFT_TABLE**", "The nftables table the tap uses. Default cora."),
++                ("tp", "**CORA_NFLOG_GROUP**", "The NFLOG group of the tap. Must match the sentinel's."),
++            ]),
++            ("EXIT STATUS", [("p", "2 if //NAME// or //CMD// is missing (it prints its usage). 1 if it cannot enter the cgroup. "
++                                   "Otherwise it does not return: the exit status is //CMD//'s.")]),
++            ("EXAMPLES", [("code", "sudo cora-run build python3 build.py\nsudo cora-run fetch curl -s https://example.org/")]),
++        ],
++        see_also=["cora-sentinel(1)", "cora-cgroup(1)", "cora-firewall(1)"],
++    ),
++
++    "cora-cgroup": dict(
++        summary="inspect and thaw cora-sentinel task cgroups",
++        synopsis=["**cora-cgroup** **list**", "**cora-cgroup** **status** //NAME//", "**cora-cgroup** **thaw** //NAME//"],
++        description=[
++            ("p", "A task is a directory under one delegated cgroup v2 root. A sentinel contains a task through that directory: "
++                  "suspend (cgroup.freeze), terminate (cgroup.kill, kernel 5.14 or later) and throttle (cpu.max and memory.high, "
++                  "falling back to nice). **cora-cgroup** is the small tool for looking at those tasks and for undoing a suspend."),
++        ],
++        commands=[
++            ("**list**", "Print every task with its process count, whether it is frozen, and whether a freeze was requested."),
++            ("**status** //NAME//", "Print one task's process count and whether it is frozen."),
++            ("**thaw** //NAME//", "Unfreeze a suspended task."),
++        ],
++        sections=[
++            ("ENVIRONMENT", [
++                ("tp", "**CORA_CGROUP_ROOT**", "The task cgroup root. Default /sys/fs/cgroup/cora."),
++                ("tp", "**CORA_CGROUP_MOUNT**", "Where cgroup v2 is mounted. Default /sys/fs/cgroup."),
++            ]),
++            ("EXIT STATUS", [("p", "0 on success. 2 on a usage error (it prints its usage).")]),
++            ("EXAMPLES", [("code", "cora-cgroup list\nsudo cora-cgroup thaw build")]),
++        ],
++        see_also=["cora-run(1)", "cora-firewall(1)", "cora-sentinel(1)"],
++    ),
++
++    "cora-firewall": dict(
++        summary="per-task egress quarantine with nftables",
++        synopsis=["**cora-firewall** **list**", "**cora-firewall** **block** //NAME//", "**cora-firewall** **unblock** //NAME//",
++                  "**cora-firewall** **release** //NAME//", "**cora-firewall** **gc**", "**cora-firewall** **purge**"],
++        description=[
++            ("p", "**cora-firewall** manages the per-task egress rules of a sentinel. The rules live in their own nftables table, "
++                  "//inet cora//; the tool never touches any other table, so removing that table removes every rule cora-sentinel "
++                  "ever added and nothing else. There is one rule per task, matched on the socket's cgroup v2 and tagged "
++                  "\"cora:NAME\"; it drops everything leaving a non-loopback interface. The kernel is the source of truth: there is "
++                  "no state file, and a restarted daemon reads the ruleset back. It needs CAP_NET_ADMIN (run it as root)."),
++        ],
++        commands=[
++            ("**list**", "Show each isolated task with the packets and bytes its rule has dropped."),
++            ("**block** //NAME//", "Isolate a task: cut its egress."),
++            ("**unblock** //NAME//", "Remove a task's egress rule."),
++            ("**release** //NAME//", "The review action: undo every containment measure on a task (its egress rule, a freeze, "
++                                    "its limits) and drop the dynamic kernel entries that task alone caused. Use it for a false positive."),
++            ("**gc**", "Remove rules whose cgroup no longer exists."),
++            ("**purge**", "Delete the whole table: every per-task rule and the tap, at once. The panic button. It also removes "
++                          "the kernel floor if it is in the same table."),
++        ],
++        sections=[
++            ("ENVIRONMENT", [
++                ("tp", "**CORA_CGROUP_ROOT**, **CORA_CGROUP_MOUNT**", "As for cora-cgroup(1)."),
++                ("tp", "**CORA_NFT_TABLE**", "The table name. Default cora."),
++                ("tp", "**CORA_STATE_DIR**", "Where **release** finds the dynamic-policy ledgers. Default /var/lib/cora-sentinel."),
++                ("tp", "**CORA_NFT_NATIVE**", "Set to 0 to read the nftables ruleset by running **nft -j list** instead of directly over netlink. The direct read is the default and is far faster when there are many tasks; the fallback is for debugging."),
++            ]),
++            ("EXIT STATUS", [("p", "0 on success. 1 on an error from nftables or the cgroup (it prints it). 2 on a usage error.")]),
++            ("EXAMPLES", [("code", "sudo cora-firewall list\nsudo cora-firewall release build")]),
++        ],
++        see_also=["cora-floor(1)", "cora-cgroup(1)", "cora-sentinel(1)"],
++    ),
++
++    "cora-floor": dict(
++        summary="inspect and drive the kernel-side blocklist floor and the dynamic policy",
++        synopsis=["**cora-floor** [**--table** //TABLE//] [**--state-dir** //DIR//] //COMMAND// [//ARGS//]",
++                  "**cora-floor** **dyn-replay** //DECISIONS//... [//OPTIONS//]"],
++        parser=("cora_sentinel.nftsets", "main"),
++        extra_parsers=[("DYN-REPLAY OPTIONS", lambda: importlib.import_module("cora_sentinel.dynreplay").build_parser())],
++        description=[
++            ("p", "The kernel floor is a set of nftables sets that drop listed addresses before the first packet leaves or arrives "
++                  "(**cora-sentinel --floor**). **cora-floor** shows and drives it: the sets, the dead-man confirmation, one-off "
++                  "blocks, the dynamic-policy ledger, and a replay tool that rehearses the policy against recorded logs."),
++            ("p", "The floor is host-wide and it outlives the daemon: stopping cora-sentinel does not remove it. "
++                  "**cora-floor remove** does."),
++            ("p", "//dyn-replay// has its own option parser: **cora-floor dyn-replay --help**. It joins decisions.jsonl with "
++                  "events.jsonl (a decision has the verdict and the time but not the destination or the task), feeds each recorded "
++                  "ISOLATE back through the real policy with a clock that follows the recorded times, and reports what would have "
++                  "been blocked, which limits were hit, and whether any web port was promoted. It never touches the live ledger or "
++                  "the live ruleset. In kernel mode (root, nft and unshare available) it mirrors every write into a private network "
++                  "namespace."),
++        ],
++        sections=[
++            ("ENVIRONMENT", [
++                ("tp", "**CORA_NFT_TABLE**", "The table name (**--table**). Default cora."),
++                ("tp", "**CORA_STATE_DIR**", "The state directory (**--state-dir**). Default /var/lib/cora-sentinel."),
++            ]),
++            ("FILES", [
++                ("tp", "/var/lib/cora-sentinel/floor.pending.json", "A floor waiting for **confirm** (written by **cora-sentinel --floor-confirm**)."),
++                ("tp", "/var/lib/cora-sentinel/floor.confirmed.json", "The allow set a person confirmed; an unchanged set asks for no new confirmation."),
++                ("tp", "/var/lib/cora-sentinel/dyn-ledger-shadow.json, dyn-ledger-enforce.json", "The dynamic policy's ledgers, one per mode."),
++            ]),
++            ("EXIT STATUS", [("p", "0 on success. 1 on an error, or when **confirm** finds nothing waiting. For **dyn-replay**: 1 if **--check** "
++                                   "found a mismatch with what the live policy recorded, 2 if a self-check failed (a web port promoted, or "
++                                   "the simulated sets disagree with the ledger) or the input was unusable.")]),
++            ("EXAMPLES", [
++                ("p", "Keep a floor the daemon is waiting on, then look at the sets:"),
++                ("code", "sudo cora-floor confirm\nsudo cora-floor status"),
++                ("p", "Block one address for ten minutes, by hand:"),
++                ("code", "sudo cora-floor block 203.0.113.9 600"),
++                ("p", "Rehearse a tweak against a week of shadow-mode logs:"),
++                ("code", "cora-floor dyn-replay /var/log/cora-sentinel/decisions.jsonl --events /var/log/cora-sentinel/events.jsonl --task-cap 4"),
++            ]),
++        ],
++        see_also=["cora-sentinel(1)", "cora-firewall(1)", "cora-blocklist(1)"],
++    ),
++
++    "cora-blocklist": dict(
++        summary="pinned, reviewed blocklist updates, and a blocklist checker",
++        synopsis=["**cora-blocklist** **check** //PATH// [//IP-OR-DOMAIN//...]",
++                  "**cora-blocklist** [**--dir** //DIR//] //COMMAND// [//ARGS//]"],
++        parser=("cora_sentinel.blocklist_store", "main"),
++        description=[
++            ("p", "**cora-blocklist** keeps the blocklists a sentinel loads under review. **pull** fetches every source and stages what "
++                  "changed without touching the active lists; you read the **diff**, and **accept** pins the update by the first "
++                  "12 hex digits of its sha256, which you must retype. **verify** checks every active list against its pin. "
++                  "Apply an accepted update with SIGHUP to the daemon."),
++            ("p", "**check** is separate: it loads a blocklist file or directory, prints a summary, and tells you whether each "
++                  "address or domain you name matches."),
++        ],
++        sections=[
++            ("ENVIRONMENT", [("tp", "**CORA_BLOCKLIST_DIR**", "The store directory. Default /var/lib/cora-sentinel/blocklists as root, "
++                                                                "otherwise ~/.local/share/cora-sentinel/blocklists.")]),
++            ("EXIT STATUS", [("p", "0 on success. 1 on an error or a failed **verify**. 10 when **pull** staged changes that wait for review. "
++                                   "2 on a usage error.")]),
++            ("EXAMPLES", [("code", "cora-blocklist check /etc/cora-sentinel/blocklists 203.0.113.9 ads.example.com\n"
++                                   "cora-blocklist pull\ncora-blocklist diff\ncora-blocklist accept rogue-subnets --sha256 0123456789ab")]),
++        ],
++        see_also=["cora-sentinel(1)", "cora-floor(1)"],
++    ),
++
++    "cora-report": dict(
++        summary="anonymized violation report tooling",
++        synopsis=["**cora-report** **--write-schema** //PATH//"],
++        parser=("cora_sentinel.report", "main"),
++        description=[
++            ("p", "The sentinel can write anonymized violation reports in the schema //cora.security.violation/v1//. "
++                  "**cora-report** writes that JSON Schema to a file, so a report can be validated. With no option it prints "
++                  "its help and exits with status 2."),
++        ],
++        sections=[("EXIT STATUS", [("p", "0 after writing the schema. 2 with no option.")]),
++                  ("FILES", [("tp", f"{DOCS}/violation-reports.md", "What a report holds and what it leaves out.")])],
++        see_also=["cora-sentinel(1)"],
++    ),
++
++    "cora-demo": dict(
++        summary="live demonstration of the whole cora-sentinel chain",
++        synopsis=["**cora-demo** [//OPTIONS//]"],
++        parser=("cora_sentinel.demo", "main"),
++        description=[
++            ("p", "**cora-demo** runs the whole chain once on this machine: it starts a task that contacts a blocklisted destination "
++                  "(an offline stand-in unless **--domain** is given), the sentinel detects it, the model judges it, and the resulting "
++                  "action is carried out unless **--dry-run** is given. It checks the machine first and stops with FAIL lines for "
++                  "what is missing. It needs root, cgroup v2, nftables, a real network address and a model."),
++        ],
++        sections=[("EXIT STATUS", [("p", "2 if the machine cannot run it (the FAIL lines say why).")]),
++                  ("EXAMPLES", [("code", "sudo cora-demo --model model.gguf --dry-run\nsudo cora-demo --model model.gguf --ephemeral")])],
++        see_also=["cora-sentinel(1)", "cora-selfcheck(1)"],
++    ),
++
++    "cora-selfcheck": dict(
++        summary="can this machine run the sentinel, and is the install complete?",
++        synopsis=["**cora-selfcheck**"],
++        description=[
++            ("p", "**cora-selfcheck** reports what this machine and this install can do. Its //required// section covers the Python "
++                  "version, the vendored safety gate (verified byte for byte against its VENDOR.lock, and reported as modified if "
++                  "it is not) and the modules' own probes. The rest lists the machine's capabilities: root, cgroup v2, nftables, "
++                  "NFLOG, sock_diag. Each missing one says what it costs you, because most are optional: without nftables you lose "
++                  "isolation, without NFLOG the connect-time tap, without root all of it."),
++        ],
++        sections=[("EXIT STATUS", [("p", "0 only if everything required is present. A missing machine capability is reported but is not a "
++                                         "failure. 1 if a required item is missing, including a modified vendored gate.")])],
++        see_also=["cora-sentinel(1)", "cora-demo(1)"],
++    ),
++}
++
++ORDER = ["cora-sentinel", "cora-run", "cora-cgroup", "cora-firewall", "cora-floor", "cora-blocklist", "cora-report", "cora-demo",
++         "cora-selfcheck"]
++
++
++# --------------------------------------------------------------------------------------------------------------------
++# roff
++# --------------------------------------------------------------------------------------------------------------------
++ASCII = {"\u2192": "->", "\u2013": "-", "\u2014": " - ", "\u2265": ">=", "\u2264": "<=", "\u2026": "...", "\u201c": '"', "\u201d": '"',
++         "\u2018": "'", "\u2019": "'", "\u00d7": "x", "\u00b7": "."}
++
++
++def esc(s: str) -> str:
++    """roff-safe text: backslash and hyphen escaped, anything outside ASCII as a \\[uXXXX] glyph."""
++    for k, v in ASCII.items():
++        s = s.replace(k, v)
++    out = []
++    for c in s:
++        out.append("\\e" if c == "\\" else "\\-" if c == "-" else c if ord(c) < 128 else f"\\[u{ord(c):04X}]")
++    return "".join(out)
++
++
++def inline(s: str) -> str:
++    """**bold** and //italic// markers, on text that is already escaped."""
++    s = re.sub(r"\*\*(.+?)\*\*", lambda m: "\\fB" + m.group(1) + "\\fR", s)
++    return re.sub(r"//(.+?)//", lambda m: "\\fI" + m.group(1) + "\\fR", s)
++
++
++def text(s: str) -> str:
++    return inline(esc(s))
++
++
++def guard(line: str) -> str:
++    return "\\&" + line if line[:1] in (".", "'") else line
++
++
++def para(s: str) -> List[str]:
++    return [".PP"] + [guard(l) for l in text(s).splitlines()]
++
++
++def code(s: str) -> List[str]:
++    return [".PP", ".nf", ".RS 4"] + [guard(esc(l)) for l in s.splitlines()] + [".RE", ".fi"]
++
++
++def tagged(label: str, body: str) -> List[str]:
++    return [".TP", text(label)] + [guard(l) for l in text(body).splitlines()]
++
++
++def blocks(items) -> List[str]:
++    out: List[str] = []
++    for it in items:
++        if it[0] == "p":
++            out += para(it[1])
++        elif it[0] == "code":
++            out += code(it[1])
++        elif it[0] == "tp":
++            out += tagged(it[1], it[2])
++    return out
++
++
++# --------------------------------------------------------------------------------------------------------------------
++# argparse introspection
++# --------------------------------------------------------------------------------------------------------------------
++class _Captured(Exception):
++    pass
++
++
++def capture(module: str, func: str, prog: str) -> argparse.ArgumentParser:
++    """Run module.func() until it first calls ArgumentParser.parse_args, and hand back that parser."""
++    held: dict = {}
++    real = argparse.ArgumentParser.parse_args
++
++    def fake(self, args=None, namespace=None):
++        held["parser"] = self
++        raise _Captured()
++    argparse.ArgumentParser.parse_args = fake
++    old = sys.argv
++    sys.argv = [prog]
++    try:
++        getattr(importlib.import_module(module), func)()
++    except _Captured:
++        pass
++    finally:
++        argparse.ArgumentParser.parse_args = real
++        sys.argv = old
++    if "parser" not in held:
++        raise RuntimeError(f"{module}.{func} never built an argparse parser")
++    return held["parser"]
++
++
++def _label(act: argparse.Action) -> str:
++    mv = act.metavar or act.dest
++    mv = " ".join(mv) if isinstance(mv, tuple) else str(mv)
++    if not act.option_strings:                                  # a positional argument
++        return f"//{mv.upper()}//"
++    flags = ", ".join(f"**{o}**" for o in act.option_strings)
++    if act.nargs == 0:
++        return flags
++    val = "{" + "|".join(map(str, act.choices)) + "}" if act.choices else (act.metavar and mv or act.dest.upper())
++    return f"{flags} //{val}//"
++
++
++def _help(parser: argparse.ArgumentParser, act: argparse.Action) -> str:
++    h = parser._get_formatter()._expand_help(act)          # fills %(default)s and friends, as --help does
++    return re.sub(r"\s+", " ", h).strip()
++
++
++def option_blocks(parser: argparse.ArgumentParser) -> List[str]:
++    out: List[str] = []
++    for act in parser._actions:
++        if act.help == argparse.SUPPRESS or isinstance(act, (argparse._HelpAction, argparse._SubParsersAction)):
++            continue
++        if not act.option_strings and not act.help:
++            continue
++        out += tagged(_label(act), _help(parser, act) if act.help else "")
++    return out
++
++
++def command_blocks(parser: argparse.ArgumentParser) -> List[str]:
++    out: List[str] = []
++    for act in parser._actions:
++        if not isinstance(act, argparse._SubParsersAction):
++            continue
++        shown = {a.dest: a for a in act._choices_actions if a.help != argparse.SUPPRESS}
++        for name, sp in act.choices.items():
++            if name not in shown:
++                continue
++            args = " ".join(_label(a) for a in sp._actions if not isinstance(a, argparse._HelpAction) and a.help != argparse.SUPPRESS)
++            out += tagged(f"**{name}**" + (f" {args}" if args else ""), re.sub(r"\s+", " ", shown[name].help or "").strip())
++    return out
++
++
++# --------------------------------------------------------------------------------------------------------------------
++# a page
++# --------------------------------------------------------------------------------------------------------------------
++def render(name: str, version: str, date: str) -> str:
++    spec = PAGES[name]
++    L: List[str] = [f'.TH {name.upper().replace("-", chr(92) + "-")} 1 "{date}" "cora-sentinel {version}" "cora-sentinel manual"', ".nh",
++                    ".SH NAME", f"{esc(name)} \\- {esc(spec['summary'])}", ".SH SYNOPSIS"]
++    for i, s in enumerate(spec["synopsis"]):
++        L += ([".br"] if i else []) + [text(s)]
++    L += [".SH DESCRIPTION"] + blocks(spec["description"])
++    parser = None
++    if "parser" in spec:
++        parser = capture(*spec["parser"], prog=name)
++        opts = option_blocks(parser)
++        if opts:
++            L += [".SH OPTIONS"] + opts
++        cmds = command_blocks(parser)
++        if cmds:
++            L += [".SH COMMANDS"] + cmds
++    if "commands" in spec:
++        L += [".SH COMMANDS"]
++        for label, body in spec["commands"]:
++            L += tagged(label, body)
++    for title, make in spec.get("extra_parsers", []):
++        L += [f".SH {title}"] + option_blocks(make())
++    for title, items in spec.get("sections", []):
++        L += [f".SH {title}"] + blocks(items)
++    L += [".SH SEE ALSO", ", ".join(f"\\fB{esc(r.split('(')[0])}\\fR({r.split('(')[1][:-1]})" for r in spec["see_also"]) + ".",
++          ".SH REPORTING BUGS", f"{esc(URL)}/issues"]
++    return "\n".join(L) + "\n"
++
++
++def main(argv: Optional[List[str]] = None) -> int:
++    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
++    ap.add_argument("--out", type=Path, help="write DIR/<command>.1 for every command")
++    ap.add_argument("--date", default="", help="the date in the page footer (default: none, so the output is reproducible)")
++    ap.add_argument("--list", action="store_true")
++    a = ap.parse_args(argv)
++    if a.list:
++        print("\n".join(ORDER))
++        return 0
++    if not a.out:
++        ap.error("--out DIR is required (or --list)")
++    from cora_sentinel import __version__
++    a.out.mkdir(parents=True, exist_ok=True)
++    for name in ORDER:
++        (a.out / f"{name}.1").write_text(render(name, __version__, a.date))
++    print(f"wrote {len(ORDER)} pages to {a.out}")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())

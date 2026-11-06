@@ -265,6 +265,20 @@ def test_the_packaged_code_is_self_contained_and_its_gate_verifies(data):
 
 
 @have_tools
+def test_the_man_pages_are_installed_gzipped_with_the_build_date_and_the_version(data):
+    man = data / "usr/share/man/man1"
+    assert sorted(p.name for p in man.iterdir()) == sorted(f"{c}.1.gz" for c in SCRIPTS)
+    for c in SCRIPTS:
+        raw = (man / f"{c}.1.gz").read_bytes()
+        page = gzip.decompress(raw).decode()
+        assert page.startswith(f'.TH {c.upper().replace("-", chr(92) + "-")} 1 "2027-01-15" "cora-sentinel {cora_sentinel.__version__}"')
+        assert raw[4:8] == b"\0\0\0\0"                                  # gzip -n: no timestamp in the header, so the .deb is reproducible
+        if shutil.which("groff"):
+            r = subprocess.run(["groff", "-man", "-ww", "-z"], input=page, capture_output=True, text=True)
+            assert r.returncode == 0 and r.stderr == "", f"{c}: {r.stderr}"
+
+
+@have_tools
 def test_the_copyright_file_credits_both_licenses_and_names_the_vendored_commit(data):
     c = (data / "usr/share/doc/cora-sentinel/copyright").read_text()
     assert c.startswith("Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/")

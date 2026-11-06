@@ -186,7 +186,7 @@ def main() -> int:
                          "only the NFLOG tap can see this")
     ap.add_argument("--no-nflog", action="store_true", help="do not use the NFLOG flow tap")
     ap.add_argument("--timeout", type=float, default=150, help="seconds to wait for the whole chain")
-    ap.add_argument("--threads", type=int, default=None)
+    ap.add_argument("--threads", type=int, default=None, help="CPU threads for the language model (default: the library's choice)")
     ap.add_argument("--workdir", help="keep files here (default: a temp dir)")
     a = ap.parse_args()
 

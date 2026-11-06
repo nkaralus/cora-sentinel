@@ -604,7 +604,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         from cora_sentinel import dynreplay
         return dynreplay.main(args[args.index("dyn-replay") + 1:])
     ap = argparse.ArgumentParser(prog="cora-floor", description="Inspect and drive the kernel-side blocklist floor.")
-    ap.add_argument("--table", default=os.environ.get("CORA_NFT_TABLE", "cora"))
+    ap.add_argument("--table", default=os.environ.get("CORA_NFT_TABLE", "cora"),
+                    help="the nftables table (default cora, or $CORA_NFT_TABLE)")
     ap.add_argument("--state-dir", default=os.environ.get("CORA_STATE_DIR", floorguard.DEFAULT_STATE_DIR),
                     help="where the confirmation state lives (default /var/lib/cora-sentinel)")
     sub = ap.add_subparsers(dest="cmd", required=True)

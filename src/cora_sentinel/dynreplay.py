@@ -523,9 +523,14 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--until", metavar="ISO", help="only decisions before this time")
     g = ap.add_argument_group("policy settings (rehearsing: a tweak, run as B against the defaults as A; "
                               "with --as-recorded/--check: the live daemon's settings)")
-    g.add_argument("--min-conf", type=float), g.add_argument("--write-budget", type=int, metavar="PER_MIN")
-    g.add_argument("--max-live", type=int), g.add_argument("--task-cap", type=int), g.add_argument("--promote-tasks", type=int)
-    g.add_argument("--flow-ttl", type=int, metavar="SEC"), g.add_argument("--ip-ttl", type=int, metavar="SEC")
+    g.add_argument("--min-conf", type=float, help="model confidence needed to block (default 0.9)")
+    g.add_argument("--write-budget", type=int, metavar="PER_MIN", help="kernel writes per minute (default 20)")
+    g.add_argument("--max-live", type=int, help="live dynamic elements (default 512)")
+    g.add_argument("--task-cap", type=int, help="distinct targets per task per hour (default 8)")
+    g.add_argument("--promote-tasks", type=int,
+                   help="distinct tasks on non-web ports of one address that promote its flow block to the whole address (default 2)")
+    g.add_argument("--flow-ttl", type=int, metavar="SEC", help="lifetime of a first flow block, in seconds (default 600)")
+    g.add_argument("--ip-ttl", type=int, metavar="SEC", help="lifetime of a first whole-address block, in seconds (default 1800)")
     g.add_argument("--allow", action="append", default=[], metavar="CIDR", help="never block these (exemption)")
     g.add_argument("--protect", action="append", default=[], metavar="ADDR", help="never block this address")
     w = ap.add_argument_group("world")
@@ -535,9 +540,11 @@ def build_parser() -> argparse.ArgumentParser:
     w.add_argument("--diff-recorded", action="store_true", help="also compare the result with what shadow recorded")
     ap.add_argument("--kernel", choices=("auto", "on", "off"), default="auto",
                     help="mirror writes into a private namespace and cross-check (auto: if root, nft and unshare)")
-    ap.add_argument("--json", action="store_true"), ap.add_argument("--outcomes", action="store_true", help="with --json: every decision")
-    ap.add_argument("--top", type=int, default=10), ap.add_argument("--changes", type=int, default=15)
-    ap.add_argument("--timeline", action="store_true")
+    ap.add_argument("--json", action="store_true", help="print machine-readable JSON instead of text")
+    ap.add_argument("--outcomes", action="store_true", help="with --json: every decision")
+    ap.add_argument("--top", type=int, default=10, help="how many targets to list (default %(default)s)")
+    ap.add_argument("--changes", type=int, default=15, help="how many changed decisions to list in a diff (default %(default)s)")
+    ap.add_argument("--timeline", action="store_true", help="add an hour-by-hour timeline")
     ap.add_argument("--in-ns", action="store_true", help=argparse.SUPPRESS)
     return ap
 

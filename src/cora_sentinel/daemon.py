@@ -575,7 +575,9 @@ def main() -> int:
                          "floor, and let the model only add to it; see docs/containment-latency.md)")
     ap.add_argument("--report-dir", default="cora_reports",
                     help="anonymized violation reports for blocklist hits ('' disables)")
-    ap.add_argument("--report-salt", default="~/.config/cora/report_salt")
+    ap.add_argument("--report-salt", default="~/.config/cora/report_salt",
+                    help="file holding the secret salt that pseudonymizes task names in violation reports; created if missing, "
+                         "and kept OUTSIDE the report directory on purpose (default %(default)s)")
     ap.add_argument("--report-include-process", action="store_true",
                     help="include the executable basename in reports (off by default)")
     ap.add_argument("--net-source", choices=("auto", "sockdiag", "proc"), default="auto",
@@ -631,18 +633,22 @@ def main() -> int:
     ap.add_argument("--nft", action="store_true",
                     help="enable the ISOLATE verdict: per-cgroup egress drop via nftables "
                          "(needs --cgroup-root and root/CAP_NET_ADMIN)")
-    ap.add_argument("--cgroup-mount", default="/sys/fs/cgroup")
-    ap.add_argument("--spike-mb", type=int, default=150)
-    ap.add_argument("--window", type=float, default=10.0)
-    ap.add_argument("--interval", type=float, default=1.0)
-    ap.add_argument("--out", default="sentinel_events.jsonl")
-    ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--cgroup-mount", default="/sys/fs/cgroup", help="where cgroup v2 is mounted (default %(default)s)")
+    ap.add_argument("--spike-mb", type=int, default=150,
+                    help="report a memory spike when a task's resident memory rises by at least this many MB above its minimum "
+                         "within --window (default %(default)s)")
+    ap.add_argument("--window", type=float, default=10.0, help="seconds of memory history a spike is measured over (default %(default)s)")
+    ap.add_argument("--interval", type=float, default=1.0, help="seconds between checks (default %(default)s)")
+    ap.add_argument("--out", default="sentinel_events.jsonl", help="write events here, one JSON object per line (default %(default)s)")
+    ap.add_argument("--selftest", action="store_true", help="run the built-in self-test, which provokes each kind of event once, and exit (0 on PASS)")
     ap.add_argument("--model", help="path to Qwen GGUF; enables the verdict stage")
     ap.add_argument("--enforce", action="store_true",
                     help="actually act on verdicts (default: dry-run)")
-    ap.add_argument("--min-conf", type=float, default=0.6)
-    ap.add_argument("--decisions", default="sentinel_decisions.jsonl")
-    ap.add_argument("--threads", type=int, default=None)
+    ap.add_argument("--min-conf", type=float, default=0.6,
+                    help="minimum model confidence (0 to 1) for an actionable verdict; below it the verdict becomes ESCALATE (default %(default)s)")
+    ap.add_argument("--decisions", default="sentinel_decisions.jsonl",
+                    help="write each adjudicator decision here, one JSON object per line (default %(default)s)")
+    ap.add_argument("--threads", type=int, default=None, help="CPU threads for the language model (default: the library's choice)")
     a = ap.parse_args()
 
     if a.selftest:

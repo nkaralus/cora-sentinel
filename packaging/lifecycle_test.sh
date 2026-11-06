@@ -38,9 +38,15 @@ where="$(cd / && python3 -c 'import cora_sentinel; print(cora_sentinel.__file__)
 case "$where" in /usr/lib/python3/dist-packages/*) ok "python3 imports the packaged copy";; *) bad "python3 imports $where (something shadows the package)";; esac
 sc="$(cd / && cora-selfcheck 2>&1)"          # captured, not piped into grep -q: SIGPIPE + pipefail would fake a failure
 grep -q "ok .*vendored subnetbus .* verified" <<<"$sc" && ok "cora-selfcheck: vendored gate verified" || bad "cora-selfcheck did not verify the vendored gate"
-# a minimal image may path-exclude /usr/share/doc (dpkg then reports the docs missing); nothing else may be reported
-v="$(dpkg -V cora-sentinel | grep -v ' /usr/share/doc/' || true)"
+# a minimal image may path-exclude /usr/share/doc and /usr/share/man (dpkg then reports them missing); nothing else may be reported
+v="$(dpkg -V cora-sentinel | grep -vE ' /usr/share/(doc|man)/' || true)"
 [ -z "$v" ] && ok "dpkg -V is clean (docs aside)" || bad "dpkg -V reports: $v"
+if grep -qs "^path-exclude=/usr/share/man" /etc/dpkg/dpkg.cfg /etc/dpkg/dpkg.cfg.d/* 2>/dev/null; then
+    echo "  skip  man pages (this image excludes /usr/share/man from packages)"
+else
+    for c in sentinel run cgroup firewall floor blocklist report demo selfcheck; do check "man page: cora-$c(1)" test -s "/usr/share/man/man1/cora-$c.1.gz"; done
+    man -w cora-floor >/dev/null 2>&1 && ok "man finds cora-floor(1)" || bad "man cannot find cora-floor(1)"
+fi
 if [ -d /run/systemd/system ]; then
     gone systemctl is-active --quiet cora-sentinel && ok "service not started" || bad "service was started"
     gone systemctl is-enabled --quiet cora-sentinel && ok "service not enabled" || bad "service was enabled"
@@ -75,6 +81,7 @@ gone test -e /var/lib/cora-sentinel && ok "state removed" || bad "state left beh
 check "audit logs KEPT" test -e /var/log/cora-sentinel/decisions.jsonl
 grep -q "kept the audit logs" <<<"$out" && ok "said so" || bad "no 'kept the audit logs' message"
 gone test -e /usr/lib/python3/dist-packages/cora_sentinel && ok "no package files left" || bad "package files left behind"
+gone test -e /usr/share/man/man1/cora-floor.1.gz && ok "man pages removed" || bad "man pages left behind"
 rm -rf /var/log/cora-sentinel        # the test's own audit file
 
 echo

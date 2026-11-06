@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.8.2
+
+### Added
+- **Man pages for all nine commands** (`cora-sentinel`, `cora-run`, `cora-cgroup`, `cora-firewall`, `cora-floor`, `cora-blocklist`,
+  `cora-report`, `cora-demo`, `cora-selfcheck`), installed by the `.deb` to `/usr/share/man/man1/*.1.gz`.
+  `tools/gen_man.py` builds them at build time; nothing generated is checked in. The OPTIONS and COMMANDS sections come from the
+  real argparse parsers (including `cora-floor`'s subcommands and `dyn-replay`'s options), so they cannot drift; the descriptions,
+  signals, files, environment, exit status and examples are in the generator. The page date is the build epoch, so the `.deb` stays
+  byte-reproducible.
+- `tests/test_man.py` (19): every console script has a page; every page is clean roff (`groff -ww`) and has the standard sections
+  and an EXIT STATUS; no option or command is listed without a description; every option and subcommand the parsers accept is in
+  the page; every subcommand in the hand-parsed tools' usage text is in theirs; every `CORA_*` environment variable a tool reads is
+  documented; `SEE ALSO` points only at pages that exist; reproducible output; roff escaping. Mutation-checked (a new undocumented
+  environment variable, subcommand and option each fail it). The `.deb` test checks the nine `.1.gz` files, their date and version,
+  and that they pass `groff -ww`.
+- `tests/test_ci.py` (+1): a `pytest` line in the CI `package` job must set `PYTHONPATH=src` or the job must install the project. The
+  first real GitHub run failed there with `ModuleNotFoundError` (fixed upstream in `de26085`); a local emulation could not show it,
+  because the project was installed on the machine that ran it. The test fails on the original workflow and passes on the fix.
+- `packaging/lifecycle_test.sh` checks the installed man pages (and `man -w`) and that purge removes them, and skips that on an image
+  that excludes `/usr/share/man`.
+
+### Fixed
+- Twenty-three options had no description in the code, so they were blank in `--help` as well as in the new pages. They now say what
+  they do (`--spike-mb`, `--window`, `--interval`, `--out`, `--decisions`, `--min-conf`, `--selftest`, `--threads`, `--cgroup-mount`,
+  `--report-salt`, `cora-floor --table`, and `dyn-replay`'s tuning and output options).
+- `CORA_NFT_NATIVE` (read by `cora-firewall` and the daemon, default 1; 0 reads the ruleset with `nft -j list` instead of netlink)
+  was undocumented. The man page test found it.
+
+### Changed
+- `lintian` on the package: 14 warnings down to 5 (the nine `no-manual-page` warnings are gone; nothing new appeared).
+
 ## 0.8.1
 
 ### Fixed

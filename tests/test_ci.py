@@ -85,6 +85,17 @@ def test_the_build_job_checks_the_gate_the_checksums_reproducibility_and_lintian
     assert "python tools/vendor_bus.py check" in job("unprivileged")
 
 
+def test_the_package_job_can_import_the_project_wherever_it_runs_pytest():
+    """The package job installs build tools, not the project. A pytest line there must say where the code is (PYTHONPATH=src), or the
+    first run on a real runner fails with ModuleNotFoundError (it did, and a local run could not show it: there the project was installed)."""
+    runs = [l for l in job("package").splitlines() if "pytest" in l and not l.lstrip().startswith(("#", "python -m pip install"))
+            and "pip install" not in l]
+    installs_project = re.search(r"pip install (-e )?[\"']?\.", job("package")) is not None
+    assert runs, "the package job runs no tests?"
+    for l in runs:
+        assert installs_project or "PYTHONPATH=src" in l, f"pytest cannot import cora_sentinel here: {l.strip()}"
+
+
 def test_every_script_the_workflows_call_exists_and_is_executable():
     for rel in ("packaging/build_release.sh", "packaging/lifecycle_test.sh", "tools/vendor_bus.py"):
         p = ROOT / rel

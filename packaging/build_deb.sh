@@ -49,7 +49,7 @@ stage="$tmp/stage"
 site="$stage/usr/lib/python3/dist-packages"
 doc="$stage/usr/share/doc/cora-sentinel"
 mkdir -p "$site" "$stage/DEBIAN" "$stage/usr/bin" "$stage/usr/lib/systemd/system" "$stage/etc/cora-sentinel" \
-         "$stage/etc/logrotate.d" "$doc"
+         "$stage/etc/logrotate.d" "$doc" "$stage/usr/share/man/man1"
 
 # ---- code: the wheel, minus RECORD (stale once modes change), marked as dpkg's so pip will not uninstall it ------------
 python3 -m zipfile -e "$wheel" "$site"
@@ -78,6 +78,9 @@ cp "$repo/deploy/cora-sentinel.logrotate" "$stage/etc/logrotate.d/cora-sentinel"
 cp "$repo/README.md" "$doc/README.md"
 cp "$repo"/docs/*.md "$doc/"
 gzip -9n -c "$repo/CHANGELOG.md" > "$doc/changelog.gz"
+# the man pages are generated from the real argument parsers (tools/gen_man.py); nothing generated is kept in git
+python3 "$repo/tools/gen_man.py" --out "$tmp/man" --date "$(date -u -d "@$sde" +%Y-%m-%d)" >/dev/null
+for page in "$tmp"/man/*.1; do gzip -9n -c "$page" > "$stage/usr/share/man/man1/$(basename "$page").gz"; done
 # Debian wants its own changelog format; the real history is upstream's CHANGELOG.md, shipped beside it
 gzip -9n -c > "$doc/changelog.Debian.gz" <<CHG
 cora-sentinel (${version}-${rev}) unstable; urgency=medium

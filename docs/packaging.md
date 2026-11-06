@@ -62,10 +62,22 @@ start is yours (the install prints the three steps). The package is `Architectur
 | `/etc/cora-sentinel/cora-sentinel.conf` | conffile: the daemon's arguments (`CORA_ARGS`). dpkg keeps your edits across upgrades |
 | `/etc/logrotate.d/cora-sentinel` | conffile: size-based, `copytruncate` |
 | `/usr/share/doc/cora-sentinel/` | README, these docs, `changelog.gz`, `copyright` (both licenses) |
+| `/usr/share/man/man1/cora-*.1.gz` | a man page for each of the nine commands (below) |
 
 The unit is in `/usr/lib/systemd/system`, not `/etc`, so it is not a conffile: files under `/usr` never are, and putting it
 in `/etc/systemd/system` would make it silently override the package's updates. Customize it with `systemctl edit
 cora-sentinel` (a drop-in). The venv installer (`deploy/install-service.sh`) is unchanged and uses the same unit template.
+
+### Man pages
+
+`man cora-sentinel`, `cora-run`, `cora-cgroup`, `cora-firewall`, `cora-floor`, `cora-blocklist`, `cora-report`, `cora-demo` and
+`cora-selfcheck`. They are generated at build time by `tools/gen_man.py` (`python tools/gen_man.py --out DIR` writes them) and
+nothing generated is kept in git. The OPTIONS and COMMANDS sections are read from the real argparse parsers, so an option cannot be
+added to the code and forgotten here; the hand-parsed tools (`cora-run`, `cora-cgroup`, `cora-firewall`, `cora-selfcheck`) are
+written out in the generator. `tests/test_man.py` fails when an option has no description, when a subcommand in a tool's usage text
+or an environment variable it reads is missing from its page, when a page is not clean roff (`groff -ww`), or when a `SEE ALSO`
+points nowhere; it has already caught one real gap (`CORA_NFT_NATIVE` was undocumented). The page date is the build epoch, so the
+`.deb` stays reproducible.
 
 ### What each dpkg action does
 
@@ -123,8 +135,8 @@ compile). `PYTHONPATH` is set in the config, not the unit, so the side-install i
   `license-files`.
 - The `.deb` is built with `dpkg-deb` alone, so it is not a Debian *source* package (no `debian/` tree for a PPA or the
   archive). `Maintainer:` defaults to a GitHub no-reply address; set `DEB_MAINTAINER` to change it.
-- `lintian` (run on the final package): **0 errors**, 14 warnings, all known and left alone. `maintainer-script-calls-systemctl`
+- `lintian` (run on the final package): **0 errors**, 5 warnings, all known and left alone. `maintainer-script-calls-systemctl`
   (4): the scripts call `systemctl` directly, guarded by `/run/systemd/system`, instead of debhelper's generated
-  `deb-systemd-invoke` snippets. `no-manual-page` (9): the commands have `--help` but no man pages yet.
-  `initial-upload-closes-no-bugs`: only relevant to an upload to the Debian archive.
+  `deb-systemd-invoke` snippets. `initial-upload-closes-no-bugs`: only relevant to an upload to the Debian archive. (The nine
+  `no-manual-page` warnings were cleared in 0.8.2 by the man pages above.)
 - Not signed. To publish, put the files in an apt repository (`reprepro`, `aptly`) and sign that.

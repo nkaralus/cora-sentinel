@@ -47,7 +47,8 @@ For development: `pip install -e ".[dev]"`.
 **A package for Ubuntu/Debian.** `packaging/build_release.sh` builds an sdist, a wheel and a native `.deb`
 (`Architecture: all`, depends on `python3` and `nftables` only). Installing it does not start the service; removing it stops
 the service and removes the kernel floor; purging keeps the audit logs. See [docs/packaging.md](docs/packaging.md)
-(including how to side-install `llama-cpp-python` for the model under Ubuntu's PEP 668 restriction).
+(including how to side-install `llama-cpp-python` for the model under Ubuntu's PEP 668 restriction). The package installs a man
+page for each of the nine commands (`man cora-floor`), generated at build time from the real argument parsers.
 
 ## Try it
 
