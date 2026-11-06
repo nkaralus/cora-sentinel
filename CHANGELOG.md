@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.8.7
+
+### Fixed
+- **Two real-kernel tests failed in the privileged CI job** (`tests/test_cgroup_nested.py`: `PermissionError: [Errno 13] Permission denied: '.../nest/sub'`). The CI job runs `sudo ./venv/bin/python -m pytest`, which sets `SUDO_UID`, and `cora-run` then drops the worker it starts to that user. The worker tried to create its own sub-cgroup inside a root-owned task cgroup and was refused. My sandbox runs as plain root with no `SUDO_UID`, so its workers stayed root and the failure never appeared there. Only the tests were wrong; no product code changed.
+  - **A `chmod 0777` on the task directory is not enough** (tried): the `mkdir` then succeeds, but the move into the sub-cgroup fails with `EACCES`, because moving a process needs write access to the task's own `cgroup.procs` (the common ancestor), which stays root-owned. It would also have turned the event test into a false pass: the old worker swallowed the failed move and connected from the top-level task cgroup, which the pre-0.8.6 code handles too.
+  - **The worker now creates nothing and moves nothing.** It waits until the test (root) has moved it into `nest/sub/worker`, as a launcher or a container runtime would, and only then connects. So it needs no permission, and it cannot connect before it is nested (the 0.8.6 test could pass without ever exercising the nested path).
+  - **Both tests now run twice**: as the test runs, and as an unprivileged user (`SUDO_UID=65534`, exactly what makes `cora-run` drop privileges). The CI condition is therefore covered wherever the tests run as root, not only in CI.
+  - `test_the_worker_needs_no_permission_because_the_test_does_the_moving` fails if the worker is ever given the power to create or move cgroups itself.
+  - Checked: with the original bug put back (`pids()` ignoring sub-cgroups, or `cgroup_of` matching exactly) the tests fail in both modes; 12 consecutive runs, six as root and six with sudo's variables set, were clean.
+
+### Observed, not changed
+- An unprivileged process inside a task cgroup cannot create sub-cgroups, or move into them, unless the task cgroup is delegated to it (the directory and its `cgroup.procs` chowned to it). `cora-run` does not delegate. So the nested-cgroup case that 0.8.6 fixes arises where sub-cgroups are made by root or by a manager that delegates (systemd, a container runtime), not by an unprivileged task on its own. Whether `cora-run` should delegate its task cgroup to the user it drops to is a design question, not decided here.
+
 ## 0.8.6
 
 ### Fixed

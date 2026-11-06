@@ -19,7 +19,7 @@ The model is never in the hot path and never chooses the target.
           (SUSPEND = cgroup.freeze, TERMINATE = cgroup.kill, THROTTLE = cpu/memory)    + anonymized report
 ```
 
-**Status: beta (0.8.6).** Verified by the test suite on Linux 6.18 (a VM), and by the author on bare-metal
+**Status: beta (0.8.7).** Verified by the test suite on Linux 6.18 (a VM), and by the author on bare-metal
 Ubuntu for the TCP tap and the demo. UDP/QUIC/DNS support has so far only been verified in the VM.
 
 ## Requirements
@@ -270,10 +270,11 @@ python -m pytest -q                              # unprivileged: kernel tests sk
 sudo -E ./venv/bin/python -m pytest -q           # everything (CORA_GGUF=path adds the real-model test)
 ```
 
-At 0.8.6: **922 passed, 7 skipped** as root (the skips: IPv6 loopback for sock_diag and the tap, two tests that only apply when
-not root, the real-model test, and the comparison with GitHub that needs `CORA_TEST_NETWORK=1`), and **818 passed, 111 skipped** run
-as an unprivileged user, which is what CI executes (the skips there are the tests that need root, a cgroup v2 mount, nft or a real
-address, so they cannot fail on a machine without them).
+At 0.8.7: **925 passed, 7 skipped** as root, run both plainly and with `SUDO_UID` set the way CI's `sudo pytest` runs it (the tests
+then start their workers as an unprivileged user; the skips: IPv6 loopback for sock_diag and the tap, two tests that only apply when not
+root, the real-model test, and the comparison with GitHub that needs `CORA_TEST_NETWORK=1`), and **819 passed, 113 skipped** run as an
+unprivileged user, which is what CI executes (the skips there are the tests that need root, a cgroup v2 mount, nft or a real address, so
+they cannot fail on a machine without them).
 
 At 0.4.0: **453 passed, 5 skipped** as root against the installed wheel (the skips: IPv6 sock_diag, two tests that
 only apply when not root, and two IPv6 tap tests that have never been run on a kernel with IPv6; the real-model

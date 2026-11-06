@@ -185,11 +185,50 @@ def test_the_main_loop_uses_the_guarded_tick():
 
 
 # ---------------------------------------------------------------------------------------------- the real kernel (root only)
-def nested_worker(root, port=None, n=3, hold=1.5, sleep_only=False):
-    """What a browser does: the task makes a sub-cgroup, moves itself into it, and only then talks to the network."""
-    body = ("for _ in range(%d):\n    socket.create_connection((%r, %d)).close()\n" % (n, LOCAL, port)) if not sleep_only else ""
-    return ("import os, socket, time\nsub = os.path.join(%r, 'nest', 'sub', 'worker')\nos.makedirs(sub, exist_ok=True)\n"
-            "open(os.path.join(sub, 'cgroup.procs'), 'w').write(str(os.getpid()))\n%stime.sleep(%r)\n" % (str(root), body, hold))
+def nested_worker(port=None, n=3, hold=1.5):
+    """A worker that needs no permission at all. It creates nothing and moves nothing: it waits until something else has put it in
+    <root>/nest/sub/worker (the test does, as root, like a launcher or a container runtime would) and only THEN talks to the network, so it
+    can never connect from the top-level task cgroup and pass without exercising the nested path.
+
+    Why not let it make its own sub-cgroup: under `sudo pytest` (the privileged CI job) cora-run drops the worker to the invoking user, who
+    cannot mkdir in a root-owned cgroup. And a chmod of the task directory is not enough either: moving a process needs write access to the
+    task's own cgroup.procs (the common ancestor), so the move fails with EACCES and the worker stays where it was."""
+    connect = ("for _ in range(%d):\n    socket.create_connection((%r, %d)).close()\n" % (n, LOCAL, port)) if port else ""
+    return ("import os, socket, sys, time\n"
+            "print(os.getuid(), flush=True)\n"
+            "def where():\n"
+            "    for line in open('/proc/self/cgroup'):\n"
+            "        if line.startswith('0::'):\n"
+            "            return line[3:].strip()\n"
+            "end = time.monotonic() + 20\n"
+            "while not (where() or '').endswith('/nest/sub/worker'):\n"
+            "    if time.monotonic() > end:\n"
+            "        sys.exit('never moved into nest/sub/worker')\n"
+            "    time.sleep(0.01)\n"
+            "%stime.sleep(%r)\n" % (connect, hold))
+
+
+def move_into_sub_cgroup(cgroups, pid, timeout=10):
+    """The launcher's part, done by the test (root), so it never depends on who the worker runs as."""
+    end = time.monotonic() + timeout
+    while cgroups.cgroup_of(pid) != "nest" and time.monotonic() < end:
+        time.sleep(0.01)                                          # wait for cora-run to put the task in its cgroup
+    assert cgroups.cgroup_of(pid) == "nest", "cora-run never put the task in its cgroup"
+    sub = cgroups.root / "nest" / "sub" / "worker"
+    sub.mkdir(parents=True, exist_ok=True)
+    (sub / "cgroup.procs").write_text(str(pid))
+
+
+@pytest.fixture(params=["as the test runs", "as an unprivileged user"])
+def worker_user(request, monkeypatch):
+    """Who the worker runs as. `sudo pytest` (the privileged CI job) sets SUDO_UID, and cora-run then drops the worker to that user, so
+    the worker is NOT root there. Running both ways means the code is tested under that condition everywhere, not only in CI."""
+    if request.param == "as an unprivileged user":
+        if os.geteuid() != 0:
+            pytest.skip("cora-run only drops privileges when it starts as root")
+        monkeypatch.setenv("SUDO_UID", "65534")
+        monkeypatch.setenv("SUDO_GID", "65534")
+    return request.param
 
 
 @pytest.fixture
@@ -209,16 +248,28 @@ def nested_env(env):
                 time.sleep(0.1)                                   # the worker is still exiting
 
 
+def test_the_worker_needs_no_permission_because_the_test_does_the_moving():
+    code = nested_worker(port=1234)
+    for forbidden in ("makedirs", "mkdir", "chmod", "chown", "'w'", '"w"', "write("):
+        assert forbidden not in code, f"the worker must not create or move anything itself ({forbidden})"
+    assert "cgroup.procs" not in code
+
+
 @real
-def test_a_connection_from_a_nested_worker_becomes_an_event_instead_of_being_dropped(nested_env):
+def test_a_connection_from_a_nested_worker_becomes_an_event_instead_of_being_dropped(nested_env, worker_user):
     cgroups, fw, made = nested_env
     events = []
     lis, port = listener()
     stop = drain(lis)
     s, nm = monitor(cgroups, fw, made, events, interval=0.2)
-    p = task(cgroups, fw, "nest", nested_worker(cgroups.root, port))
+    p = task(cgroups, fw, "nest", nested_worker(port))
+    move_into_sub_cgroup(cgroups, p.pid)
+    assert p.pid not in cgroups.pids("nest", nested=False) and p.pid in cgroups.pids("nest"), "the worker really is nested"
+    uid = int(p.stdout.readline())
+    if worker_user == "as an unprivileged user":
+        assert uid == 65534, "the worker really did run as nobody, not as root"
     time.sleep(3.0)
-    p.wait(30)
+    assert p.wait(30) == 0, "the worker connected (it only does once it is nested)"
     stop.set()
     lis.close()
     st = nm.stats
@@ -231,14 +282,12 @@ def test_a_connection_from_a_nested_worker_becomes_an_event_instead_of_being_dro
 
 
 @real
-def test_cgroup_of_and_pids_agree_with_the_kernel_for_a_nested_process(nested_env):
+def test_cgroup_of_and_pids_agree_with_the_kernel_for_a_nested_process(nested_env, worker_user):
     cgroups, fw, made = nested_env
-    p = task(cgroups, fw, "nest", nested_worker(cgroups.root, hold=4, sleep_only=True))
+    p = task(cgroups, fw, "nest", nested_worker(hold=4))
     try:
-        end = time.monotonic() + 10
-        while not (cgroups._read_proc_cgroup(p.pid) or "").endswith("/nest/sub/worker") and time.monotonic() < end:
-            time.sleep(0.02)                                      # wait for the MOVE: before it, the pid is directly in the task
-        assert (cgroups._read_proc_cgroup(p.pid) or "").endswith("/nest/sub/worker"), "the worker never moved into its sub-cgroup"
+        move_into_sub_cgroup(cgroups, p.pid)
+        assert (cgroups._read_proc_cgroup(p.pid) or "").endswith("/nest/sub/worker")
         assert cgroups.cgroup_of(p.pid) == "nest", "the kernel says .../nest/sub/worker; the answer is the task"
         assert p.pid in cgroups.pids("nest") and p.pid not in cgroups.pids("nest", nested=False)
         assert cgroups.discover().get(p.pid) == "nest"
