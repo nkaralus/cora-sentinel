@@ -1,0 +1,1281 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 3685cbd..5263699 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,42 @@
+ # Changelog
+ 
++## 0.7.0
++
++### Added
++- **Replay harness (`cora-floor dyn-replay`, `tools/dyn_replay.py`, `cora_sentinel.dynreplay`).** Feeds recorded ISOLATE
++  decisions back through the real `DynPolicy` with a clock that follows the recorded timestamps, to rehearse policy
++  tweaks against shadow data without waiting a week and without touching the live system. It needs BOTH logs: a decision has
++  no destination or task, so it is joined with `events.jsonl` on `event_id` (rotated, `.gz`, several files, `-` for stdin;
++  `--since/--until`).
++- **Worlds.** *Rehearse* (default): the adjudicator is assumed enforcing (a dry-run ISOLATE counts as done) and a task's later
++  events are dropped once it is isolated, because an isolated task has no egress. `--as-recorded`: no assumptions.
++  `--check`: replay as recorded and verify every decision against the live `dyn` record (exit 1 on a mismatch); in these two
++  modes the policy flags state the LIVE daemon's settings.
++- **Report:** results, skip reasons, the three limits (write budget with peak per minute and denials, live elements, per-task
++  cap), the web-port section (blocks, refreshes, targets, promotions, which must be 0), the longest-blocked targets with
++  exact blocked time, `--timeline`, and for tweaks (`--min-conf --write-budget --max-live --task-cap --promote-tasks
++  --flow-ttl --ip-ttl --allow --protect`) a B-vs-A diff of every changed decision. `--json` / `--outcomes`.
++- **Kernel mode** (auto when root, nft and `unshare` exist; `--kernel off|on`): every write is mirrored into a private
++  network namespace and a throwaway table, elements are removed at their SIMULATED expiry, and the real nft state is
++  cross-checked against the ledger. Reports write count, p50/p99 and expiries removed.
++- **Self-checks (exit 2):** a web port promoted to a whole address (classified by port inside the replay, not from the
++  policy's own flag, so it cannot hide the bug it looks for), or the sets disagreeing with the ledger.
++- Tests: `test_dynreplay.py` (26) and `test_dynreplay_kernel.py` (4); the two daemon end-to-end tests replay the real
++  daemon's logs with `--check`.
++
++### Not done
++- It does not re-run the model, so a different model or prompt cannot be rehearsed; `--min-conf` filters recorded
++  confidences only.
++- The live allow list at the time is not recoverable (exemptions come from the recorded skip reasons plus `--allow` /
++  `--protect`); releases and manual unblocks are not in the log and are not replayed; time has one-second resolution.
++
++## 0.6.2
++
++### Fixed
++- Test fixtures (recorded here after the fact): `test_daemon_dyn.py` writes each task's result to `/tmp` because `cora-run`
++  drops root when started under `sudo` and the task could not write into the root-owned pytest directory; the logrotate
++  test stages a root-owned copy of the config, which logrotate insists on.
++
+ ## 0.6.1
+ 
+ ### Fixed
+diff --git a/README.md b/README.md
+index 215d2cf..d609af1 100644
+--- a/README.md
++++ b/README.md
+@@ -123,7 +123,8 @@ effect by default: the default is `shadow`**, which records what it *would* do i
+ Web ports (80/443) are blocked per flow only, never the whole address; other ports escalate to the whole address after
+ two distinct tasks; there are budgets (20 writes/min, 512 live, 8 targets per task per hour); and `cora-firewall release
+ TASK` drops what that task caused. See [docs/dyn-policy.md](docs/dyn-policy.md), and review a week of shadow data with
+-`cora-floor dyn-report sentinel_decisions.jsonl` before you consider `--dyn-policy enforce`.
++`cora-floor dyn-report sentinel_decisions.jsonl` before you consider `--dyn-policy enforce`, and rehearse a
++tweak against the recorded data with `cora-floor dyn-replay decisions.jsonl --task-cap 4` (see docs/dyn-policy.md).
+ 
+ ### As a service
+ 
+@@ -279,6 +280,10 @@ need a cgroup v2 mount, or `CORA_TEST_CGROUP_MOUNT`).
+ restored by the policy's decisions; they use a public address aliased inside the lab, because the policy refuses private
+ ones). `tools/dyn_bench.py` measures the per-decision cost.
+ 
++0.7.0 adds `tests/test_dynreplay.py` (26, no kernel: the logs are produced by running the live policy over synthetic
++scenarios) and `tests/test_dynreplay_kernel.py` (4: the private-namespace mode; the host ruleset is compared before and
++after). The two daemon end-to-end tests also replay the real daemon's own logs with `--check`.
++
+ 0.6.1 adds `tests/test_daemon_dyn.py` (2: the real daemon with a stub model and real `cora-run` tasks; shadow records
+ `would_block`, and in enforce a brand-new task's first packet to an isolated task's destination is dropped).
+ Daemon tests launch with `nsenter`, not `ip netns exec`, which would hide the host's cgroup mount.
+@@ -286,7 +291,7 @@ Daemon tests launch with `nsenter`, not `ip netns exec`, which would hide the ho
+ ## Layout
+ 
+ ```
+-src/cora_sentinel/   daemon  netmon  nflog  nftdump  nftsets  floorguard  dynpolicy  sockdiag  firewall  cgroup  blocklist  blocklist_store  reload  report  verdict  run  demo  selfcheck
++src/cora_sentinel/   daemon  netmon  nflog  nftdump  nftsets  floorguard  dynpolicy  dynreplay  sockdiag  firewall  cgroup  blocklist  blocklist_store  reload  report  verdict  run  demo  selfcheck
+ tests/               unit tests, plus kernel tests that skip without root
+ schema/              violation.schema.json (cora.security.violation/v1)
+ examples/            starter blocklists, an allow list, an example report
+diff --git a/docs/dyn-policy.md b/docs/dyn-policy.md
+index 973f48b..d4c54bc 100644
+--- a/docs/dyn-policy.md
++++ b/docs/dyn-policy.md
+@@ -107,3 +107,53 @@ The decision log is `/var/log/cora-sentinel/decisions.jsonl`, rotated by size (t
+ across rotations: `zcat -f /var/log/cora-sentinel/decisions.jsonl* | cora-floor dyn-report /dev/stdin`.
+ Anything in the report with `no_destination` or `bad_flow` means an event had a shape the policy did not expect: report it.
+ `--floor` is separate from the dynamic policy (it enforces your static lists); drop it for a purely observational run.
++
++## Rehearsing against recorded data (`cora-floor dyn-replay`)
++
++Shadow mode records what the policy decided; `dyn-replay` lets you ask "what if" about it without waiting another week.
++It feeds every recorded ISOLATE back through the real policy code with a clock that follows the recorded timestamps, so
++TTLs expire, budgets refill and windows slide as they did, in seconds.
++
++```bash
++cora-floor dyn-replay /var/log/cora-sentinel/decisions.jsonl                          # events.jsonl is found next to it
++zcat -f /var/log/cora-sentinel/decisions.jsonl* | cora-floor dyn-replay - \
++    --events /var/log/cora-sentinel/events.jsonl --events /var/log/cora-sentinel/events.jsonl.1   # across rotations
++cora-floor dyn-replay decisions.jsonl --task-cap 4 --write-budget 10                  # B (your settings) vs A (defaults)
++cora-floor dyn-replay decisions.jsonl --check                                         # does it reproduce the live record?
++```
++
++**Both logs are needed.** A decision has the verdict, the action, the time and what the live policy did, but not the
++destination or the task. Those are in the event (`events.jsonl`, the daemon's `--out`), joined on `event_id`. Rotated and
++`.gz` files are fine, and so are several of each; `-` reads stdin. `--since` / `--until` take an ISO time (UTC if no offset).
++
++**Worlds.** *Rehearse* (default) answers "what would **enforce** have done?": the adjudicator is assumed to be enforcing,
++so a dry-run ISOLATE counts as done, and once a task is isolated its later events are dropped (an isolated task has no
++egress, so a shadow log taken with a dry-running adjudicator holds events enforce would never have seen;
++`--keep-isolated` keeps them). `--as-recorded` makes no assumptions: the recorded actions, the policy in shadow.
++`--check` is `--as-recorded` plus a decision-by-decision comparison with the `dyn` record the live policy wrote, with exit
++status 1 on any mismatch: it is how you know the harness reproduces your daemon, and how you notice drift after an
++upgrade. In these two modes the policy flags are **not** a tweak; they tell the replay the settings your live daemon runs
++with (`--check --dyn-task-cap` is `--check --task-cap`), because a log written under one setting cannot match a replay
++under another.
++
++**What it prints:** results by kind; the skip reasons; the three limits (write budget with its peak per minute and
++denials, live elements, per-task cap with the busiest task); the **web ports** section (flow blocks, repeat-offense
++refreshes, distinct targets, and promotions to a whole address, which must be 0); the targets that would have been
++blocked longest, with exact blocked time; `--timeline` per hour; and with tweaks a diff of every decision that changed.
++`--json` is the same data (`--outcomes` adds every decision).
++
++**Kernel mode.** If root, nft and `unshare` are available, every write is also made in a private network namespace and a
++throwaway table (never the host's), and at the end the real nft state is cross-checked against the policy's ledger.
++Kernel timeouts run in real time, so elements are written with the longest timeout and removed at their *simulated*
++expiry. The decisions are identical with or without it; it proves each write is accepted by nft and reports the cost.
++`--kernel off` skips it. The replay never touches the live ledger or the live ruleset.
++
++**Exit status.** 0 ok; 1 `--check` found a mismatch; 2 a self-check failed (a web port was promoted, which the replay
++detects independently of the policy's own flag, or the sets disagree with the ledger) or the input was unusable.
++
++**What it cannot do.** It does not re-run the model: verdicts and confidences are as recorded, so `--min-conf` filters them
++but a different model or prompt cannot be rehearsed. The live allow list and protected addresses at the time are not
++recoverable, so exemptions come from what the live policy recorded for each decision, plus `--allow` / `--protect`. Time has
++one-second resolution (the decision log's), and history before the first logged decision is unknown, so the first
++decisions after a log rotation may not match under `--check`. Releases (`cora-firewall release`) and manual unblocks are
++not in the log and are not replayed. The escalation factor (x4, 24 h cap) and the web-port list are fixed in the code.
+diff --git a/src/cora_sentinel/__init__.py b/src/cora_sentinel/__init__.py
+index c7a4c3b..8874acc 100644
+--- a/src/cora_sentinel/__init__.py
++++ b/src/cora_sentinel/__init__.py
+@@ -5,4 +5,4 @@ local model (grammar-constrained) proposes a verdict; deterministic gates decide
+ See README.md.
+ """
+ 
+-__version__ = "0.6.1"
++__version__ = "0.7.0"
+diff --git a/src/cora_sentinel/dynreplay.py b/src/cora_sentinel/dynreplay.py
+new file mode 100644
+index 0000000..1e7c1f5
+--- /dev/null
++++ b/src/cora_sentinel/dynreplay.py
+@@ -0,0 +1,656 @@
++#!/usr/bin/env python3
++"""
++cora_sentinel.dynreplay - rehearse the dynamic policy against what the daemon recorded. Stdlib only.
++
++  cora-floor dyn-replay decisions.jsonl [--events events.jsonl] [policy flags]
++  zcat -f decisions.jsonl* | cora-floor dyn-replay - --events events.jsonl.1 --events events.jsonl
++
++The decision log has the verdict, the action, the time and what the live policy did; it does NOT have the destination
++or the task. Those are in the event log, so the two are joined on event_id (rotated and .gz files are fine, and so is
++`-` for stdin). Each recorded ISOLATE is fed back through the real `DynPolicy` with a clock that follows the recorded
++timestamps, so TTLs expire, budgets refill and windows slide exactly as they did, in seconds instead of a week.
++
++It never touches the live system: the policy runs on an in-memory ledger (never the one in --state-dir), and kernel mode
++(below) runs in a private network namespace and a throwaway table.
++
++WORLDS
++  rehearse (default)  "What would enforce have done?" The adjudicator is assumed to be enforcing, so a dry-run ISOLATE
++                      counts as done, and once a task is isolated its later events are dropped (an isolated task has no
++                      egress, so a shadow log taken with a dry-running adjudicator contains events enforce would never
++                      have seen). --keep-isolated keeps them.
++  --as-recorded       No assumptions: the recorded actions, the policy in shadow. Here the policy flags below are NOT a
++                      tweak: they tell the replay the settings the LIVE daemon ran with (--dyn-min-conf etc.).
++  --check             --as-recorded, then compare every decision with the `dyn` record the live policy wrote. It should
++                      match exactly given the live settings (first decisions after a rotation may not: the live ledger
++                      had history before the log starts). Exit 1 on any mismatch. This is the proof that the harness
++                      reproduces the daemon, and the test for drift after an upgrade.
++
++TWEAKS  --min-conf --write-budget --max-live --task-cap --promote-tasks --flow-ttl --ip-ttl, and --allow/--protect for
++        exemptions. With any of them the tool runs the shipped defaults (A) and your settings (B) over the same log and
++        prints what changed. `--diff-recorded` compares the result with what shadow actually recorded.
++
++KERNEL  By default, if root, nft and unshare are available, every write is also made in a private namespace (`unshare -n`)
++        and a throwaway table, and the real nft state is cross-checked against the policy's ledger at the end. Kernel
++        timeouts run in real time, so elements are removed at their SIMULATED expiry. --kernel off|on|auto.
++
++EXIT  0 ok, 1 --check found a mismatch, 2 a self-check failed (a web port promoted, or the sets disagree with the ledger).
++"""
++from __future__ import annotations
++
++import argparse
++import collections
++import copy
++import gzip
++import ipaddress
++import json
++import os
++import shutil
++import sys
++import time
++from dataclasses import dataclass, fields, replace
++from datetime import datetime, timezone
++from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
++
++from cora_sentinel import dynpolicy, floorguard
++from cora_sentinel.dynpolicy import WEB_PORTS, DynConfig, DynPolicy
++from cora_sentinel.firewall import FirewallError
++from cora_sentinel.nftsets import MAX_TTL_S, NftSets
++
++ACT = frozenset({"blocked", "refreshed", "promoted", "would_block", "would_refresh", "would_promote"})
++THROTTLE = ("budget", "standing_cap", "task_cap")
++NORM = {"would_block": "blocked", "would_refresh": "refreshed", "would_promote": "promoted"}
++KERNEL_TABLE = "cora_replay"
++
++
++# --------------------------------------------------------------------------
++# reading the logs
++# --------------------------------------------------------------------------
++def _open(path: str):
++    if path == "-":
++        return sys.stdin
++    return gzip.open(path, "rt") if str(path).endswith(".gz") else open(path)
++
++
++def _json_lines(paths: Sequence[str], bad: List[int]) -> Iterator[dict]:
++    for p in paths:
++        with _open(p) as fh:
++            for line in fh:
++                line = line.strip()
++                if not line:
++                    continue
++                try:
++                    obj = json.loads(line)
++                except ValueError:
++                    bad[0] += 1
++                    continue
++                if isinstance(obj, dict):
++                    yield obj
++
++
++def parse_ts(s) -> float:
++    d = datetime.fromisoformat(str(s))
++    return (d if d.tzinfo else d.replace(tzinfo=timezone.utc)).timestamp()
++
++
++@dataclass
++class Rec:
++    i: int
++    ts: float
++    ev: dict
++    d: dict
++
++    @property
++    def task(self) -> str:
++        s = self.ev.get("subject") or {}
++        return str(s.get("cgroup") or s.get("name") or s.get("pid"))
++
++
++def load(decision_paths: Sequence[str], event_paths: Sequence[str], since: Optional[float] = None,
++         until: Optional[float] = None) -> Tuple[List[Rec], dict]:
++    """Final-ISOLATE decisions joined with their events, in time order. Returns (records, what was skipped and why)."""
++    bad = [0]
++    decs: Dict[str, Tuple[float, int, dict]] = {}
++    total = 0
++    for n, d in enumerate(_json_lines(decision_paths, bad)):
++        total += 1
++        eid = d.get("event_id")
++        if d.get("final") != "ISOLATE" or not eid or eid in decs:
++            continue
++        try:
++            ts = parse_ts(d["ts"])
++        except (KeyError, ValueError):
++            bad[0] += 1
++            continue
++        if (since is not None and ts < since) or (until is not None and ts >= until):
++            continue
++        decs[eid] = (ts, n, d)
++    evs: Dict[str, dict] = {}
++    for ev in _json_lines(event_paths, bad):
++        eid = ev.get("event_id")
++        if eid in decs and eid not in evs:
++            evs[eid] = ev
++            if len(evs) == len(decs):
++                break
++    joined = sorted(((ts, n, eid) for eid, (ts, n, _) in decs.items() if eid in evs))
++    recs = [Rec(i, ts, evs[eid], decs[eid][2]) for i, (ts, n, eid) in enumerate(joined)]
++    return recs, {"decisions": total, "isolate": len(decs), "joined": len(recs),
++                  "no_event": len(decs) - len(recs), "malformed": bad[0]}
++
++
++# --------------------------------------------------------------------------
++# the stand-ins: a clock, a set of "kernel" elements with SIMULATED lifetimes, and exemptions
++# --------------------------------------------------------------------------
++class Clock:
++    def __init__(self, t: float = 0.0):
++        self.t = t
++
++    def __call__(self) -> float:
++        return self.t
++
++
++def _pct(xs: Sequence[float], p: float) -> float:
++    xs = sorted(xs)
++    return xs[min(len(xs) - 1, int(len(xs) * p / 100))] if xs else 0.0
++
++
++class ReplaySets:
++    """Stands in for NftSets. Remembers every element with its simulated expiry (so the policy can be cross-checked), and,
++    given a real NftSets, mirrors each write into it. A real element would outlive a fast replay or expire in real time,
++    so it is written with the longest timeout and deleted when its SIMULATED time is up."""
++
++    def __init__(self, clock: Clock, inner=None):
++        self.clock, self.inner = clock, inner
++        self.live: Dict[str, Tuple[float, tuple]] = {}
++        self.writes, self.deletes, self.times = 0, 0, []
++
++    def _timed(self, fn, *args):
++        t0 = time.perf_counter()
++        r = fn(*args)
++        self.times.append((time.perf_counter() - t0) * 1000.0)
++        return r
++
++    def block_ip(self, ip: str, ttl_s: int) -> None:
++        if self.inner is not None:
++            self._timed(self.inner.block_ip, ip, MAX_TTL_S)
++        self.live[f"i:{ip}"] = (self.clock.t + ttl_s, ("ip", ip))
++        self.writes += 1
++
++    def block_flow(self, ip: str, proto: str, port: int, ttl_s: int) -> None:
++        if self.inner is not None:
++            self._timed(self.inner.block_flow, ip, proto, port, MAX_TTL_S)
++        self.live[f"f:{ip}|{proto}|{port}"] = (self.clock.t + ttl_s, ("flow", ip, proto, port))
++        self.writes += 1
++
++    def sweep(self, now: float) -> None:
++        for k in [k for k, (exp, _) in self.live.items() if exp <= now]:
++            _, what = self.live.pop(k)
++            if self.inner is not None:
++                (self.inner.unblock_ip if what[0] == "ip" else self.inner.unblock_flow)(*what[1:])
++                self.deletes += 1
++
++    def active(self, now: float) -> set:
++        return {k for k, (exp, _) in self.live.items() if exp > now}
++
++    def kernel_active(self) -> set:
++        return ({f"f:{k}" for k in self.inner.live_flows()} | {f"i:{k}" for k in self.inner.live_ips()}) if self.inner else set()
++
++
++class ReplayExempt:
++    """The live allow/protect state is not recoverable, so: honour what the live policy recorded for THAT decision
++    (a skip with reason allowed:/protected:), plus any --allow / --protect given now."""
++
++    def __init__(self, allow: Sequence[str] = (), protect: Sequence[str] = ()):
++        self.idx = floorguard.net_index(list(allow))
++        self.protect = {str(ipaddress.ip_address(p)) for p in protect}
++        self.recorded: Optional[str] = None
++
++    def __call__(self, ip: str) -> Optional[str]:
++        if self.recorded:
++            return self.recorded
++        if ip in self.protect:
++            return "protected:replay"
++        hit = floorguard.covering(ip, self.idx)
++        return f"allowed:{hit}" if hit else None
++
++
++def _recorded_exempt(r: Rec) -> Optional[str]:
++    rd = r.d.get("dyn") or {}
++    reason = str(rd.get("reason", ""))
++    return reason if rd.get("result") == "skipped" and reason.startswith(("allowed:", "protected:")) else None
++
++
++# --------------------------------------------------------------------------
++# one world
++# --------------------------------------------------------------------------
++@dataclass
++class World:
++    name: str
++    cfg: DynConfig
++    assume_enforcing: bool = True
++    drop_isolated: bool = True
++
++
++def run_world(recs: Sequence[Rec], w: World, allow: Sequence[str] = (), protect: Sequence[str] = (), inner=None) -> dict:
++    clock = Clock(recs[0].ts if recs else 0.0)
++    sets = ReplaySets(clock, inner) if w.assume_enforcing else None
++    exempt = ReplayExempt(allow, protect)
++    eff = "enforce" if w.assume_enforcing else "shadow"
++    pol = DynPolicy(eff, sets=sets, exempt=exempt, state_dir=None, cfg=w.cfg, clock=clock, log=lambda m: None)
++    isolated: Dict[str, float] = {}
++    out: List[dict] = []
++    track = {"live": [], "tokens": [], "task_targets": {}}
++    for r in recs:
++        clock.t = r.ts
++        if sets is not None:
++            sets.sweep(r.ts)
++        d = {k: v for k, v in r.d.items() if k != "dyn"}
++        act = str(d.get("action", ""))
++        if w.assume_enforcing and act.startswith("dry-run:"):
++            d["action"] = "done:" + act[len("dry-run:"):]
++        oc = {"i": r.i, "ts": r.ts, "event_id": r.d.get("event_id"), "task": r.task}
++        rd = r.d.get("dyn")
++        oc["recorded"] = ({"result": NORM.get(rd["result"], rd["result"]), "key": rd.get("key"), "ttl_s": rd.get("ttl_s"),
++                           "reason": rd.get("reason")} if rd else None)
++        if w.drop_isolated and r.task in isolated:
++            oc.update(result="suppressed", reason="task already isolated")
++            out.append(oc)
++            continue
++        exempt.recorded = _recorded_exempt(r)
++        try:
++            rec = pol.consider(copy.deepcopy(r.ev), d)
++        except Exception as e:                                     # a policy bug must show up, not kill the replay
++            rec = {"result": "error", "error": f"{e.__class__.__name__}: {e}"}
++        if str(d.get("action", "")).startswith(("done:", "dry-run:")):
++            isolated[r.task] = r.ts
++        if rec is None:
++            oc.update(result="not_model", reason="isolated by the floor, not the model")
++        else:
++            oc.update({k: rec[k] for k in ("result", "reason", "kind", "key", "ttl_s", "offense", "web", "port", "proto",
++                                           "tasks", "error") if k in rec})
++            if "port" in oc:                  # classified here, by port, NOT from the policy's own flag: the self-check
++                oc["web"] = oc["port"] in WEB_PORTS      # "no web port is ever promoted" must not trust the code it checks
++        out.append(oc)
++        L = pol._ledger(eff).read()
++        track["live"].append((r.ts, DynPolicy._live(L, clock.t)))
++        if "bucket" in L:
++            track["tokens"].append(L["bucket"]["tokens"])
++        n = len({k for t, k in L["targets"].get(r.task, []) if t > clock.t - dynpolicy.WINDOW_S})
++        if n > track["task_targets"].get(r.task, 0):
++            track["task_targets"][r.task] = n
++    consistent = None
++    if sets is not None and recs:
++        sets.sweep(clock.t)
++        L = pol._ledger(eff).read()
++        ledger = ({f"f:{k}" for k, e in L["flows"].items() if e["expires"] > clock.t}
++                  | {f"i:{k}" for k, e in L["ips"].items() if e["expires"] > clock.t})
++        consistent = {"ledger_vs_sets": ledger == sets.active(clock.t)}
++        if inner is not None:
++            consistent["kernel_vs_sets"] = sets.kernel_active() == sets.active(clock.t)
++    return {"world": w, "outcomes": out, "track": track, "sets": sets, "consistent": consistent, "cfg": w.cfg}
++
++
++# --------------------------------------------------------------------------
++# summaries
++# --------------------------------------------------------------------------
++def _blocked_seconds(outcomes: Sequence[dict]) -> Dict[str, dict]:
++    """Per target: how long it would have been blocked (a refresh replaces the expiry, so segments never overlap)."""
++    per: Dict[str, dict] = {}
++    cur: Dict[str, Tuple[float, float]] = {}
++    for o in outcomes:
++        if o["result"] not in ACT:
++            continue
++        k = o["key"]
++        e = per.setdefault(k, {"key": k, "kind": o["kind"], "web": o["web"], "tasks": set(), "n": 0, "offenses": 0,
++                               "max_ttl_s": 0, "seconds": 0.0, "first": o["ts"]})
++        e["tasks"].add(o["task"])
++        e["n"] += 1
++        e["offenses"] = max(e["offenses"], o.get("offense", 0))
++        e["max_ttl_s"] = max(e["max_ttl_s"], o["ttl_s"])
++        if k in cur:
++            start, until = cur[k]
++            e["seconds"] += (min(until, o["ts"]) - start)
++        cur[k] = (o["ts"], o["ts"] + o["ttl_s"])
++    for k, (start, until) in cur.items():
++        per[k]["seconds"] += until - start
++    return per
++
++
++def summarize(res: dict, top: int = 10) -> dict:
++    w: World = res["world"]
++    out = res["outcomes"]
++    cfg = w.cfg
++    results = collections.Counter(o["result"] for o in out)
++    skipped = collections.Counter(o.get("reason", "?").split(":")[0] for o in out if o["result"] == "skipped")
++    throttle_by_task: collections.Counter = collections.Counter(
++        o["task"] for o in out if o["result"] == "skipped" and o.get("reason") == "task_cap")
++    # writes per minute, peak
++    win: collections.deque = collections.deque()
++    peak_w, peak_w_at = 0, None
++    for o in out:
++        if o["result"] in ACT:
++            win.append(o["ts"])
++            while win and win[0] <= o["ts"] - 60:
++                win.popleft()
++            if len(win) > peak_w:
++                peak_w, peak_w_at = len(win), o["ts"]
++    live = res["track"]["live"]
++    peak_live, peak_live_at = max(((n, t) for t, n in live), default=(0, None))
++    tt = res["track"]["task_targets"]
++    max_task, max_task_n = max(tt.items(), key=lambda kv: kv[1], default=(None, 0))
++    per = _blocked_seconds(out)
++    rows = sorted(per.values(), key=lambda e: -e["seconds"])
++    fmt = lambda e: {"key": e["key"], "kind": e["kind"], "web": e["web"], "tasks": len(e["tasks"]), "hits": e["n"],  # noqa: E731
++                     "offenses": e["offenses"], "max_ttl_s": e["max_ttl_s"], "blocked_s": round(e["seconds"])}
++    web_rows = [e for e in rows if e["web"]]
++    web_promotions = [o for o in out if o.get("web") and o["result"] in ("promoted", "would_promote")]
++    web_covered = sum(1 for o in out if o.get("web") and o["result"] in ACT | {"dedupe"} and o.get("kind") == "ip")
++    hours: Dict[int, dict] = {}
++    for o in out:
++        h = hours.setdefault(int(o["ts"] // 3600), {"hour": int(o["ts"] // 3600) * 3600, "new": 0, "refresh": 0,
++                                                    "promote": 0, "skipped": 0, "dedupe": 0, "suppressed": 0})
++        h[{"blocked": "new", "would_block": "new", "refreshed": "refresh", "would_refresh": "refresh",
++           "promoted": "promote", "would_promote": "promote", "skipped": "skipped", "dedupe": "dedupe",
++           "suppressed": "suppressed"}.get(o["result"], "skipped")] += 1
++    for t, n in live:
++        if int(t // 3600) in hours:
++            hours[int(t // 3600)]["peak_live"] = max(hours[int(t // 3600)].get("peak_live", 0), n)
++    return {
++        "world": w.name, "assume_enforcing": w.assume_enforcing, "replayed": len(out),
++        "span": ({"first": out[0]["ts"], "last": out[-1]["ts"]} if out else None),
++        "results": dict(results), "skipped_reasons": dict(skipped),
++        "throttled": {"total": sum(results_for(out, r) for r in THROTTLE),
++                      **{r: results_for(out, r) for r in THROTTLE}, "task_cap_by_task": dict(throttle_by_task.most_common(5))},
++        "limits": {"write_per_min": {"limit": cfg.write_per_min, "peak": peak_w, "at": peak_w_at},
++                   "live": {"limit": cfg.max_live, "peak": peak_live, "at": peak_live_at},
++                   "task_targets_per_hour": {"limit": cfg.task_cap, "max": max_task_n, "task": max_task},
++                   "bucket_min_tokens": (round(min(res["track"]["tokens"]), 2) if res["track"]["tokens"] else None)},
++        "web": {"ports": sorted(WEB_PORTS), "targets": len(web_rows),
++                "blocks": sum(1 for o in out if o.get("web") and o["result"] in ("blocked", "would_block")),
++                "refreshes": sum(1 for o in out if o.get("web") and o["result"] in ("refreshed", "would_refresh")),
++                "promotions": len(web_promotions), "covered_by_whole_address": web_covered,
++                "top": [fmt(e) for e in web_rows[:top]]},
++        "targets": {"n": len(rows), "top": [fmt(e) for e in rows[:top]],
++                    "blocked_seconds_total": round(sum(e["seconds"] for e in rows))},
++        "timeline": [hours[h] for h in sorted(hours)],
++        "consistent": res["consistent"],
++    }
++
++
++def results_for(out: Sequence[dict], reason: str) -> int:
++    return sum(1 for o in out if o["result"] == "skipped" and o.get("reason") == reason)
++
++
++def diff_worlds(a: dict, b: dict, limit: int = 15) -> dict:
++    sig = lambda o: (o["result"], o.get("key"), o.get("ttl_s"))              # noqa: E731
++    changed = [{"i": x["i"], "ts": x["ts"], "task": x["task"], "a": {k: x.get(k) for k in ("result", "reason", "key", "ttl_s")},
++                "b": {k: y.get(k) for k in ("result", "reason", "key", "ttl_s")}}
++               for x, y in zip(a["outcomes"], b["outcomes"]) if sig(x) != sig(y)]
++    sa, sb = summarize(a), summarize(b)
++    num = lambda s, k: sum(v for r, v in s["results"].items() if r in k)      # noqa: E731
++    return {"changed": len(changed), "of": len(a["outcomes"]), "first": changed[:limit],
++            "delta": {"blocks": num(sb, ACT) - num(sa, ACT), "targets": sb["targets"]["n"] - sa["targets"]["n"],
++                      "web_targets": sb["web"]["targets"] - sa["web"]["targets"],
++                      "throttled": sb["throttled"]["total"] - sa["throttled"]["total"],
++                      "blocked_seconds": sb["targets"]["blocked_seconds_total"] - sa["targets"]["blocked_seconds_total"]}}
++
++
++def compare_recorded(res: dict, limit: int = 15) -> dict:
++    """Replay vs what the live policy recorded, decision by decision (results compared without the would_ prefix)."""
++    n = same = no_record = 0
++    bad: List[dict] = []
++    for o in res["outcomes"]:
++        rec = o["recorded"]
++        if rec is None:
++            no_record += 1
++            continue
++        n += 1
++        ok = (NORM.get(o["result"], o["result"]) == rec["result"]
++              and (rec.get("key") is None or o.get("key") == rec["key"])
++              and (rec.get("ttl_s") is None or o.get("ttl_s") == rec["ttl_s"]))
++        if ok:
++            same += 1
++        else:
++            bad.append({"i": o["i"], "ts": o["ts"], "task": o["task"], "recorded": rec,
++                        "replay": {k: o.get(k) for k in ("result", "reason", "key", "ttl_s")}})
++    return {"compared": n, "match": same, "mismatch": len(bad), "no_record": no_record, "first": bad[:limit]}
++
++
++# --------------------------------------------------------------------------
++# printing
++# --------------------------------------------------------------------------
++def _iso(t: Optional[float]) -> str:
++    return "-" if t is None else datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
++
++
++def _dur(s: float) -> str:
++    return f"{s / 86400:.1f} d" if s >= 2 * 86400 else f"{s / 3600:.1f} h" if s >= 3600 else f"{s / 60:.0f} min" if s >= 60 else f"{s:.0f} s"
++
++
++def render(inputs: dict, kernel: Optional[dict], s: dict, title: str) -> str:
++    L: List[str] = []
++    p = L.append
++    sp = s["span"]
++    p(f"== {title}")
++    p(f"replayed {s['replayed']} of {inputs['joined']} joined ISOLATE decisions"
++      + (f", {_iso(sp['first'])} to {_iso(sp['last'])} ({_dur(sp['last'] - sp['first'])})" if sp else ""))
++    p(f"world: {s['world']}")
++    r = s["results"]
++    p("results   " + (", ".join(f"{k} {v}" for k, v in sorted(r.items(), key=lambda kv: -kv[1])) or "none"))
++    if s["skipped_reasons"]:
++        p("skipped   " + ", ".join(f"{k} {v}" for k, v in sorted(s["skipped_reasons"].items(), key=lambda kv: -kv[1])))
++    lim = s["limits"]
++    th = s["throttled"]
++    p("limits")
++    p(f"  write budget  {lim['write_per_min']['limit']}/min   peak {lim['write_per_min']['peak']}/min"
++      + (f" at {_iso(lim['write_per_min']['at'])}" if lim['write_per_min']['at'] else "") + f"   denied {th['budget']}"
++      + (f"   lowest bucket {lim['bucket_min_tokens']} tokens" if lim["bucket_min_tokens"] is not None else ""))
++    p(f"  live elements {lim['live']['limit']}   peak {lim['live']['peak']}"
++      + (f" at {_iso(lim['live']['at'])}" if lim['live']['at'] else "") + f"   denied {th['standing_cap']}")
++    p(f"  per-task cap  {lim['task_targets_per_hour']['limit']}/h   max by one task {lim['task_targets_per_hour']['max']}"
++      + (f" ({lim['task_targets_per_hour']['task']})" if lim['task_targets_per_hour']['task'] else "") + f"   denied {th['task_cap']}"
++      + (f"   {th['task_cap_by_task']}" if th["task_cap_by_task"] else ""))
++    w = s["web"]
++    p(f"web ports {'/'.join(map(str, w['ports']))}")
++    p(f"  flow blocks {w['blocks']}   repeat-offense refreshes {w['refreshes']}   distinct targets {w['targets']}")
++    p(f"  promoted to a whole address: {w['promotions']}" + ("" if not w['promotions'] else "   <<< MUST BE 0: THE POLICY IS BROKEN"))
++    if w["covered_by_whole_address"]:
++        p(f"  web hits covered by a whole-address block that other ports caused: {w['covered_by_whole_address']}")
++    for e in w["top"][:5]:
++        p(f"    {e['key']:<44} blocked {_dur(e['blocked_s']):>8}  offenses {e['offenses']}  tasks {e['tasks']}")
++    t = s["targets"]
++    p(f"targets {t['n']}  total blocked time {_dur(t['blocked_seconds_total'])}")
++    for e in t["top"]:
++        p(f"  {'web' if e['web'] else '   '} {e['kind']:<4} {e['key']:<44} blocked {_dur(e['blocked_s']):>8}  max ttl {_dur(e['max_ttl_s']):>7}  "
++          f"offenses {e['offenses']}  tasks {e['tasks']}")
++    if s["consistent"] is not None:
++        c = s["consistent"]
++        p("self-check  ledger vs simulated sets: " + ("agree" if c["ledger_vs_sets"] else "DISAGREE")
++          + ("" if "kernel_vs_sets" not in c else "   real nft vs simulated sets: " + ("agree" if c["kernel_vs_sets"] else "DISAGREE")))
++    if kernel:
++        p(f"kernel     private netns, table {KERNEL_TABLE}: {kernel['writes']} writes accepted"
++          + (f" (p50 {kernel['p50_ms']:.2f} ms, p99 {kernel['p99_ms']:.2f} ms)" if kernel["writes"] else "")
++          + f", {kernel['deletes']} simulated expiries removed")
++    return "\n".join(L)
++
++
++def render_timeline(s: dict) -> str:
++    L = ["timeline (hour, UTC)     new refresh promote dedupe skipped suppressed peak_live"]
++    for h in s["timeline"]:
++        L.append(f"  {_iso(h['hour'])[:13]}:00   {h['new']:>5} {h['refresh']:>7} {h['promote']:>7} {h['dedupe']:>6} {h['skipped']:>7} "
++                 f"{h['suppressed']:>10} {h.get('peak_live', 0):>9}")
++    return "\n".join(L)
++
++
++def render_diff(d: dict, a_name: str, b_name: str) -> str:
++    de = d["delta"]
++    L = [f"== {b_name} vs {a_name}", f"changed decisions {d['changed']} of {d['of']}",
++         f"  blocks {de['blocks']:+d}   targets {de['targets']:+d}   web targets {de['web_targets']:+d}   throttled {de['throttled']:+d}   "
++         f"blocked time {'+' if de['blocked_seconds'] >= 0 else '-'}{_dur(abs(de['blocked_seconds']))}"]
++    for c in d["first"]:
++        a, b = c["a"], c["b"]
++        L.append(f"  #{c['i']} {_iso(c['ts'])} {c['task']}: {a['result']}{'/' + a['reason'] if a.get('reason') else ''} -> "
++                 f"{b['result']}{'/' + b['reason'] if b.get('reason') else ''}" + (f"  {b['key']} ttl {b['ttl_s']}" if b.get("key") else ""))
++    if d["changed"] > len(d["first"]):
++        L.append(f"  ... {d['changed'] - len(d['first'])} more (--changes N)")
++    return "\n".join(L)
++
++
++def render_check(c: dict, label: str) -> str:
++    L = [f"== {label}: replay vs what the live policy recorded",
++         f"compared {c['compared']}   match {c['match']}   mismatch {c['mismatch']}   (no live record: {c['no_record']})"]
++    for m in c["first"]:
++        r, p = m["recorded"], m["replay"]
++        L.append(f"  #{m['i']} {_iso(m['ts'])} {m['task']}: recorded {r['result']}{'/' + r['reason'] if r.get('reason') else ''}"
++                 f" {r.get('key') or ''} ttl {r.get('ttl_s')}  |  replay {p['result']}{'/' + p['reason'] if p.get('reason') else ''}"
++                 f" {p.get('key') or ''} ttl {p.get('ttl_s')}")
++    return "\n".join(L)
++
++
++# --------------------------------------------------------------------------
++# command line
++# --------------------------------------------------------------------------
++def can_kernel() -> bool:
++    return os.geteuid() == 0 and bool(shutil.which("nft")) and bool(shutil.which("unshare"))
++
++
++def build_parser() -> argparse.ArgumentParser:
++    ap = argparse.ArgumentParser(prog="cora-floor dyn-replay", description=__doc__.split("\n\n")[0],
++                                 epilog="Read the module docstring (or docs/dyn-policy.md) for the worlds, tweaks and exit codes.")
++    ap.add_argument("decisions", nargs="+", help="decisions.jsonl (rotated and .gz files fine; '-' = stdin)")
++    ap.add_argument("--events", action="append", metavar="FILE",
++                    help="events.jsonl (repeatable; default: events.jsonl next to the decision log)")
++    ap.add_argument("--since", metavar="ISO", help="only decisions at or after this time (UTC if no offset)")
++    ap.add_argument("--until", metavar="ISO", help="only decisions before this time")
++    g = ap.add_argument_group("policy settings (rehearsing: a tweak, run as B against the defaults as A; "
++                              "with --as-recorded/--check: the live daemon's settings)")
++    g.add_argument("--min-conf", type=float), g.add_argument("--write-budget", type=int, metavar="PER_MIN")
++    g.add_argument("--max-live", type=int), g.add_argument("--task-cap", type=int), g.add_argument("--promote-tasks", type=int)
++    g.add_argument("--flow-ttl", type=int, metavar="SEC"), g.add_argument("--ip-ttl", type=int, metavar="SEC")
++    g.add_argument("--allow", action="append", default=[], metavar="CIDR", help="never block these (exemption)")
++    g.add_argument("--protect", action="append", default=[], metavar="ADDR", help="never block this address")
++    w = ap.add_argument_group("world")
++    w.add_argument("--as-recorded", action="store_true", help="no assumptions: recorded actions, policy in shadow")
++    w.add_argument("--check", action="store_true", help="--as-recorded, then verify it reproduces the live dyn records (exit 1 if not)")
++    w.add_argument("--keep-isolated", action="store_true", help="keep later events of an already-isolated task")
++    w.add_argument("--diff-recorded", action="store_true", help="also compare the result with what shadow recorded")
++    ap.add_argument("--kernel", choices=("auto", "on", "off"), default="auto",
++                    help="mirror writes into a private namespace and cross-check (auto: if root, nft and unshare)")
++    ap.add_argument("--json", action="store_true"), ap.add_argument("--outcomes", action="store_true", help="with --json: every decision")
++    ap.add_argument("--top", type=int, default=10), ap.add_argument("--changes", type=int, default=15)
++    ap.add_argument("--timeline", action="store_true")
++    ap.add_argument("--in-ns", action="store_true", help=argparse.SUPPRESS)
++    return ap
++
++
++_TWEAKS = {"min_conf": "min_conf", "write_budget": "write_per_min", "max_live": "max_live", "task_cap": "task_cap",
++           "promote_tasks": "promote_tasks", "flow_ttl": "flow_base_s", "ip_ttl": "ip_base_s"}
++
++
++def main(argv: Optional[Sequence[str]] = None) -> int:
++    argv = list(sys.argv[1:] if argv is None else argv)
++    a = build_parser().parse_args(argv)
++    if a.check:
++        a.as_recorded = True
++    tweaks = {cfg: getattr(a, arg) for arg, cfg in _TWEAKS.items() if getattr(a, arg) is not None}
++    events = a.events
++    if not events:
++        first = next((p for p in a.decisions if p != "-"), None)
++        guess = os.path.join(os.path.dirname(os.path.abspath(first)), "events.jsonl") if first else None
++        if not guess or not os.path.exists(guess):
++            print("error: the decision log has no destination or task; give the event log with --events FILE "
++                  "(the daemon's --out, /var/log/cora-sentinel/events.jsonl)", file=sys.stderr)
++            return 2
++        events = [guess]
++    kernel_wanted = (a.kernel == "on" or (a.kernel == "auto" and can_kernel())) and not a.as_recorded
++    if a.kernel == "on" and not can_kernel():
++        print("error: --kernel on needs root, nft and unshare", file=sys.stderr)
++        return 2
++    if kernel_wanted and not a.in_ns:
++        os.execvp("unshare", ["unshare", "-n", sys.executable, "-m", "cora_sentinel.dynreplay", "--in-ns", *argv])
++    try:
++        since = parse_ts(a.since) if a.since else None
++        until = parse_ts(a.until) if a.until else None
++        recs, inputs = load(a.decisions, events, since, until)
++    except (OSError, ValueError) as e:
++        print(f"error: {e}", file=sys.stderr)
++        return 2
++    inner = None
++    if kernel_wanted:
++        inner = NftSets(table=KERNEL_TABLE)
++        try:
++            inner.ensure()
++        except FirewallError as e:
++            print(f"error: cannot prepare the private table: {e}", file=sys.stderr)
++            return 2
++    if not recs:
++        msg = (f"nothing to replay: {inputs['decisions']} decisions, {inputs['isolate']} final ISOLATE, "
++               f"{inputs['no_event']} without a matching event")
++        print(json.dumps({"inputs": inputs, "worlds": {}}) if a.json else msg)
++        return 0
++
++    base_cfg = DynConfig()
++    # rehearsing: the flags are a tweak (B) against the shipped defaults (A). Verifying (--as-recorded/--check): there is one
++    # world and the flags tell it the settings the LIVE daemon ran with, so it can be compared with what that daemon recorded
++    has_b = bool(tweaks or a.allow or a.protect) and not a.as_recorded
++    drop = not a.keep_isolated and not a.as_recorded
++    name = ("as-recorded (recorded actions, policy in shadow)" if a.as_recorded else
++            "rehearse-enforce (adjudicator assumed enforcing" + ("; later events of an isolated task dropped)" if drop else ")"))
++    runs: Dict[str, dict] = {}
++    live_cfg = replace(base_cfg, **tweaks) if a.as_recorded else base_cfg
++    runs["A"] = run_world(recs, World("A", live_cfg, not a.as_recorded, drop),
++                          a.allow if a.as_recorded else [], a.protect if a.as_recorded else [],
++                          inner=None if has_b else inner)
++    if has_b:
++        runs["B"] = run_world(recs, World("B", replace(base_cfg, **tweaks), True, drop), a.allow, a.protect, inner=inner)
++    main_run = runs.get("B", runs["A"])
++    sums = {k: summarize(v, a.top) for k, v in runs.items()}
++    for k, sm in sums.items():
++        sm["world"] = name + (" - shipped defaults" if k == "A" and has_b else " - your settings" if k == "B" else "")
++    kernel = None
++    sets = main_run["sets"]
++    if inner is not None and sets is not None:
++        kernel = {"writes": sets.writes, "deletes": sets.deletes, "p50_ms": _pct(sets.times, 50), "p99_ms": _pct(sets.times, 99)}
++    diff = diff_worlds(runs["A"], runs["B"], a.changes) if "B" in runs else None
++    check = compare_recorded(main_run, a.changes) if (a.check or a.diff_recorded) else None
++
++    problems: List[str] = []
++    for k, s in sums.items():
++        if s["web"]["promotions"]:
++            problems.append(f"world {k}: a web port was promoted to a whole-address block")
++        c = s["consistent"]
++        if c and not all(c.values()):
++            problems.append(f"world {k}: the simulated/real sets disagree with the ledger ({c})")
++    if a.json:
++        doc = {"inputs": inputs, "kernel": kernel, "worlds": {k: {"summary": s} for k, s in sums.items()}, "diff": diff,
++               "check": check, "problems": problems}
++        if a.outcomes:
++            for k, v in runs.items():
++                doc["worlds"][k]["outcomes"] = v["outcomes"]
++        print(json.dumps(doc, indent=1, default=str))
++    else:
++        print(f"inputs: {inputs['decisions']} decisions, {inputs['isolate']} final ISOLATE, {inputs['joined']} joined with an event"
++              + (f", {inputs['no_event']} had no matching event (ignored)" if inputs["no_event"] else "")
++              + (f", {inputs['malformed']} malformed lines skipped" if inputs["malformed"] else "")
++              + ("" if kernel else "   kernel: not used (simulation only)"))
++        for k, s in sums.items():
++            print()
++            print(render(inputs, kernel if k == ("B" if "B" in runs else "A") else None, s, f"world {k}" if "B" in runs else "replay"))
++            if a.timeline:
++                print(render_timeline(s))
++        if diff:
++            print()
++            print(render_diff(diff, "A", "B"))
++        if check:
++            print()
++            print(render_check(check, "check" if a.check else "diff-recorded"))
++        for pb in problems:
++            print(f"SELF-CHECK FAILED: {pb}", file=sys.stderr)
++    if problems:
++        return 2
++    if a.check and check and check["mismatch"]:
++        return 1
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/src/cora_sentinel/nftsets.py b/src/cora_sentinel/nftsets.py
+index 1230ae5..2f4e0c8 100644
+--- a/src/cora_sentinel/nftsets.py
++++ b/src/cora_sentinel/nftsets.py
+@@ -599,6 +599,10 @@ class FloorSync:
+ # cora-floor
+ # --------------------------------------------------------------------------
+ def main(argv: Optional[List[str]] = None) -> int:
++    args = list(sys.argv[1:] if argv is None else argv)
++    if "dyn-replay" in args:                       # its options are its own; argparse's REMAINDER would swallow --help
++        from cora_sentinel import dynreplay
++        return dynreplay.main(args[args.index("dyn-replay") + 1:])
+     ap = argparse.ArgumentParser(prog="cora-floor", description="Inspect and drive the kernel-side blocklist floor.")
+     ap.add_argument("--table", default=os.environ.get("CORA_NFT_TABLE", "cora"))
+     ap.add_argument("--state-dir", default=os.environ.get("CORA_STATE_DIR", floorguard.DEFAULT_STATE_DIR),
+@@ -610,6 +614,8 @@ def main(argv: Optional[List[str]] = None) -> int:
+     sub.add_parser("pending", help="seconds left to confirm, or 'none'")
+     p = sub.add_parser("dyn", help="the dynamic-policy ledger: what is blocked (or would be, in shadow) and why")
+     p.add_argument("--mode", choices=("shadow", "enforce"), action="append")
++    sub.add_parser("dyn-replay", help="rehearse the dynamic policy against recorded decisions and events "
++                   "(has its own options: `cora-floor dyn-replay --help`)")
+     p = sub.add_parser("dyn-report", help="summarise what the dynamic policy did or would have done, from decisions.jsonl")
+     p.add_argument("decisions")
+     sub.add_parser("rollback", help="remove the floor IF it is still awaiting confirmation (the unit's ExecStopPost)")
+diff --git a/tests/test_daemon_dyn.py b/tests/test_daemon_dyn.py
+index 7025a35..7c0d921 100644
+--- a/tests/test_daemon_dyn.py
++++ b/tests/test_daemon_dyn.py
+@@ -17,6 +17,7 @@ from pathlib import Path
+ 
+ import pytest
+ 
++from cora_sentinel import dynreplay
+ from cora_sentinel.nftsets import NftSets
+ 
+ from test_floor_confirm import CG, daemon_kernel, enter
+@@ -157,6 +158,9 @@ def test_shadow_through_the_daemon_records_what_it_would_block_and_touches_nothi
+     out = subprocess.run([*enter(w.lab.c), sys.executable, "-m", "cora_sentinel.nftsets", "--state-dir", w.state,
+                           "dyn", "--mode", "shadow"], env=w.env, capture_output=True, text=True).stdout
+     assert f"{G}|tcp|{GPORT}" in out and "[shadow] 1 active" in out
++    # the replay harness must reproduce what this REAL daemon recorded, from the two logs it wrote
++    rc = dynreplay.main([str(w.dec), "--events", str(w.tmp / "events.jsonl"), "--check", "--kernel", "off", "--json"])
++    assert rc == 0, "the replay does not reproduce the daemon's own shadow decision"
+ 
+ 
+ @kernel
+@@ -175,3 +179,5 @@ def test_enforce_through_the_daemon_closes_the_first_packet_gap_for_the_next_tas
+     b = task(w, "taskb")                                                 # a brand-new task, never judged
+     assert until(lambda: b.exists()) and b.read_text() == "fail", "B's first packet got out"
+     assert w.sets.drop_counts()["out"] >= 1                              # dropped by the floor, not by B being isolated
++    rc = dynreplay.main([str(w.dec), "--events", str(w.tmp / "events.jsonl"), "--check", "--kernel", "off", "--json"])
++    assert rc == 0, "the replay does not reproduce the daemon's enforce decision"
+diff --git a/tests/test_dynreplay.py b/tests/test_dynreplay.py
+new file mode 100644
+index 0000000..049dae8
+--- /dev/null
++++ b/tests/test_dynreplay.py
+@@ -0,0 +1,313 @@
++"""The replay harness without a kernel. The logs are produced by running the LIVE policy over synthetic scenarios and
++writing both files exactly as the daemon does, so what the replay reads is what the daemon writes.
++Run: pytest -q tests/test_dynreplay.py"""
++import gzip
++import io
++import json
++import random
++import subprocess
++import sys
++import uuid
++from datetime import datetime, timezone
++from pathlib import Path
++
++import pytest
++
++from cora_sentinel import dynpolicy, dynreplay, nftsets
++from cora_sentinel.dynpolicy import DynConfig, DynPolicy
++
++from test_dynpolicy import Clock, mk
++
++T0 = 1_800_000_000.0
++DRY = "dry-run:ISOLATE@cgroup:x"
++
++
++def iso(t):
++    return datetime.fromtimestamp(t, timezone.utc).isoformat(timespec="seconds")
++
++
++def make_log(tmp_path, steps, mode="shadow", cfg=None, exempt=None, name=""):
++    """steps: [(seconds_since_previous, mk-kwargs)]. Returns (decisions_path, events_path) like the daemon's two logs."""
++    dec, evp = tmp_path / f"decisions{name}.jsonl", tmp_path / f"events{name}.jsonl"
++    clock = Clock(T0)
++    pol = DynPolicy(mode, state_dir=None, clock=clock, cfg=cfg or DynConfig(), log=lambda m: None, exempt=exempt)
++    with open(dec, "w") as df, open(evp, "w") as ef:
++        for dt, kw in steps:
++            clock.advance(dt)
++            kw = {"action": DRY, **kw}
++            ev, d = mk(**kw)
++            ev["event_id"], ev["ts"] = uuid.uuid4().hex, iso(clock.t)
++            d.update({"ts": iso(clock.t), "event_id": ev["event_id"], "pid": 1, "vip": "10.0.0.2",
++                      "kind": "unauthorized_connection", "mode": "dry-run"})
++            rec = pol.consider(ev, d)
++            if rec:
++                d["dyn"] = rec
++            ef.write(json.dumps(ev) + "\n")
++            df.write(json.dumps(d) + "\n")
++    return dec, evp
++
++
++def run(tmp_path, capsys, *argv, steps=None, **mk_kw):
++    """Run the CLI on a fresh log (or an existing one) and return (exit, parsed JSON or text)."""
++    if steps is not None:
++        dec, evp = make_log(tmp_path, steps, **mk_kw)
++        argv = (str(dec), "--events", str(evp)) + argv
++    rc = dynreplay.main(["--kernel", "off", *argv])
++    out = capsys.readouterr().out
++    try:
++        return rc, json.loads(out)
++    except ValueError:
++        return rc, out
++
++
++WEB = (0, {"task": "a", "ip": "45.33.32.156", "port": 443})
++
++
++# ================= reading the logs =================
++def test_decisions_are_joined_with_events_by_event_id_and_only_isolate_counts(tmp_path):
++    dec, evp = make_log(tmp_path, [(0, {"task": "a"}), (5, {"task": "b", "ip": "45.33.33.9"}),
++                                   (5, {"task": "c", "ip": "45.33.34.9", "final": "ESCALATE", "action": "needs-human"})])
++    lines = evp.read_text().splitlines()
++    evp.write_text("\n".join(lines[:2]) + "\n")                       # the third event is not in the log; the 2nd decision stays
++    recs, st = dynreplay.load([str(dec)], [str(evp)])
++    assert st == {"decisions": 3, "isolate": 2, "joined": 2, "no_event": 0, "malformed": 0}
++    dec.write_text(dec.read_text().replace(json.loads(dec.read_text().splitlines()[1])["event_id"], "gone"))
++    recs, st = dynreplay.load([str(dec)], [str(evp)])
++    assert st["joined"] == 1 and st["no_event"] == 1 and recs[0].task == "a"
++
++
++def test_duplicates_malformed_lines_and_shuffled_order_are_handled(tmp_path):
++    dec, evp = make_log(tmp_path, [(0, {"task": "a"}), (10, {"task": "b", "ip": "45.33.33.9"}), (10, {"task": "c", "ip": "45.33.34.9"})])
++    lines = dec.read_text().splitlines()
++    dec.write_text("\n".join([lines[2], "not json", lines[0], lines[0], "", lines[1]]) + "\n")
++    recs, st = dynreplay.load([str(dec)], [str(evp)])
++    assert [r.task for r in recs] == ["a", "b", "c"] and st["malformed"] == 1 and st["isolate"] == 3   # time order, deduplicated
++
++
++def test_rotated_gz_files_several_files_and_stdin(tmp_path, monkeypatch):
++    dec, evp = make_log(tmp_path, [(0, {"task": "a"}), (10, {"task": "b", "ip": "45.33.33.9"}), (10, {"task": "c", "ip": "45.33.34.9"})])
++    dl, el = dec.read_text().splitlines(), evp.read_text().splitlines()
++    (tmp_path / "decisions.jsonl.1.gz").write_bytes(gzip.compress(("\n".join(dl[:2]) + "\n").encode()))
++    (tmp_path / "events.jsonl.1.gz").write_bytes(gzip.compress(("\n".join(el[:2]) + "\n").encode()))
++    dec.write_text(dl[2] + "\n")
++    evp.write_text(el[2] + "\n")
++    recs, st = dynreplay.load([str(dec), str(tmp_path / "decisions.jsonl.1.gz")], [str(evp), str(tmp_path / "events.jsonl.1.gz")])
++    assert [r.task for r in recs] == ["a", "b", "c"]
++    monkeypatch.setattr(sys, "stdin", io.StringIO("\n".join(dl) + "\n"))
++    recs, st = dynreplay.load(["-"], [str(tmp_path / "events.jsonl.1.gz"), str(evp)])
++    assert len(recs) == 3
++
++
++def test_since_and_until_select_a_window(tmp_path):
++    dec, evp = make_log(tmp_path, [(0, {"task": "a"}), (3600, {"task": "b", "ip": "45.33.33.9"}), (3600, {"task": "c", "ip": "45.33.34.9"})])
++    recs, _ = dynreplay.load([str(dec)], [str(evp)], since=dynreplay.parse_ts(iso(T0 + 3600)), until=dynreplay.parse_ts(iso(T0 + 7200)))
++    assert [r.task for r in recs] == ["b"]
++
++
++def test_the_event_log_defaults_to_the_one_next_to_the_decisions_and_is_required_otherwise(tmp_path, capsys):
++    dec, evp = make_log(tmp_path, [WEB])
++    evp.rename(tmp_path / "events.jsonl")
++    assert dynreplay.main(["--kernel", "off", str(dec)]) == 0
++    capsys.readouterr()
++    (tmp_path / "events.jsonl").unlink()
++    assert dynreplay.main(["--kernel", "off", str(dec)]) == 2
++    assert "--events" in capsys.readouterr().err
++
++
++def test_an_empty_log_says_so_and_is_not_an_error(tmp_path, capsys):
++    (tmp_path / "d.jsonl").write_text("")
++    (tmp_path / "e.jsonl").write_text("")
++    rc, out = run(tmp_path, capsys, str(tmp_path / "d.jsonl"), "--events", str(tmp_path / "e.jsonl"))
++    assert rc == 0 and "nothing to replay" in out
++
++
++# ================= the clock, the worlds =================
++def outcomes(tmp_path, capsys, *argv, steps, **kw):
++    rc, doc = run(tmp_path, capsys, "--json", "--outcomes", *argv, steps=steps, **kw)
++    return rc, doc, doc["worlds"]["A"]["outcomes"]
++
++
++def test_the_policy_clock_follows_the_recorded_time(tmp_path, capsys):
++    steps = [(0, {"task": "a", "port": 443}), (601, {"task": "b", "port": 443}), (30, {"task": "c", "port": 443})]
++    rc, doc, oc = outcomes(tmp_path, capsys, steps=steps)
++    assert [o["result"] for o in oc] == ["blocked", "blocked", "refreshed"]
++    assert [o["ttl_s"] for o in oc] == [600, 2400, 9600]               # expired at +600, so +601 is a fresh block at offense 2
++
++
++def test_rehearse_treats_a_dry_run_isolate_as_done_and_as_recorded_does_not(tmp_path, capsys):
++    steps = [(0, {"task": "a"})]
++    assert outcomes(tmp_path, capsys, steps=steps)[2][0]["result"] == "blocked"
++    assert outcomes(tmp_path, capsys, "--as-recorded", steps=steps)[2][0]["result"] == "would_block"
++
++
++def test_an_isolated_task_stops_emitting_events_in_the_rehearse_world(tmp_path, capsys):
++    steps = [(0, {"task": "a"}), (20, {"task": "a"}), (20, {"task": "a", "ip": "45.33.33.9"})]
++    _, doc, oc = outcomes(tmp_path, capsys, steps=steps)
++    assert [o["result"] for o in oc] == ["blocked", "suppressed", "suppressed"]
++    _, doc, oc = outcomes(tmp_path, capsys, "--keep-isolated", steps=steps)
++    assert [o["result"] for o in oc] == ["blocked", "dedupe", "blocked"]
++
++
++def test_exemptions_recorded_live_are_honoured_and_allow_protect_add_more(tmp_path, capsys):
++    exempt = lambda ip: "allowed:45.33.33.0/24" if ip.startswith("45.33.33.") else None        # noqa: E731
++    steps = [(0, {"task": "a", "ip": "45.33.33.9"}), (10, {"task": "b", "ip": "45.33.34.9"}), (10, {"task": "c", "ip": "45.33.35.9"})]
++    dec, evp = make_log(tmp_path, steps, exempt=exempt)
++    rc, doc = run(tmp_path, capsys, str(dec), "--events", str(evp), "--json", "--outcomes")
++    assert [o["result"] for o in doc["worlds"]["A"]["outcomes"]] == ["skipped", "blocked", "blocked"]      # from the record
++    assert doc["worlds"]["A"]["outcomes"][0]["reason"].startswith("allowed:")
++    rc, doc = run(tmp_path, capsys, str(dec), "--events", str(evp), "--json", "--outcomes", "--allow", "45.33.34.0/24", "--protect", "45.33.35.9")
++    b = doc["worlds"]["B"]["outcomes"]
++    assert [o["result"] for o in b] == ["skipped", "skipped", "skipped"] and doc["diff"]["changed"] == 2
++
++
++# ================= does it reproduce the daemon? =================
++SCENARIO = ([(0, {"task": "t1", "port": 443}), (30, {"task": "t2", "port": 443}), (20, {"task": "t3", "ip": "45.33.33.7", "port": 8080}),
++             (20, {"task": "t4", "ip": "45.33.33.7", "port": 9090}), (20, {"task": "t5", "ip": "45.33.34.1", "port": 22, "conf": 0.8}),
++             (20, {"task": "t6", "ip": "45.33.34.2", "port": 53}), (700, {"task": "t7", "port": 443}),
++             (5, {"task": "t8", "ip": "45.33.34.3", "port": 80, "blocklist": True})]
++            + [(2, {"task": "noisy", "ip": f"45.34.0.{i}", "port": 7000 + i}) for i in range(12)])
++
++
++def test_check_reproduces_exactly_what_the_live_policy_recorded(tmp_path, capsys):
++    rc, doc = run(tmp_path, capsys, "--check", "--json", steps=SCENARIO)
++    assert rc == 0 and doc["check"]["mismatch"] == 0 and doc["check"]["compared"] == len(SCENARIO), doc["check"]
++
++
++def test_check_needs_the_live_settings_and_detects_drift_without_them(tmp_path, capsys):
++    cfg = DynConfig(task_cap=5, write_per_min=50)
++    dec, evp = make_log(tmp_path, SCENARIO, cfg=cfg)
++    base = (str(dec), "--events", str(evp), "--check", "--json")
++    rc, doc = run(tmp_path, capsys, *base, "--task-cap", "5", "--write-budget", "50")
++    assert rc == 0 and doc["check"]["mismatch"] == 0
++    rc, doc = run(tmp_path, capsys, *base)                                         # replayed with different settings
++    assert rc == 1 and doc["check"]["mismatch"] >= 1 and doc["check"]["first"][0]["recorded"]["reason"] == "task_cap"
++
++
++def test_check_detects_a_policy_that_changed_since_the_log_was_written(tmp_path, capsys, monkeypatch):
++    dec, evp = make_log(tmp_path, SCENARIO)
++    monkeypatch.setattr(dynpolicy, "FLOW_BASE_S", 300)
++    monkeypatch.setattr(dynpolicy.DynConfig, "flow_base_s", 300, raising=False)
++    rc, doc = run(tmp_path, capsys, str(dec), "--events", str(evp), "--check", "--json", "--flow-ttl", "300")
++    assert rc == 1 and any(m["recorded"]["ttl_s"] == 600 for m in doc["check"]["first"])
++
++
++def test_diff_recorded_is_informational_and_a_log_without_dyn_records_is_counted(tmp_path, capsys):
++    dec, evp = make_log(tmp_path, [WEB])
++    d = json.loads(dec.read_text())
++    d.pop("dyn")
++    dec.write_text(json.dumps(d) + "\n")
++    rc, doc = run(tmp_path, capsys, str(dec), "--events", str(evp), "--diff-recorded", "--json")
++    assert rc == 0 and doc["check"]["no_record"] == 1 and doc["check"]["compared"] == 0
++
++
++# ================= tweaks and the diff =================
++def test_a_tweak_runs_b_against_the_defaults_and_reports_what_changed(tmp_path, capsys):
++    rc, doc = run(tmp_path, capsys, "--json", "--keep-isolated", "--write-budget", "2", steps=SCENARIO)
++    assert set(doc["worlds"]) == {"A", "B"}
++    d = doc["diff"]
++    assert d["changed"] >= 1 and d["delta"]["throttled"] > 0 and d["delta"]["blocks"] < 0 and d["first"][0]["b"]["reason"] == "budget"
++    assert doc["worlds"]["B"]["summary"]["limits"]["write_per_min"]["limit"] == 2
++
++
++def test_promote_tasks_changes_whether_the_whole_address_is_blocked(tmp_path, capsys):
++    steps = [(0, {"task": "x", "ip": "45.33.33.7", "port": 8080}), (10, {"task": "y", "ip": "45.33.33.7", "port": 9090})]
++    rc, doc = run(tmp_path, capsys, "--json", "--promote-tasks", "3", steps=steps)
++    assert doc["worlds"]["A"]["summary"]["results"].get("promoted") == 1 and "promoted" not in doc["worlds"]["B"]["summary"]["results"]
++
++
++def test_a_single_world_has_no_diff_and_the_text_report_has_its_sections(tmp_path, capsys):
++    rc, out = run(tmp_path, capsys, "--timeline", "--top", "3", steps=SCENARIO)
++    for head in ("== replay", "results", "limits", "write budget", "live elements", "per-task cap", "web ports 80/443",
++                 "promoted to a whole address: 0", "targets ", "self-check", "timeline (hour, UTC)", "kernel: not used"):
++        assert head in out, head
++    assert "== B vs A" not in out
++
++
++# ================= the report's numbers =================
++def test_blocked_time_is_exact_across_a_refresh_and_a_gap(tmp_path, capsys):
++    steps = [(0, {"task": "a", "port": 443}), (300, {"task": "b", "port": 443}), (5000, {"task": "c", "port": 443})]
++    rc, doc = run(tmp_path, capsys, "--json", steps=steps)
++    top = doc["worlds"]["A"]["summary"]["web"]["top"][0]
++    # 0-300 (first ttl 600, cut short by the refresh) + 300-2700 (ttl 2400) + 5300: a fresh block at offense 3 (ttl 9600)
++    assert top["blocked_s"] == 300 + 2400 + 9600 and top["offenses"] == 3 and top["tasks"] == 3
++
++
++def test_limits_report_denials_peaks_and_the_lowest_bucket(tmp_path, capsys):
++    steps = [(1, {"task": f"t{i}", "ip": f"45.34.0.{i}", "port": 7000 + i}) for i in range(8)]
++    rc, doc = run(tmp_path, capsys, "--json", "--write-budget", "3", steps=steps)
++    s = doc["worlds"]["B"]["summary"]
++    assert s["throttled"]["budget"] == 5 and s["limits"]["write_per_min"]["peak"] == 3 and s["limits"]["live"]["peak"] == 3
++    assert s["limits"]["bucket_min_tokens"] < 1.0
++    steps = [(1, {"task": "one", "ip": f"45.34.0.{i}", "port": 7000 + i}) for i in range(4)]
++    rc, doc = run(tmp_path, capsys, "--json", "--keep-isolated", "--task-cap", "2", steps=steps)
++    s = doc["worlds"]["B"]["summary"]
++    assert s["throttled"]["task_cap"] == 2 and s["limits"]["task_targets_per_hour"]["max"] == 2
++    assert s["throttled"]["task_cap_by_task"] == {"one": 2}
++
++
++def test_web_traffic_is_reported_and_a_web_hit_covered_by_a_whole_address_block_is_noticed(tmp_path, capsys):
++    steps = [(0, {"task": "x", "ip": "45.33.33.7", "port": 8080}), (10, {"task": "y", "ip": "45.33.33.7", "port": 9090}),
++             (10, {"task": "z", "ip": "45.33.33.7", "port": 443})]
++    rc, doc = run(tmp_path, capsys, "--json", steps=steps)
++    w = doc["worlds"]["A"]["summary"]["web"]
++    assert w["promotions"] == 0 and w["covered_by_whole_address"] == 1
++
++
++# ================= the self-checks =================
++def test_a_web_port_promotion_is_a_self_check_failure_even_if_the_policy_lies_about_it(tmp_path, capsys, monkeypatch):
++    dec, evp = make_log(tmp_path, [(0, {"task": "a", "port": 443}), (10, {"task": "b", "port": 443})])
++    monkeypatch.setattr(dynpolicy, "WEB_PORTS", frozenset())          # a broken policy that treats 443 as an ordinary port
++    rc = dynreplay.main(["--kernel", "off", str(dec), "--events", str(evp)])
++    cap = capsys.readouterr()
++    assert rc == 2 and "SELF-CHECK FAILED" in cap.err and "MUST BE 0" in cap.out
++
++
++def test_the_ledger_and_the_simulated_sets_agree_over_a_random_history(tmp_path, capsys):
++    rnd = random.Random(7)
++    steps = [(rnd.choice([0, 1, 5, 30, 200, 900, 4000]),
++              {"task": f"t{rnd.randrange(9)}", "ip": f"45.33.{rnd.randrange(3)}.{rnd.randrange(6)}",
++               "port": rnd.choice([443, 80, 8080, 9090, 22, 8443, 7777]), "proto": rnd.choice(["tcp", "udp"]),
++               "conf": rnd.choice([0.95, 0.99, 0.5])}) for _ in range(300)]
++    for flags in ((), ("--keep-isolated",), ("--keep-isolated", "--task-cap", "3", "--write-budget", "5", "--max-live", "6")):
++        rc, doc = run(tmp_path, capsys, "--json", *flags, steps=steps)
++        assert rc == 0 and doc["problems"] == []
++        for w in doc["worlds"].values():
++            assert w["summary"]["consistent"] == {"ledger_vs_sets": True}, flags
++
++
++def test_a_policy_that_raises_is_reported_not_fatal(tmp_path, capsys, monkeypatch):
++    dec, evp = make_log(tmp_path, [WEB, (5, {"task": "b", "ip": "45.33.33.9"})])
++    real = DynPolicy.consider
++    monkeypatch.setattr(DynPolicy, "consider", lambda self, ev, d: (_ for _ in ()).throw(RuntimeError("boom")))
++    rc, doc = run(tmp_path, capsys, str(dec), "--events", str(evp), "--json")
++    assert rc == 0 and doc["worlds"]["A"]["summary"]["results"] == {"error": 2}
++
++
++def test_the_live_ledger_is_never_touched(tmp_path, capsys, monkeypatch):
++    state = tmp_path / "st"
++    state.mkdir()
++    ledger = state / "dyn-ledger-enforce.json"
++    ledger.write_text(json.dumps({"v": 1, "flows": {}, "ips": {}, "watch": {}, "targets": {}, "marker": "live"}))
++    before = ledger.read_bytes()
++    monkeypatch.setenv("CORA_STATE_DIR", str(state))
++    rc, doc = run(tmp_path, capsys, "--json", steps=SCENARIO)
++    assert rc == 0 and ledger.read_bytes() == before and sorted(p.name for p in state.iterdir()) == ["dyn-ledger-enforce.json"]
++
++
++def test_kernel_on_without_privileges_is_a_clean_error(tmp_path, capsys, monkeypatch):
++    dec, evp = make_log(tmp_path, [WEB])
++    monkeypatch.setattr(dynreplay, "can_kernel", lambda: False)
++    assert dynreplay.main(["--kernel", "on", str(dec), "--events", str(evp)]) == 2
++    assert "needs root, nft and unshare" in capsys.readouterr().err
++
++
++# ================= the entry points =================
++def test_cora_floor_dyn_replay_and_the_tools_shim_run_the_same_thing(tmp_path, capsys):
++    dec, evp = make_log(tmp_path, [WEB])
++    assert nftsets.main(["dyn-replay", str(dec), "--events", str(evp), "--kernel", "off", "--json"]) == 0
++    assert json.loads(capsys.readouterr().out)["inputs"]["joined"] == 1
++    shim = Path(__file__).resolve().parents[1] / "tools" / "dyn_replay.py"
++    r = subprocess.run([sys.executable, str(shim), str(dec), "--events", str(evp), "--kernel", "off"], capture_output=True, text=True)
++    assert r.returncode == 0 and "web ports 80/443" in r.stdout
++    h = subprocess.run([sys.executable, "-m", "cora_sentinel.nftsets", "dyn-replay", "--help"], capture_output=True, text=True)
++    assert h.returncode == 0 and "--check" in h.stdout
+diff --git a/tests/test_dynreplay_kernel.py b/tests/test_dynreplay_kernel.py
+new file mode 100644
+index 0000000..3c6a764
+--- /dev/null
++++ b/tests/test_dynreplay_kernel.py
+@@ -0,0 +1,75 @@
++"""The replay harness's kernel mode on a real kernel: every write is made in a private network namespace (`unshare -n`)
++and a throwaway table, the real nft state is cross-checked against the policy's ledger, and the host is never touched.
++Skips without root, nft and unshare. Run: sudo -E $(which python) -m pytest -q tests/test_dynreplay_kernel.py"""
++import json
++import shutil
++import subprocess
++import sys
++
++import pytest
++
++from test_dynreplay import make_log
++from test_floor_gate import kernel
++
++needs_unshare = pytest.mark.skipif(not shutil.which("unshare"), reason="needs unshare")
++
++# long enough for expiries, refreshes, a promotion and a throttled task to all happen
++STEPS = ([(0, {"task": "w1", "port": 443}), (400, {"task": "w2", "port": 443}), (400, {"task": "w3", "port": 443}),
++          (50, {"task": "s1", "ip": "45.33.33.7", "port": 8080}), (30, {"task": "s2", "ip": "45.33.33.7", "port": 9090}),
++          (3000, {"task": "w4", "port": 443}), (20, {"task": "u1", "ip": "2606:4700::1", "port": 8443})]
++         + [(5, {"task": "x%d" % i, "ip": f"45.34.0.{i}", "port": 7000 + i}) for i in range(10)] + [(4000, {"task": "late", "port": 443})])
++
++
++def replay(dec, evp, *flags, stdin=None):
++    return subprocess.run([sys.executable, "-m", "cora_sentinel.dynreplay", str(dec), "--events", str(evp), *flags],
++                          capture_output=True, text=True, input=stdin)
++
++
++def host_nft():
++    return subprocess.run(["nft", "list", "ruleset"], capture_output=True, text=True).stdout
++
++
++@kernel
++@needs_unshare
++def test_kernel_mode_writes_to_a_private_namespace_and_agrees_with_the_ledger(tmp_path):
++    dec, evp = make_log(tmp_path, STEPS)
++    before = host_nft()
++    r = replay(dec, evp, "--kernel", "on")
++    assert r.returncode == 0, r.stdout + r.stderr
++    assert "private netns" in r.stdout and "real nft vs simulated sets: agree" in r.stdout
++    assert "ledger vs simulated sets: agree" in r.stdout and "simulated expiries removed" in r.stdout
++    assert host_nft() == before, "the replay changed the HOST ruleset"
++    assert subprocess.run(["nft", "list", "table", "inet", "cora_replay"], capture_output=True).returncode != 0
++
++
++@kernel
++@needs_unshare
++def test_kernel_and_simulation_decide_identically_and_expiries_really_happened(tmp_path):
++    dec, evp = make_log(tmp_path, STEPS)
++    sim = json.loads(replay(dec, evp, "--kernel", "off", "--json", "--outcomes").stdout)
++    ker = json.loads(replay(dec, evp, "--kernel", "on", "--json", "--outcomes").stdout)
++    assert ker["worlds"]["A"]["outcomes"] == sim["worlds"]["A"]["outcomes"]
++    k = ker["kernel"]
++    acts = sum(1 for o in sim["worlds"]["A"]["outcomes"] if o["result"] in ("blocked", "refreshed", "promoted"))
++    assert k["writes"] == acts and k["deletes"] >= 3 and k["p50_ms"] > 0       # blocks timed out in SIMULATED time and were removed
++    assert ker["worlds"]["A"]["summary"]["consistent"] == {"ledger_vs_sets": True, "kernel_vs_sets": True}
++    assert sim["kernel"] is None and ker["problems"] == []
++
++
++@kernel
++@needs_unshare
++def test_kernel_mode_keeps_stdin_and_skips_the_kernel_when_verifying(tmp_path):
++    dec, evp = make_log(tmp_path, STEPS[:6])
++    r = replay("-", evp, "--kernel", "on", stdin=dec.read_text())              # the exec into the namespace must keep stdin
++    assert r.returncode == 0 and "private netns" in r.stdout, r.stdout + r.stderr
++    c = replay(dec, evp, "--check", "--kernel", "on")                          # verifying never writes: no namespace needed
++    assert c.returncode == 0 and "kernel: not used" in c.stdout and "match 6   mismatch 0" in c.stdout
++
++
++@kernel
++@needs_unshare
++def test_a_tweak_in_kernel_mode_mirrors_world_b_and_still_agrees(tmp_path):
++    dec, evp = make_log(tmp_path, STEPS)
++    r = replay(dec, evp, "--kernel", "on", "--keep-isolated", "--write-budget", "4", "--task-cap", "3")
++    assert r.returncode == 0, r.stdout + r.stderr
++    assert "== B vs A" in r.stdout and "real nft vs simulated sets: agree" in r.stdout
+diff --git a/tools/dyn_replay.py b/tools/dyn_replay.py
+new file mode 100755
+index 0000000..24476ec
+--- /dev/null
++++ b/tools/dyn_replay.py
+@@ -0,0 +1,12 @@
++#!/usr/bin/env python3
++"""Rehearse the dynamic policy against recorded decisions and events. Same as `cora-floor dyn-replay`; see
++cora_sentinel/dynreplay.py or docs/dyn-policy.md.
++
++  python tools/dyn_replay.py /var/log/cora-sentinel/decisions.jsonl --events /var/log/cora-sentinel/events.jsonl
++"""
++import sys
++
++from cora_sentinel.dynreplay import main
++
++if __name__ == "__main__":
++    sys.exit(main())

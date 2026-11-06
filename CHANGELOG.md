@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.7.0
+
+### Added
+- **Replay harness (`cora-floor dyn-replay`, `tools/dyn_replay.py`, `cora_sentinel.dynreplay`).** Feeds recorded ISOLATE
+  decisions back through the real `DynPolicy` with a clock that follows the recorded timestamps, to rehearse policy
+  tweaks against shadow data without waiting a week and without touching the live system. It needs BOTH logs: a decision has
+  no destination or task, so it is joined with `events.jsonl` on `event_id` (rotated, `.gz`, several files, `-` for stdin;
+  `--since/--until`).
+- **Worlds.** *Rehearse* (default): the adjudicator is assumed enforcing (a dry-run ISOLATE counts as done) and a task's later
+  events are dropped once it is isolated, because an isolated task has no egress. `--as-recorded`: no assumptions.
+  `--check`: replay as recorded and verify every decision against the live `dyn` record (exit 1 on a mismatch); in these two
+  modes the policy flags state the LIVE daemon's settings.
+- **Report:** results, skip reasons, the three limits (write budget with peak per minute and denials, live elements, per-task
+  cap), the web-port section (blocks, refreshes, targets, promotions, which must be 0), the longest-blocked targets with
+  exact blocked time, `--timeline`, and for tweaks (`--min-conf --write-budget --max-live --task-cap --promote-tasks
+  --flow-ttl --ip-ttl --allow --protect`) a B-vs-A diff of every changed decision. `--json` / `--outcomes`.
+- **Kernel mode** (auto when root, nft and `unshare` exist; `--kernel off|on`): every write is mirrored into a private
+  network namespace and a throwaway table, elements are removed at their SIMULATED expiry, and the real nft state is
+  cross-checked against the ledger. Reports write count, p50/p99 and expiries removed.
+- **Self-checks (exit 2):** a web port promoted to a whole address (classified by port inside the replay, not from the
+  policy's own flag, so it cannot hide the bug it looks for), or the sets disagreeing with the ledger.
+- Tests: `test_dynreplay.py` (26) and `test_dynreplay_kernel.py` (4); the two daemon end-to-end tests replay the real
+  daemon's logs with `--check`.
+
+### Not done
+- It does not re-run the model, so a different model or prompt cannot be rehearsed; `--min-conf` filters recorded
+  confidences only.
+- The live allow list at the time is not recoverable (exemptions come from the recorded skip reasons plus `--allow` /
+  `--protect`); releases and manual unblocks are not in the log and are not replayed; time has one-second resolution.
+
+## 0.6.2
+
+### Fixed
+- Test fixtures (recorded here after the fact): `test_daemon_dyn.py` writes each task's result to `/tmp` because `cora-run`
+  drops root when started under `sudo` and the task could not write into the root-owned pytest directory; the logrotate
+  test stages a root-owned copy of the config, which logrotate insists on.
+
 ## 0.6.1
 
 ### Fixed

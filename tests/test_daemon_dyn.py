@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from cora_sentinel import dynreplay
 from cora_sentinel.nftsets import NftSets
 
 from test_floor_confirm import CG, daemon_kernel, enter
@@ -157,6 +158,9 @@ def test_shadow_through_the_daemon_records_what_it_would_block_and_touches_nothi
     out = subprocess.run([*enter(w.lab.c), sys.executable, "-m", "cora_sentinel.nftsets", "--state-dir", w.state,
                           "dyn", "--mode", "shadow"], env=w.env, capture_output=True, text=True).stdout
     assert f"{G}|tcp|{GPORT}" in out and "[shadow] 1 active" in out
+    # the replay harness must reproduce what this REAL daemon recorded, from the two logs it wrote
+    rc = dynreplay.main([str(w.dec), "--events", str(w.tmp / "events.jsonl"), "--check", "--kernel", "off", "--json"])
+    assert rc == 0, "the replay does not reproduce the daemon's own shadow decision"
 
 
 @kernel
@@ -175,3 +179,5 @@ def test_enforce_through_the_daemon_closes_the_first_packet_gap_for_the_next_tas
     b = task(w, "taskb")                                                 # a brand-new task, never judged
     assert until(lambda: b.exists()) and b.read_text() == "fail", "B's first packet got out"
     assert w.sets.drop_counts()["out"] >= 1                              # dropped by the floor, not by B being isolated
+    rc = dynreplay.main([str(w.dec), "--events", str(w.tmp / "events.jsonl"), "--check", "--kernel", "off", "--json"])
+    assert rc == 0, "the replay does not reproduce the daemon's enforce decision"

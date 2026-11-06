@@ -107,3 +107,53 @@ The decision log is `/var/log/cora-sentinel/decisions.jsonl`, rotated by size (t
 across rotations: `zcat -f /var/log/cora-sentinel/decisions.jsonl* | cora-floor dyn-report /dev/stdin`.
 Anything in the report with `no_destination` or `bad_flow` means an event had a shape the policy did not expect: report it.
 `--floor` is separate from the dynamic policy (it enforces your static lists); drop it for a purely observational run.
+
+## Rehearsing against recorded data (`cora-floor dyn-replay`)
+
+Shadow mode records what the policy decided; `dyn-replay` lets you ask "what if" about it without waiting another week.
+It feeds every recorded ISOLATE back through the real policy code with a clock that follows the recorded timestamps, so
+TTLs expire, budgets refill and windows slide as they did, in seconds.
+
+```bash
+cora-floor dyn-replay /var/log/cora-sentinel/decisions.jsonl                          # events.jsonl is found next to it
+zcat -f /var/log/cora-sentinel/decisions.jsonl* | cora-floor dyn-replay - \
+    --events /var/log/cora-sentinel/events.jsonl --events /var/log/cora-sentinel/events.jsonl.1   # across rotations
+cora-floor dyn-replay decisions.jsonl --task-cap 4 --write-budget 10                  # B (your settings) vs A (defaults)
+cora-floor dyn-replay decisions.jsonl --check                                         # does it reproduce the live record?
+```
+
+**Both logs are needed.** A decision has the verdict, the action, the time and what the live policy did, but not the
+destination or the task. Those are in the event (`events.jsonl`, the daemon's `--out`), joined on `event_id`. Rotated and
+`.gz` files are fine, and so are several of each; `-` reads stdin. `--since` / `--until` take an ISO time (UTC if no offset).
+
+**Worlds.** *Rehearse* (default) answers "what would **enforce** have done?": the adjudicator is assumed to be enforcing,
+so a dry-run ISOLATE counts as done, and once a task is isolated its later events are dropped (an isolated task has no
+egress, so a shadow log taken with a dry-running adjudicator holds events enforce would never have seen;
+`--keep-isolated` keeps them). `--as-recorded` makes no assumptions: the recorded actions, the policy in shadow.
+`--check` is `--as-recorded` plus a decision-by-decision comparison with the `dyn` record the live policy wrote, with exit
+status 1 on any mismatch: it is how you know the harness reproduces your daemon, and how you notice drift after an
+upgrade. In these two modes the policy flags are **not** a tweak; they tell the replay the settings your live daemon runs
+with (`--check --dyn-task-cap` is `--check --task-cap`), because a log written under one setting cannot match a replay
+under another.
+
+**What it prints:** results by kind; the skip reasons; the three limits (write budget with its peak per minute and
+denials, live elements, per-task cap with the busiest task); the **web ports** section (flow blocks, repeat-offense
+refreshes, distinct targets, and promotions to a whole address, which must be 0); the targets that would have been
+blocked longest, with exact blocked time; `--timeline` per hour; and with tweaks a diff of every decision that changed.
+`--json` is the same data (`--outcomes` adds every decision).
+
+**Kernel mode.** If root, nft and `unshare` are available, every write is also made in a private network namespace and a
+throwaway table (never the host's), and at the end the real nft state is cross-checked against the policy's ledger.
+Kernel timeouts run in real time, so elements are written with the longest timeout and removed at their *simulated*
+expiry. The decisions are identical with or without it; it proves each write is accepted by nft and reports the cost.
+`--kernel off` skips it. The replay never touches the live ledger or the live ruleset.
+
+**Exit status.** 0 ok; 1 `--check` found a mismatch; 2 a self-check failed (a web port was promoted, which the replay
+detects independently of the policy's own flag, or the sets disagree with the ledger) or the input was unusable.
+
+**What it cannot do.** It does not re-run the model: verdicts and confidences are as recorded, so `--min-conf` filters them
+but a different model or prompt cannot be rehearsed. The live allow list and protected addresses at the time are not
+recoverable, so exemptions come from what the live policy recorded for each decision, plus `--allow` / `--protect`. Time has
+one-second resolution (the decision log's), and history before the first logged decision is unknown, so the first
+decisions after a log rotation may not match under `--check`. Releases (`cora-firewall release`) and manual unblocks are
+not in the log and are not replayed. The escalation factor (x4, 24 h cap) and the web-port list are fixed in the code.

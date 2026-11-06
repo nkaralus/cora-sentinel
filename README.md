@@ -123,7 +123,8 @@ effect by default: the default is `shadow`**, which records what it *would* do i
 Web ports (80/443) are blocked per flow only, never the whole address; other ports escalate to the whole address after
 two distinct tasks; there are budgets (20 writes/min, 512 live, 8 targets per task per hour); and `cora-firewall release
 TASK` drops what that task caused. See [docs/dyn-policy.md](docs/dyn-policy.md), and review a week of shadow data with
-`cora-floor dyn-report sentinel_decisions.jsonl` before you consider `--dyn-policy enforce`.
+`cora-floor dyn-report sentinel_decisions.jsonl` before you consider `--dyn-policy enforce`, and rehearse a
+tweak against the recorded data with `cora-floor dyn-replay decisions.jsonl --task-cap 4` (see docs/dyn-policy.md).
 
 ### As a service
 
@@ -279,6 +280,10 @@ need a cgroup v2 mount, or `CORA_TEST_CGROUP_MOUNT`).
 restored by the policy's decisions; they use a public address aliased inside the lab, because the policy refuses private
 ones). `tools/dyn_bench.py` measures the per-decision cost.
 
+0.7.0 adds `tests/test_dynreplay.py` (26, no kernel: the logs are produced by running the live policy over synthetic
+scenarios) and `tests/test_dynreplay_kernel.py` (4: the private-namespace mode; the host ruleset is compared before and
+after). The two daemon end-to-end tests also replay the real daemon's own logs with `--check`.
+
 0.6.1 adds `tests/test_daemon_dyn.py` (2: the real daemon with a stub model and real `cora-run` tasks; shadow records
 `would_block`, and in enforce a brand-new task's first packet to an isolated task's destination is dropped).
 Daemon tests launch with `nsenter`, not `ip netns exec`, which would hide the host's cgroup mount.
@@ -286,7 +291,7 @@ Daemon tests launch with `nsenter`, not `ip netns exec`, which would hide the ho
 ## Layout
 
 ```
-src/cora_sentinel/   daemon  netmon  nflog  nftdump  nftsets  floorguard  dynpolicy  sockdiag  firewall  cgroup  blocklist  blocklist_store  reload  report  verdict  run  demo  selfcheck
+src/cora_sentinel/   daemon  netmon  nflog  nftdump  nftsets  floorguard  dynpolicy  dynreplay  sockdiag  firewall  cgroup  blocklist  blocklist_store  reload  report  verdict  run  demo  selfcheck
 tests/               unit tests, plus kernel tests that skip without root
 schema/              violation.schema.json (cora.security.violation/v1)
 examples/            starter blocklists, an allow list, an example report

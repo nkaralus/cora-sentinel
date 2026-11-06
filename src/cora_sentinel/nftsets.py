@@ -599,6 +599,10 @@ class FloorSync:
 # cora-floor
 # --------------------------------------------------------------------------
 def main(argv: Optional[List[str]] = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if "dyn-replay" in args:                       # its options are its own; argparse's REMAINDER would swallow --help
+        from cora_sentinel import dynreplay
+        return dynreplay.main(args[args.index("dyn-replay") + 1:])
     ap = argparse.ArgumentParser(prog="cora-floor", description="Inspect and drive the kernel-side blocklist floor.")
     ap.add_argument("--table", default=os.environ.get("CORA_NFT_TABLE", "cora"))
     ap.add_argument("--state-dir", default=os.environ.get("CORA_STATE_DIR", floorguard.DEFAULT_STATE_DIR),
@@ -610,6 +614,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     sub.add_parser("pending", help="seconds left to confirm, or 'none'")
     p = sub.add_parser("dyn", help="the dynamic-policy ledger: what is blocked (or would be, in shadow) and why")
     p.add_argument("--mode", choices=("shadow", "enforce"), action="append")
+    sub.add_parser("dyn-replay", help="rehearse the dynamic policy against recorded decisions and events "
+                   "(has its own options: `cora-floor dyn-replay --help`)")
     p = sub.add_parser("dyn-report", help="summarise what the dynamic policy did or would have done, from decisions.jsonl")
     p.add_argument("decisions")
     sub.add_parser("rollback", help="remove the floor IF it is still awaiting confirmation (the unit's ExecStopPost)")
