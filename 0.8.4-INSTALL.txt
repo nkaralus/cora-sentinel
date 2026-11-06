@@ -1,0 +1,23 @@
+cora-sentinel 0.8.4: the daemon says what arguments it started with, and refuses unexpanded shell syntax
+
+Extract over the pushed HEAD (541812b, v0.8.3):
+    cd ~/cora-sentinel
+    unzip -o /path/to/cora-sentinel-0.8.4.zip
+    pip install -e ".[dev]"
+    sudo -E ./venv/bin/python -m pytest -q          # I measured 795 passed, 7 skipped as root in my sandbox
+    cora-sentinel --out '$HOME/x'                    # try it: it prints the refusal and exits 2
+
+New:      tests/test_args.py (37)
+Modified: src/cora_sentinel/daemon.py   the echo line, shell_tokens(), the refusal (exit 2), and the --allow-shell-chars escape hatch
+          deploy/cora-sentinel.service  RestartPreventExitStatus=2 (a usage error is not restarted)
+          deploy/cora-sentinel.conf     the comment now says: no variables, no substitution, no quote marks
+          docs/service.md  tools/gen_man.py (the man page's EXIT STATUS)  CHANGELOG.md  __init__.py (0.8.4)
+0.8.4.patch is the same change as a `git apply` patch.
+
+TO PICK UP THE UNIT CHANGE ON YOUR HOST: you run the venv install, not the .deb, so your unit is wherever you put it. Add the line
+    RestartPreventExitStatus=2
+under Restart=on-failure in it, then: sudo systemctl daemon-reload && sudo systemctl restart cora-sentinel
+The daemon changes need only the restart. After it, the first journal line should read:
+    [cora-sentinel] 0.8.4 starting with: --cgroup-root /sys/fs/cgroup/cora --nft --nflog --floor ...
+
+The refusal checks arguments for $VAR, ${VAR}, $(cmd), $1, a backtick, or a quote mark stuck to a value. A "~" is not refused.

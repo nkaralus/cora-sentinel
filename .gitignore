@@ -16,3 +16,4 @@ cora_reports/
 cora-demo-*/
 sentinel_events.jsonl
 sentinel_decisions.jsonl
+superseded-flat/

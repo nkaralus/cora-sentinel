@@ -31,6 +31,9 @@ ExecStopPost=-@BINDIR@/cora-floor rollback
 # `systemctl reload cora-sentinel` re-reads the blocklists (SIGHUP); nothing else changes.
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
+# Exit status 2 is a USAGE error: an unknown option, or an argument that looks like unexpanded shell syntax. Restarting cannot fix
+# it, so do not loop (and burn the start limit); the journal names the argument.
+RestartPreventExitStatus=2
 RestartSec=5
 TimeoutStopSec=20
 KillSignal=SIGTERM

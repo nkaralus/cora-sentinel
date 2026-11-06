@@ -75,8 +75,10 @@ PAGES = {
                 ("tp", "/var/lib/cora-sentinel/", "State: the confirmed floor allow set, the dynamic-policy ledgers, violation reports (**--state-dir**)."),
                 ("tp", "/sys/fs/cgroup/cora/", "The default task cgroup root (**--cgroup-root**)."),
             ]),
-            ("EXIT STATUS", [("p", "0 after a clean stop. 1 if it could not start: invalid options, a floor refused by the pre-check or "
-                                   "that nft cannot install, or a damaged install.")]),
+            ("EXIT STATUS", [("p", "0 after a clean stop. 2 on a usage error: an unknown option, or an argument that looks like unexpanded shell "
+                                   "syntax (a variable, a command substitution, a stray quote mark), which it names; the packaged unit does not "
+                                   "restart on 2. 1 if it could not start for another reason: a floor refused by the pre-check or that nft "
+                                   "cannot install, an unusable option combination, or a damaged install.")]),
             ("EXAMPLES", [
                 ("p", "Watch tasks, with the connect-time tap, without acting:"),
                 ("code", "cora-sentinel --cgroup-root /sys/fs/cgroup/cora --nft --nflog --out events.jsonl"),

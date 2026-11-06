@@ -49,6 +49,21 @@ Change the allow set and the next start asks again; `cora-floor unconfirm` bring
 
 If you are locked out anyway: wait for the window. The floor removes itself.
 
+## If the service runs with the wrong arguments
+
+The arguments come from `CORA_ARGS` in `/etc/cora-sentinel/cora-sentinel.conf`, and systemd's `EnvironmentFile` does **no shell
+expansion and no quoting**: `$HOME`, `${VAR}`, `$(cmd)` and backticks reach the daemon as literal text, and `--model "/a b.gguf"`
+reaches it as the tokens `"/a` and `b.gguf"` with the quote marks still on. The daemon used to run with whatever it got.
+
+- **It says what it got.** The first line it prints is `[cora-sentinel] VERSION starting with: ARGS`, quoted so a value split at a
+  space is visible: `journalctl -u cora-sentinel -b | grep "starting with"`. The same truth from the kernel's side:
+  `tr '\0' ' ' < /proc/$(systemctl show -p MainPID --value cora-sentinel)/cmdline`.
+- **It refuses the likely mistakes.** An argument containing `$VAR`, `${...}`, `$(...)` or a backtick, or with a quote mark stuck
+  to it, makes it exit with status **2** before it opens any file, naming the argument. The packaged unit does not restart on status
+  2 (`RestartPreventExitStatus=2`), so a bad config fails once, loudly, instead of looping into the start limit. A `~` is not
+  refused (the daemon expands it itself). If a literal `$` or quote mark really is meant, pass `--allow-shell-chars`.
+- Check a change before restarting: `cora-sentinel --out '$HOME/x'` shows the refusal in a terminal.
+
 ## What happens when
 
 | Event | Confirmed floor | Unconfirmed floor |

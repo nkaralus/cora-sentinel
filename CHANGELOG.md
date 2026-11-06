@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.8.4
+
+### Added
+- **The daemon echoes its arguments at start**: `[cora-sentinel] VERSION starting with: ARGS` (via `shlex.join`, so a value split at a
+  space or carrying a stray quote is visible), before anything else; not for `--selftest`. A mangled config is now visible in the
+  first line of the journal.
+- **It refuses arguments that look like unexpanded shell syntax**: `$VAR`, `${VAR}`, `$(cmd)`, `$1`, a backtick, or a quote mark
+  stuck to a value, with exit status **2**, naming the argument, before opening any file. systemd's `EnvironmentFile` does no shell
+  expansion or quoting, so these used to reach the daemon as literal text and it ran with arguments nobody meant. `~` is not refused
+  (the daemon expands it). `--allow-shell-chars` is the escape hatch for a literal `$`.
+- **`RestartPreventExitStatus=2` in the unit**: a usage error (this, or an unknown option) is not restarted, so it fails once and loudly
+  instead of looping into `start-limit-hit`.
+- `tests/test_args.py` (37): every shape flagged, ordinary arguments (including `~`, CIDRs, `#`, `%`, a bare `$`) not, the refusal
+  before any file exists, the echo first and quoted, the escape hatch, `--selftest`/`--help` untouched, a real process exits 2, and the
+  shipped config can never trip its own check.
+- docs/service.md: "If the service runs with the wrong arguments".
+
+### Why
+A live service ran for a day with a config that mixed shell syntax into `CORA_ARGS`; nothing said so, and the questions "where are the
+events going" and "is the model on" could only be answered by reading `/proc/PID/cmdline` by hand.
+
 ## 0.8.3
 
 ### Fixed

@@ -22,6 +22,8 @@ import collections
 import ipaddress
 import json
 import os
+import re
+import shlex
 import signal
 import socket
 import subprocess
@@ -517,6 +519,26 @@ _CHILD = (
 )
 
 
+SHELL_SYNTAX = re.compile(r"\$[{(\w]|`")          # $VAR, ${VAR}, $(cmd), $1, `cmd`
+STRAY_QUOTE = re.compile(r"^['\"]|['\"]$")         # a quote mark stuck to a value
+
+
+def shell_tokens(argv: List[str]) -> List[Tuple[str, str]]:
+    """Arguments that look like shell syntax nothing expanded: [(argument, what it looks like)].
+
+    A systemd EnvironmentFile does no shell expansion and no quoting: `CORA_ARGS=--out $HOME/e.jsonl` reaches the daemon as the
+    literal text $HOME/e.jsonl, and `--model "/m x.gguf"` as the tokens "/m and x.gguf" with quote marks still on them. The daemon
+    then runs with arguments nobody meant, silently. A `~` is deliberately NOT flagged: the daemon expands it itself (--report-salt).
+    """
+    out: List[Tuple[str, str]] = []
+    for tok in argv:
+        if SHELL_SYNTAX.search(tok):
+            out.append((tok, "a shell variable or command substitution"))
+        elif STRAY_QUOTE.search(tok):
+            out.append((tok, "a value with a quote mark stuck to it"))
+    return out
+
+
 def selftest() -> int:
     events: List[dict] = []
     # loopback is outside this allowlist on purpose, so the child's connect trips
@@ -650,7 +672,22 @@ def main() -> int:
     ap.add_argument("--decisions", default="sentinel_decisions.jsonl",
                     help="write each adjudicator decision here, one JSON object per line (default %(default)s)")
     ap.add_argument("--threads", type=int, default=None, help="CPU threads for the language model (default: the library's choice)")
+    ap.add_argument("--allow-shell-chars", action="store_true",
+                    help="accept arguments containing $, a backtick or a stray quote mark (normally a sign of an unexpanded "
+                         "shell variable in a systemd config, and refused with exit status 2)")
     a = ap.parse_args()
+
+    if not a.selftest:                    # the journal shows what the daemon REALLY runs with: a mangled config is visible at once
+        from cora_sentinel import __version__
+        print(f"[cora-sentinel] {__version__} starting with: {shlex.join(sys.argv[1:])}", file=sys.stderr, flush=True)
+    bad = shell_tokens(sys.argv[1:])
+    if bad and not a.allow_shell_chars:
+        for tok, why in bad:
+            print(f"[cora-sentinel] refusing to start: the argument {tok!r} looks like {why} that nothing expanded.", file=sys.stderr)
+        print("  A systemd EnvironmentFile (/etc/cora-sentinel/cora-sentinel.conf) does no shell expansion and no quoting: write literal "
+              "values on one line, separated by spaces.\n  If a literal $ or quote mark really is meant, pass --allow-shell-chars.",
+              file=sys.stderr)
+        return 2
 
     if a.selftest:
         return selftest()
