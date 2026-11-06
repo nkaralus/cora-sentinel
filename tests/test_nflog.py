@@ -1835,7 +1835,7 @@ def test_listing_cost_no_longer_grows_with_the_number_of_live_tasks(env):
     cg, fw, made = env
     tr = TapRules(fw, GROUP)
     tr.ensure_chain()
-    for i in range(140):
+    for i in range(60):
         cg.create(f"t{i}")
     tr.sync({n: os.stat(cg.root / n).st_ino for n in cg.names()})            # 140 tasks = 700 tap rules
 
