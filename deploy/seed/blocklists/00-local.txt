@@ -1,0 +1,12 @@
+# cora-sentinel: your local blocklist (the directory given to --blocklist, /etc/cora-sentinel/blocklists).
+#
+# This file is a TEMPLATE: it blocks nothing until you add lines. Every file in the directory is loaded (a name ending in .txt,
+# .list, .hosts, .domains, .cidr, .nets, .netset or .ipset, or none), and a list is named after its file ("00-local" here).
+#
+# One entry per line, mixed freely:
+#   203.0.113.0/24          a network (CIDR)            198.51.100.7    a single address
+#   tracker.example.com     a domain; it also matches every subdomain
+#
+# With --floor, a listed address is dropped by the kernel for the whole host, not only for tasks. Read `cora-floor status` first.
+# After editing, apply it with no restart and no detection gap:   systemctl reload cora-sentinel
+# Reviewed, pinned updates of maintained lists: cora-blocklist --help

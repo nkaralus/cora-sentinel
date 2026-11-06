@@ -14,8 +14,9 @@ case "$1" in
         fi
         # state: the confirmed allow-set fingerprint, the dynamic-policy ledgers, violation reports
         rm -rf /var/lib/cora-sentinel
-        # the conffiles themselves were already removed by dpkg; this only tidies an empty directory
-        rmdir --ignore-fail-on-non-empty /etc/cora-sentinel 2>/dev/null || true
+        # dpkg already removed the conffiles (the config and the two list templates); this only tidies the empty directories.
+        # A list file YOU added is not dpkg's to remove, so its directory stays.
+        rmdir --ignore-fail-on-non-empty /etc/cora-sentinel/blocklists /etc/cora-sentinel/allow /etc/cora-sentinel 2>/dev/null || true
         # /var/log/cora-sentinel is KEPT on purpose: it is the audit trail (events, decisions)
         if [ -d /var/log/cora-sentinel ]; then
             echo "cora-sentinel: kept the audit logs in /var/log/cora-sentinel (delete them yourself if you want them gone)"

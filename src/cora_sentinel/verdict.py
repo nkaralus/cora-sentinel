@@ -182,17 +182,45 @@ class Adjudicator:
         self._thread: Optional[threading.Thread] = None
         self._f = open(decisions_path, "a", buffering=1) if decisions_path else None
         self._sink = sink
+        self._pinned: set = set()                         # event_ids submit() pinned a VIP for (handle() unpins exactly these)
+        self._pin_lock = threading.Lock()
 
     # ---- gate -------------------------------------------------------------
-    def _gate(self, subj: dict) -> tuple:
-        """Call with net.lock held. Returns (ok, code, detail, verdict_obj)."""
+    # Actions that may still go ahead when the process that triggered the event has EXITED, provided its cgroup is provably the
+    # same one. Only ISOLATE: it is reversible (cora-firewall release) and touches egress only. TERMINATE is cgroup.kill, which
+    # would also kill a later task that reused the name, and it cannot be undone; SUSPEND and THROTTLE stay as they were.
+    GONE_OK = ("ISOLATE",)
+
+    def _same_cgroup(self, subj: dict) -> tuple:
+        """The process is gone but the action is on its cgroup: prove it is the SAME cgroup (not one a later task created under the
+        same name). Returns (ok, code, detail). Fails closed on anything it cannot prove."""
+        cgs = self.executor.cgroups
+        if cgs is None:
+            return False, "NO_CGROUP", "event names a cgroup but none is configured"
+        want = subj.get("cgroup_id")
+        if want is None:
+            return False, "CGROUP_UNPINNED", "the event did not record the cgroup's identity, so it cannot be proven the same cgroup"
+        have = cgs.cgroup_id(subj["cgroup"])
+        if have is None:
+            return False, "CGROUP_GONE", "the task cgroup no longer exists"
+        if have != want:
+            return False, "CGROUP_REPLACED", "a different cgroup now has this name"
+        return True, "OK_PROCESS_GONE", "process exited; its cgroup is still the same one"
+
+    def _gate(self, subj: dict, action: Optional[str] = None) -> tuple:
+        """Call with net.lock held. Returns (ok, code, detail, verdict_obj). `action` lets a cgroup-scoped GONE_OK action proceed
+        after the triggering process has exited; None (or any other action) keeps the strict rule."""
         if self.net.reg is None or check_all is None:
             return False, "NO_BUS", "subnetbus unavailable (damaged install); refusing to act", None
         task = {"subnet": subj["subnet"], "target": subj["name"], "ref": subj["vip"]}
         v = check_all(self.net.reg, task, Action())
         if not v.ok:
             return False, v.failed.code, v.failed.detail, None
-        if read_starttime(subj["pid"]) != subj["starttime"]:
+        st = read_starttime(subj["pid"])
+        if st is None and subj.get("cgroup") and action in self.GONE_OK:
+            ok, code, detail = self._same_cgroup(subj)     # gone (NOT merely different: a reused pid is still blocked below)
+            return (True, code, detail, v) if ok else (False, code, detail, None)
+        if st != subj["starttime"]:
             return False, "PID_REUSED", "process identity changed since the event", None
         cg = subj.get("cgroup")
         if cg:  # the action will hit a whole tree: prove this pid is still in it
@@ -204,7 +232,21 @@ class Adjudicator:
         return True, "OK", "", v
 
     # ---- one event -> one decision ---------------------------------------
+    def _unpin(self, ev: dict) -> None:
+        with self._pin_lock:
+            mine = ev.get("event_id") in self._pinned
+            self._pinned.discard(ev.get("event_id"))
+        if mine:                                          # only what submit() pinned: a direct handle() call never steals a pin
+            self.net.unpin(ev["subject"]["pid"])
+
     def handle(self, ev: dict) -> dict:
+        """Judge one event and record the decision. The VIP submit() pinned for it is released only after the decision is written."""
+        try:
+            return self._handle(ev)
+        finally:
+            self._unpin(ev)
+
+    def _handle(self, ev: dict) -> dict:
         subj = ev["subject"]
         d = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
              "event_id": ev["event_id"], "pid": subj["pid"], "vip": subj["vip"],
@@ -243,10 +285,12 @@ class Adjudicator:
 
         if final in ACTIONABLE:
             with self.net.lock:  # nothing may allocate/release between check and act
-                ok, code, detail, gv = self._gate(subj)
+                ok, code, detail, gv = self._gate(subj, final)
                 d["gate"] = {"ok": ok, "code": code, "detail": detail[:120]}
                 if ok and gv.still_valid(self.net.reg):
                     d["action"] = self.executor.run(final, subj["pid"], subj.get("cgroup"))
+                elif final == "ISOLATE" and early and early["action"].startswith(("done:", "dry-run:")):
+                    d["action"] = "already-contained"      # the policy floor isolated it at submit(); nothing was left to do
                 else:
                     d["action"] = "blocked"
             seen = (ev.get("timing") or {}).get("seen_mono_s")
@@ -301,7 +345,7 @@ class Adjudicator:
                 return                                    # cannot isolate: handle() escalates it, as before
             t = time.monotonic()
             with self.net.lock:
-                ok, code, detail, gv = self._gate(subj)
+                ok, code, detail, gv = self._gate(subj, "ISOLATE")
                 if ok and gv.still_valid(self.net.reg):
                     action = self.executor.run("ISOLATE", subj["pid"], subj["cgroup"])
                 else:
@@ -318,10 +362,15 @@ class Adjudicator:
             print(f"[verdict] early containment failed: {e!r}", file=sys.stderr)
 
     def submit(self, ev: dict) -> None:
+        pid = ev["subject"]["pid"]
+        self.net.pin(pid)                                 # first thing: the process may exit while this waits behind the model
+        with self._pin_lock:
+            self._pinned.add(ev.get("event_id"))
         self._contain_first(ev)
         try:
             self.q.put_nowait(ev)
         except queue.Full:
+            self._unpin(ev)                               # it will never reach handle(), so nothing else would unpin it
             # The queue is full because the model is slow. A contained task is still contained; an event that was
             # NOT contained and is dropped here is never judged at all, so say so loudly and keep a record.
             self.dropped += 1

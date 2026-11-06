@@ -1,4 +1,5 @@
-# The sdist is an explicit allow-list: the repository root also holds old patches, zips and the superseded layouts.
+# The sdist is an explicit allow-list: the repository root also holds the superseded layouts (cora-os/, superseded-flat/, ...) and
+# loose starter files that must not ship. tests/test_repo_root.py keeps new clutter (patches, zips, notes) out of the root.
 include LICENSE README.md CHANGELOG.md pyproject.toml
 recursive-include src/cora_sentinel/_vendor *.py LICENSE VENDOR.lock
 recursive-include deploy *

@@ -10,6 +10,7 @@ venv/
 
 # local models and run output: never commit these
 models/
+/models                   # a symlink to a models directory is not a directory to git, so `models/` alone does not match it
 *.gguf
 *.jsonl
 cora_reports/

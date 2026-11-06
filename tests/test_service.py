@@ -154,3 +154,51 @@ def test_the_logs_the_unit_declares_are_the_ones_rotated():
     assert keys("Service", "LogsDirectory") == ["cora-sentinel"]
     for flag in ("--out", "--decisions"):
         assert re.search(rf"{flag} /var/log/cora-sentinel/[\w-]+\.jsonl", CONF), flag
+
+
+# ---- the list directories the suggested flags point at ---------------------------------------------------------------------
+def suggested_dirs():
+    conf = (DEPLOY / "cora-sentinel.conf").read_text()
+    found = re.findall(r"--blocklist(?:-allow)? (/etc/cora-sentinel/\S+)", conf)
+    assert len(found) == 2, found
+    return found
+
+
+@pytest.mark.skipif(not shutil.which("bash"), reason="needs bash")
+def test_install_creates_the_directories_the_suggested_flags_name_with_inert_templates(tmp_path, stubbin):
+    from cora_sentinel.blocklist import Blocklist
+    root = tmp_path / "root"
+    assert run_install(root, "--bindir", str(stubbin)).returncode == 0
+    for d in suggested_dirs():
+        path = root / d.lstrip("/")
+        assert path.is_dir() and (path / "00-local.txt").is_file(), d
+        b = Blocklist()
+        b.load(path)                                    # the original failure: FileNotFoundError, "[Errno 2] No such file or directory"
+        assert b.entries() == (set(), set()), "a template must block and allow nothing"
+        assert (path / "00-local.txt").read_text().lstrip().startswith("#")
+    with pytest.raises(FileNotFoundError):              # and this is what a fresh install used to give you
+        Blocklist().load(tmp_path / "nowhere")
+
+
+@pytest.mark.skipif(not shutil.which("bash"), reason="needs bash")
+def test_install_seeds_a_list_directory_only_when_it_holds_no_file_and_never_overwrites(tmp_path, stubbin):
+    root = tmp_path / "root"
+    mine = root / "etc/cora-sentinel/blocklists"
+    mine.mkdir(parents=True)
+    (mine / "mine.txt").write_text("203.0.113.9\n")                                # the admin already has a list here
+    assert run_install(root, "--bindir", str(stubbin)).returncode == 0
+    assert not (mine / "00-local.txt").exists(), "a directory that holds a file is not seeded"
+    allow = root / "etc/cora-sentinel/allow/00-local.txt"
+    assert allow.is_file()
+    allow.write_text("203.0.113.7\n")                                              # edited
+    assert run_install(root, "--bindir", str(stubbin)).returncode == 0
+    assert allow.read_text() == "203.0.113.7\n" and (mine / "mine.txt").read_text() == "203.0.113.9\n"
+    assert run_install(root, "--uninstall").returncode == 0
+    assert allow.exists() and (mine / "mine.txt").exists(), "uninstall leaves your configuration alone"
+
+
+def test_the_templates_are_comment_only_ascii_and_say_what_they_are():
+    for d in ("blocklists", "allow"):
+        text = (DEPLOY / "seed" / d / "00-local.txt").read_text()
+        assert text.isascii() and "TEMPLATE" in text
+        assert all(l.startswith("#") or not l.strip() for l in text.splitlines()), "a seed must carry no entry"

@@ -38,6 +38,10 @@ where="$(cd / && python3 -c 'import cora_sentinel; print(cora_sentinel.__file__)
 case "$where" in /usr/lib/python3/dist-packages/*) ok "python3 imports the packaged copy";; *) bad "python3 imports $where (something shadows the package)";; esac
 sc="$(cd / && cora-selfcheck 2>&1)"          # captured, not piped into grep -q: SIGPIPE + pipefail would fake a failure
 grep -q "ok .*vendored subnetbus .* verified" <<<"$sc" && ok "cora-selfcheck: vendored gate verified" || bad "cora-selfcheck did not verify the vendored gate"
+for d in blocklists allow; do check "list directory and its template: /etc/cora-sentinel/$d" test -s "/etc/cora-sentinel/$d/00-local.txt"; done
+lists="$(cd / && python3 -c 'from cora_sentinel.blocklist import Blocklist
+b = Blocklist(); b.load("/etc/cora-sentinel/blocklists"); a = Blocklist(); a.load("/etc/cora-sentinel/allow"); print("loaded", b.entries(), a.entries())' 2>&1)"
+grep -q "^loaded (set(), set()) (set(), set())" <<<"$lists" && ok "the --blocklist and --blocklist-allow directories load, and hold nothing" || bad "list directories: $lists"
 # a minimal image may path-exclude /usr/share/doc and /usr/share/man (dpkg then reports them missing); nothing else may be reported
 v="$(dpkg -V cora-sentinel | grep -vE ' /usr/share/(doc|man)/' || true)"
 [ -z "$v" ] && ok "dpkg -V is clean (docs aside)" || bad "dpkg -V reports: $v"
@@ -53,12 +57,18 @@ if [ -d /run/systemd/system ]; then
     check "systemd accepts the unit" bash -c '[ -z "$(systemd-analyze verify --man=no /usr/lib/systemd/system/cora-sentinel.service 2>&1)" ]'
 fi
 
+# postinst puts back a list directory an admin removed (the template is a conffile, and dpkg respects its deletion)
+rm -rf /etc/cora-sentinel/allow
+/var/lib/dpkg/info/cora-sentinel.postinst configure >/dev/null 2>&1
+check "postinst restores a removed list directory" test -d /etc/cora-sentinel/allow
 echo "== reinstall (an upgrade): the floor and the edited config must survive"
 echo "# edited by lifecycle_test" >> /etc/cora-sentinel/cora-sentinel.conf
+echo "# edited by lifecycle_test" >> /etc/cora-sentinel/blocklists/00-local.txt
 cora-floor ensure >/dev/null 2>&1; floor_up && ok "floor installed" || bad "could not install a floor to test with"
 dpkg -i --force-confold "$deb" >/dev/null 2>&1 && ok "dpkg -i (upgrade)" || bad "upgrade failed"
 floor_up && ok "the floor survived the upgrade" || bad "the upgrade removed the floor"
 grep -q "edited by lifecycle_test" /etc/cora-sentinel/cora-sentinel.conf && ok "the edited config survived" || bad "the edited config was overwritten"
+grep -q "edited by lifecycle_test" /etc/cora-sentinel/blocklists/00-local.txt && ok "the edited list template survived (a conffile)" || bad "the edited list template was lost"
 
 echo "== remove"
 mkdir -p /var/lib/cora-sentinel /var/log/cora-sentinel
@@ -75,7 +85,7 @@ check "state kept after remove" test -e /var/lib/cora-sentinel/floor.confirmed.j
 echo "== purge"
 out="$(dpkg -P cora-sentinel 2>&1)"; rc=$?
 [ $rc = 0 ] && ok "dpkg -P" || bad "dpkg -P: $out"
-gone test -e /etc/cora-sentinel && ok "config removed" || bad "config left behind"
+gone test -e /etc/cora-sentinel && ok "config and the list directories removed" || bad "config or list directories left behind"
 gone test -e /etc/logrotate.d/cora-sentinel && ok "logrotate config removed" || bad "logrotate config left behind"
 gone test -e /var/lib/cora-sentinel && ok "state removed" || bad "state left behind"
 check "audit logs KEPT" test -e /var/log/cora-sentinel/decisions.jsonl

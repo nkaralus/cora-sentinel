@@ -208,11 +208,12 @@ def test_the_maintainer_email_can_be_overridden(wheel, tmp_path):
 
 
 @have_tools
-def test_conffiles_are_the_config_and_the_logrotate_file_and_nothing_else(ctl, data):
+def test_conffiles_are_the_config_the_two_list_templates_and_the_logrotate_file_and_nothing_else(ctl, data):
     listed = (ctl / "conffiles").read_text().split()
-    assert listed == ["/etc/cora-sentinel/cora-sentinel.conf", "/etc/logrotate.d/cora-sentinel"]
+    assert listed == ["/etc/cora-sentinel/cora-sentinel.conf", "/etc/cora-sentinel/blocklists/00-local.txt",
+                      "/etc/cora-sentinel/allow/00-local.txt", "/etc/logrotate.d/cora-sentinel"]
     assert all((data / p.lstrip("/")).is_file() for p in listed)
-    assert sorted(str(p.relative_to(data)) for p in (data / "etc").rglob("*") if p.is_file()) == [l.lstrip("/") for l in listed]
+    assert sorted(str(p.relative_to(data)) for p in (data / "etc").rglob("*") if p.is_file()) == sorted(l.lstrip("/") for l in listed)
 
 
 @have_tools
@@ -265,6 +266,38 @@ def test_the_packaged_code_is_self_contained_and_its_gate_verifies(data):
 
 
 @have_tools
+def test_the_list_directories_ship_with_inert_templates_that_are_conffiles(data, deb):
+    from cora_sentinel.blocklist import Blocklist
+    for d in ("blocklists", "allow"):
+        tpl = data / f"etc/cora-sentinel/{d}/00-local.txt"
+        assert tpl.is_file() and oct(tpl.stat().st_mode & 0o777) == "0o644"
+        assert tpl.read_text() == (ROOT / "deploy" / "seed" / d / "00-local.txt").read_text(), "one source of truth: deploy/seed"
+        b = Blocklist()
+        b.load(data / f"etc/cora-sentinel/{d}")
+        assert b.entries() == (set(), set())
+    control = sh("dpkg-deb", "-I", str(deb), "conffiles").stdout.split()
+    assert {"/etc/cora-sentinel/blocklists/00-local.txt", "/etc/cora-sentinel/allow/00-local.txt"} <= set(control)
+
+
+def test_postinst_creates_both_list_directories_with_two_explicit_paths_because_sh_is_dash():
+    text = (ROOT / "packaging" / "debian" / "postinst").read_text()
+    assert text.startswith("#!/bin/sh")
+    mk = [l for l in text.splitlines() if l.strip().startswith("mkdir")]
+    assert mk and all("{" not in l and "}" not in l for l in mk), "brace expansion is a bashism: dash would create a directory literally named {blocklists,allow}"
+    assert any("/etc/cora-sentinel/blocklists" in l and "/etc/cora-sentinel/allow" in l for l in mk)
+    for script in ("postinst", "postrm", "prerm"):
+        r = subprocess.run(["sh", "-n", str(ROOT / "packaging" / "debian" / script)], capture_output=True, text=True)
+        assert r.returncode == 0, (script, r.stderr)
+
+
+def test_postrm_purge_tidies_the_list_directories_but_not_what_the_admin_put_in_them():
+    text = (ROOT / "packaging" / "debian" / "postrm").read_text()
+    line = next(l for l in text.splitlines() if l.strip().startswith("rmdir"))
+    assert "--ignore-fail-on-non-empty" in line and "blocklists" in line and "allow" in line
+    assert "rm -rf /etc" not in text and "rm -r /etc" not in text
+
+
+@have_tools
 def test_the_man_pages_are_installed_gzipped_with_the_build_date_and_the_version(data):
     man = data / "usr/share/man/man1"
     assert sorted(p.name for p in man.iterdir()) == sorted(f"{c}.1.gz" for c in SCRIPTS)
@@ -297,7 +330,7 @@ def test_the_copyright_file_credits_both_licenses_and_names_the_vendored_commit(
 def test_md5sums_cover_every_file_except_the_conffiles_and_are_right(ctl, data):
     lines = (ctl / "md5sums").read_text().splitlines()
     got = {l.split("  ", 1)[1]: l.split("  ", 1)[0] for l in lines}
-    files = {p.relative_to(data).as_posix() for p in data.rglob("*") if p.is_file()} - {"etc/cora-sentinel/cora-sentinel.conf", "etc/logrotate.d/cora-sentinel"}
+    files = {p.relative_to(data).as_posix() for p in data.rglob("*") if p.is_file()} - {"etc/cora-sentinel/blocklists/00-local.txt", "etc/cora-sentinel/allow/00-local.txt", "etc/cora-sentinel/cora-sentinel.conf", "etc/logrotate.d/cora-sentinel"}
     assert set(got) == files
     assert all(hashlib.md5((data / f).read_bytes()).hexdigest() == h for f, h in got.items())
 

@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.8.5
+
+### Fixed
+- **A process that exits while its event waits behind the model no longer defeats the gate.** The next `tick()` released its VIP, so the
+  gate refused a perfectly good verdict ("blocked"). `VirtualNet.pin()` / `unpin()` keep the VIP registered while an event is in flight:
+  `Adjudicator.submit()` pins, `handle()` unpins in a `finally` after the decision is written (only what `submit()` pinned, so a direct
+  `handle()` call never steals a pin), and `release()` defers while pinned. A queue-full drop unpins at once. Two additions the design
+  needed: a **pin lease** (`PIN_MAX_AGE_S`, 5 minutes) so a lost unpin cannot leak a VIP for good, and a **pid-reuse guard** (a live
+  process that reuses a deferred pid takes the VIP over, so the old event's late unpin cannot free a VIP now in use).
+  - This is not a leak fix: a stray VIP was always reclaimed by the next `tick()`. The real hazard was the opposite, premature release.
+- **`ISOLATE` goes ahead when the triggering process has exited, if its cgroup is provably the same one.** The event now records
+  `subject.cgroup_id` (the cgroup directory's inode: a cgroup removed and recreated under the same name gets a new one; the model's
+  prompt never includes it) from both the `tick()` path and the connect-time tap. The gate (`Adjudicator._gate(subj, action)`) relaxes
+  only when the process is **gone** (not merely different), the action is in `GONE_OK = ("ISOLATE",)`, and the identity matches; the
+  decision records `OK_PROCESS_GONE`. `TERMINATE` (`cgroup.kill`, irreversible, would hit a later task that reused the name),
+  `SUSPEND` and `THROTTLE` stay strict. Everything else is unchanged and fails closed: a live pid with a different start time is
+  `PID_REUSED`, a pid that left the cgroup is `CGROUP_MISMATCH`, and an event with no recorded identity / a removed cgroup / a replaced
+  cgroup is refused (`CGROUP_UNPINNED` / `CGROUP_GONE` / `CGROUP_REPLACED`). A decision whose task the policy floor had already isolated at
+  `submit()` reads `already-contained` instead of `blocked`.
+- **A fresh install no longer fails closed with `[Errno 2]` when you add the suggested `--blocklist` / `--blocklist-allow` flags.** The
+  two directories (`/etc/cora-sentinel/blocklists`, `/etc/cora-sentinel/allow`) now exist after install, each with an inert comment-only
+  `00-local.txt` (`deploy/seed/`, one source of truth). The `.deb` ships them as **conffiles** (an upgrade keeps your edits, deleting one
+  is respected, purge removes them and tidies the directories; a list file you added yourself is never removed) and `postinst` also runs
+  `mkdir -p` on the two paths. `deploy/install-service.sh` creates them and seeds a directory only if it holds no file.
+  - `postinst` is `/bin/sh` (dash), which has **no brace expansion**: `mkdir -p /etc/cora-sentinel/{blocklists,allow}` there creates
+    one directory literally named `{blocklists,allow}`. The two paths are written out, and a test guards it.
+
+### Added
+- `tests/test_inflight.py` (33): the pin/unpin bookkeeping (refcount, deferral, idempotent release, unbalanced unpin, the lease, the
+  pid-reuse guard, 700 interleaved pids never filling the /24), the adjudicator (pin on submit, unpin after the decision, full queue,
+  exception, direct `handle()`, the worker thread), every gate branch above, early containment, the recorded identity (including the
+  model never seeing it, and a real-kernel test that a recreated cgroup gets a different identity and that the tap path records it).
+  Mutation-checked: nine deliberate breaks each fail it.
+- Installer, deb and lifecycle tests for the list directories; `packaging/lifecycle_test.sh` checks them with real `dpkg` (they load, an
+  edit survives an upgrade, `postinst` restores a removed directory, purge removes them).
+- `tests/test_repo_root.py`: only expected files and directories at the repository root, and no patches, zips, notes or built packages
+  tracked outside the old layouts.
+
+### Changed
+- `CgroupRoot.cgroup_id(name)`; `build_payload(..., cgroup_id=)`; `Sentinel.cgroup_id_of(name)`.
+- Two existing deb tests now expect four conffiles (the config, the two templates, logrotate).
+
+### Housekeeping
+- Removed from the repository root: `0.8.4-INSTALL.txt`, `0.8.4.patch` and `cora-sentinel-0.8.4.patch` (delivery files that ended up
+  committed because the 0.8.x zips carried them at their root: they no longer do), and `MANIFEST.sha256`, which listed the 29 files of the
+  old flat layout (none of them at the root any more) and was read by nothing except the legacy self-checks in their own directories.
+- `MANIFEST.in`'s comment updated; `.gitignore` now also ignores a `models` symlink (`models/` does not match one).
+
 ## 0.8.4
 
 ### Added

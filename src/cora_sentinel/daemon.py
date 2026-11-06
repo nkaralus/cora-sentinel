@@ -335,10 +335,15 @@ class VirtualNet:
     %[A-Z][a-zA-Z0-9]{0,63}, so pid 495 -> %Task495."""
 
     SUBNET = "10.1.1.0/24"  # bus reserves hosts .1-.9 and broadcast
+    PIN_MAX_AGE_S = 300.0   # a pin older than this is a bug (a lost unpin): release anyway, so a VIP can never leak for good
 
     def __init__(self) -> None:
         self.lock = threading.RLock()  # shared with the adjudicator thread
         self.by_pid: Dict[int, str] = {}
+        self._pins: Dict[int, int] = {}          # pid -> events in flight that need its VIP to stay registered
+        self._pin_since: Dict[int, float] = {}   # pid -> when it was first pinned (monotonic)
+        self._deferred: set = set()              # pids that exited while pinned: released at the last unpin
+        self._clock = time.monotonic             # tests replace it
         self._stub_next = 10  # only used when subnetbus isn't installed
         self.reg = None
         if Registry is not None:
@@ -351,12 +356,16 @@ class VirtualNet:
 
     def ensure(self, pid: int) -> str:
         ip = self.by_pid.get(pid)                    # steady state takes NO lock, so an adjudicator holding it
-        if ip is not None:                           # across nft cannot stall callers for a pid already known
+        if ip is not None and pid not in self._deferred:   # across nft cannot stall callers for a pid already known
             return ip
         with self.lock:
             return self._ensure(pid)
 
     def _ensure(self, pid: int) -> str:
+        # A pid whose release was deferred (it exited while an event about it was being judged) and that is asked for again is a NEW
+        # process with a reused pid number: it takes the VIP over, so the old event's late unpin cannot free a VIP now in use. (If
+        # this call was in fact for the dead one, the next tick() finds it gone again and defers it again: self-healing.)
+        self._deferred.discard(pid)
         if pid in self.by_pid:
             return self.by_pid[pid]
         if self.reg is not None:
@@ -367,8 +376,37 @@ class VirtualNet:
         self.by_pid[pid] = ip
         return ip
 
+    def pin(self, pid: int) -> None:
+        """An event about `pid` is queued for the model: keep its VIP registered until unpin(), even if the process exits meanwhile,
+        so the safety gate can still act on what the model decides (a verdict can take seconds; a short task is gone by then)."""
+        with self.lock:
+            self._pins[pid] = self._pins.get(pid, 0) + 1
+            self._pin_since.setdefault(pid, self._clock())
+
+    def unpin(self, pid: int) -> None:
+        """The matching end of pin(). The last unpin of a pid that exited meanwhile releases its VIP. Unbalanced calls are ignored."""
+        with self.lock:
+            n = self._pins.get(pid, 0)
+            if n <= 0:
+                return                                  # never pinned, or its stale pin was already force-released
+            if n > 1:
+                self._pins[pid] = n - 1
+                return
+            del self._pins[pid]
+            self._pin_since.pop(pid, None)
+            if pid in self._deferred:
+                self._deferred.discard(pid)
+                self._release(pid)
+
     def release(self, pid: int) -> None:
         with self.lock:
+            if self._pins.get(pid):
+                if self._clock() - self._pin_since.get(pid, 0.0) <= self.PIN_MAX_AGE_S:
+                    self._deferred.add(pid)             # still being judged: tick() asks again every second, and unpin() finishes it
+                    return
+                self._pins.pop(pid, None)               # a pin this old is a lost unpin: do not leak the VIP for good
+                self._pin_since.pop(pid, None)
+            self._deferred.discard(pid)
             self._release(pid)
 
     def _release(self, pid: int) -> None:
@@ -382,7 +420,8 @@ class VirtualNet:
 def build_payload(pid: int, vip: str, cmdline: str, kind: str,
                   severity: str, evidence: dict,
                   starttime: Optional[int] = None,
-                  cgroup: Optional[str] = None) -> dict:
+                  cgroup: Optional[str] = None,
+                  cgroup_id: Optional[int] = None) -> dict:
     try:
         mem = parse_meminfo(Path("/proc/meminfo").read_text())
     except OSError:
@@ -393,7 +432,8 @@ def build_payload(pid: int, vip: str, cmdline: str, kind: str,
         "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "host": socket.gethostname(),
         "subject": {"pid": pid, "vip": vip, "name": VirtualNet.name_for(pid),
-                    "starttime": starttime, "cgroup": cgroup, "subnet": VirtualNet.SUBNET,
+                    "starttime": starttime, "cgroup": cgroup, "cgroup_id": cgroup_id,
+                    "subnet": VirtualNet.SUBNET,
                     "cmdline": cmdline[:200]},
         "anomaly": {"kind": kind, "severity": severity, "evidence": evidence},
         "system": {"mem_available_kb": mem.get("MemAvailable"),
@@ -427,8 +467,13 @@ class Sentinel:
         self.cooldown_s = cooldown_s
         self._last: Dict[Tuple, float] = {}
 
+    def cgroup_id_of(self, name: Optional[str]) -> Optional[int]:
+        """The identity of a task's cgroup NOW (recorded in the event, so the gate can later prove it is still the same one)."""
+        return self.cgroups.cgroup_id(name) if (self.cgroups is not None and name) else None
+
     def _payload(self, pid, vip, cmd, kind, sev, ev, st) -> dict:
-        return build_payload(pid, vip, cmd, kind, sev, ev, st, cgroup=self._cg.get(pid))
+        name = self._cg.get(pid)
+        return build_payload(pid, vip, cmd, kind, sev, ev, st, cgroup=name, cgroup_id=self.cgroup_id_of(name))
 
     def _targets(self) -> Dict[int, str]:
         me = os.getpid()

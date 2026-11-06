@@ -49,7 +49,7 @@ stage="$tmp/stage"
 site="$stage/usr/lib/python3/dist-packages"
 doc="$stage/usr/share/doc/cora-sentinel"
 mkdir -p "$site" "$stage/DEBIAN" "$stage/usr/bin" "$stage/usr/lib/systemd/system" "$stage/etc/cora-sentinel" \
-         "$stage/etc/logrotate.d" "$doc" "$stage/usr/share/man/man1"
+         "$stage/etc/cora-sentinel/blocklists" "$stage/etc/cora-sentinel/allow" "$stage/etc/logrotate.d" "$doc" "$stage/usr/share/man/man1"
 
 # ---- code: the wheel, minus RECORD (stale once modes change), marked as dpkg's so pip will not uninstall it ------------
 python3 -m zipfile -e "$wheel" "$site"
@@ -75,6 +75,11 @@ PY
 sed 's|@BINDIR@|/usr/bin|g' "$repo/deploy/cora-sentinel.service" > "$stage/usr/lib/systemd/system/cora-sentinel.service"
 cp "$repo/deploy/cora-sentinel.conf" "$stage/etc/cora-sentinel/cora-sentinel.conf"
 cp "$repo/deploy/cora-sentinel.logrotate" "$stage/etc/logrotate.d/cora-sentinel"
+# The directories the suggested --blocklist / --blocklist-allow flags point at, each with an INERT template (it blocks and allows
+# nothing). Conffiles, so an upgrade keeps your edits, deleting one is respected, and purge removes them. Without the directories
+# the daemon exits at start with "[Errno 2] No such file or directory".
+cp "$repo/deploy/seed/blocklists/00-local.txt" "$stage/etc/cora-sentinel/blocklists/00-local.txt"
+cp "$repo/deploy/seed/allow/00-local.txt" "$stage/etc/cora-sentinel/allow/00-local.txt"
 cp "$repo/README.md" "$doc/README.md"
 cp "$repo"/docs/*.md "$doc/"
 gzip -9n -c "$repo/CHANGELOG.md" > "$doc/changelog.gz"

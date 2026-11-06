@@ -57,9 +57,18 @@ if [ -e "$conf_dir/cora-sentinel.conf" ]; then
 else
   install -m 0640 "$here/cora-sentinel.conf" "$conf_dir/cora-sentinel.conf"
 fi
+# The directories the suggested --blocklist / --blocklist-allow flags point at. Without them the daemon exits at start with
+# "[Errno 2] No such file or directory". Each gets an INERT template (it blocks and allows nothing) only if it holds no file yet.
+for d in blocklists allow; do
+  install -d -m 0755 "$conf_dir/$d"
+  if [ -z "$(find "$conf_dir/$d" -maxdepth 1 -type f -print -quit)" ]; then
+    install -m 0644 "$here/seed/$d/00-local.txt" "$conf_dir/$d/00-local.txt"
+  fi
+done
 sc daemon-reload
 cat <<MSG
 Installed $unit_dir/cora-sentinel.service (binaries in $bindir) and the log rotation in $root/etc/logrotate.d/.
+The list directories $conf_dir/blocklists and $conf_dir/allow exist (an inert template in each), for --blocklist and --blocklist-allow.
 Next:
   1. Edit $conf_dir/cora-sentinel.conf
   2. systemctl enable --now cora-sentinel

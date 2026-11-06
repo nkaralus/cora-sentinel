@@ -49,6 +49,31 @@ Change the allow set and the next start asks again; `cora-floor unconfirm` bring
 
 If you are locked out anyway: wait for the window. The floor removes itself.
 
+## A process that exits while its event waits
+
+A verdict takes 2-4 s and there are 32 slots, so a short task can be gone before the model gets to it. Two things used to follow: the
+next `tick()` released its virtual IP, so the safety gate refused the verdict, and the process-identity check would have anyway.
+
+- **The VIP stays registered while an event about it is in flight.** `submit()` pins it, the decision unpins it after it is written,
+  and a release in between is deferred. A pin older than 5 minutes is released anyway, so a lost unpin cannot leak a VIP for good.
+  If the pid number is reused by a new process meanwhile, the new process takes the VIP over and the old event's late unpin cannot
+  free it. A queue-full drop unpins at once.
+- **`ISOLATE` still goes ahead when the process is gone**, if its cgroup is provably the same one: the event records the cgroup's
+  identity (its inode, `subject.cgroup_id`, never shown to the model) and the gate compares it. The decision's gate code is then
+  `OK_PROCESS_GONE`. It is `ISOLATE` only: `TERMINATE` is `cgroup.kill`, which would also kill a later task that reused the name, and
+  it cannot be undone. Everything else stays strict: a pid that is *alive* with a different start time is still `PID_REUSED`, a pid that
+  left the cgroup is still `CGROUP_MISMATCH`, and an event with no recorded identity, a removed cgroup, or a cgroup recreated under
+  the same name is refused (`CGROUP_UNPINNED`, `CGROUP_GONE`, `CGROUP_REPLACED`).
+- If the policy floor had already isolated the task at `submit()` and the gate then refuses for a reason like those, the decision's
+  action reads `already-contained`, not `blocked`.
+
+## The list directories
+
+`/etc/cora-sentinel/blocklists` and `/etc/cora-sentinel/allow` are what the suggested `--blocklist` and `--blocklist-allow` flags point
+at. They exist after install (the `.deb`, and `deploy/install-service.sh`), each with an inert, comment-only `00-local.txt`, so adding
+the flags cannot fail with `[Errno 2] No such file or directory`. The installer seeds a directory only if it holds no file, and never
+overwrites. Put list files there and apply them with `systemctl reload cora-sentinel`.
+
 ## If the service runs with the wrong arguments
 
 The arguments come from `CORA_ARGS` in `/etc/cora-sentinel/cora-sentinel.conf`, and systemd's `EnvironmentFile` does **no shell

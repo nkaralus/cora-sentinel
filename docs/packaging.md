@@ -60,6 +60,7 @@ start is yours (the install prints the three steps). The package is `Architectur
 | | |
 |---|---|
 | `/etc/cora-sentinel/cora-sentinel.conf` | conffile: the daemon's arguments (`CORA_ARGS`). dpkg keeps your edits across upgrades |
+| `/etc/cora-sentinel/blocklists/00-local.txt`, `/etc/cora-sentinel/allow/00-local.txt` | conffiles: inert, comment-only templates (they block and allow nothing). They make the two directories the suggested `--blocklist` / `--blocklist-allow` flags name exist, so adding those flags cannot fail with `[Errno 2]`. An upgrade keeps your edits, deleting one is respected, purge removes them; a list file you add yourself is never removed |
 | `/etc/logrotate.d/cora-sentinel` | conffile: size-based, `copytruncate` |
 | `/usr/share/doc/cora-sentinel/` | README, these docs, `changelog.gz`, `copyright` (both licenses) |
 | `/usr/share/man/man1/cora-*.1.gz` | a man page for each of the nine commands (below) |

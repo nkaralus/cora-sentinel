@@ -1,2 +1,4 @@
 /etc/cora-sentinel/cora-sentinel.conf
+/etc/cora-sentinel/blocklists/00-local.txt
+/etc/cora-sentinel/allow/00-local.txt
 /etc/logrotate.d/cora-sentinel

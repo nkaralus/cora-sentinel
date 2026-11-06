@@ -1,0 +1,9 @@
+# cora-sentinel: your local allow list (the directory given to --blocklist-allow, /etc/cora-sentinel/allow).
+#
+# This file is a TEMPLATE: it allows nothing until you add lines. Anything listed here WINS over every blocklist, for addresses and
+# for DNS names alike: it is never reported and never dropped. Use it for the false positive, such as a shared CDN address that
+# sits inside a listed range. Same line formats as the blocklists:
+#   203.0.113.7             a single address            192.0.2.0/24    a network (CIDR)
+#   cdn.example.com         a domain; it also matches every subdomain
+#
+# After editing, apply it with no restart:   systemctl reload cora-sentinel

@@ -308,7 +308,8 @@ class NetMonitor:
     def _deliver(self, item: tuple) -> None:
         name, pid, argv, st, severity, ev, now = item
         payload = build_payload(pid, self.s.net.ensure(pid), " ".join(argv),
-                                "unauthorized_connection", severity, ev, st, cgroup=name)
+                                "unauthorized_connection", severity, ev, st, cgroup=name,
+                                cgroup_id=self.s.cgroup_id_of(name))
         self.s._fire((name, "unauthorized_connection", ev["remote_ip"], ev["remote_port"], ev.get("qname")),
                      now, payload)
 

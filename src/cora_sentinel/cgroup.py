@@ -67,6 +67,15 @@ class CgroupRoot:
         p.mkdir(exist_ok=True)
         return p
 
+    def cgroup_id(self, name: str) -> Optional[int]:
+        """The kernel's identity of this task's cgroup: the inode number of its directory (the cgroup id on cgroup v2), or None if it
+        does not exist. A cgroup that is removed and created again under the same name gets a NEW one, so this tells "the same task"
+        from "a later task that reused the name"."""
+        try:
+            return os.stat(self._dir(name)).st_ino
+        except (OSError, CgroupError):
+            return None
+
     def names(self) -> List[str]:
         try:
             return sorted(d.name for d in self.root.iterdir()
