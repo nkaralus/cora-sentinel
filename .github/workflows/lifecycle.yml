@@ -1,0 +1,37 @@
+# The REAL install -> upgrade -> remove -> purge of the .deb on a real systemd, on a DISPOSABLE GitHub runner. Manual only.
+#
+# This is the one thing the unit tests cannot cover (they stub systemctl/nft): stop/disable ordering with ExecStopPost, a
+# restart on upgrade, and removing a real kernel floor. packaging/lifecycle_test.sh stops the cora-sentinel service and
+# removes a floor, which is why it runs HERE and never on the live host: a GitHub-hosted runner is a throwaway VM.
+#
+# Run it from the Actions tab (Run workflow). If the runner's kernel cannot do nftables the install step will say so; that
+# is a limit of the runner, not a failure of the package.
+name: lifecycle (manual, disposable runner)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lifecycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: build the package
+        run: |
+          python -m pip install build
+          packaging/build_release.sh
+      - name: what this runner has
+        run: |
+          uname -r
+          systemctl --version | head -1
+          sudo nft list ruleset | head -5 || true
+      - name: install, upgrade, remove, purge for real
+        run: |
+          sudo CORA_LIFECYCLE_TEST=disposable-machine packaging/lifecycle_test.sh "$(ls dist/*.deb)"

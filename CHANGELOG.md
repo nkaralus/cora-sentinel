@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.8.1
+
+### Fixed
+- **A rare flake in the tap tests on a busy host.** The sock_diag destroy-event stream audits every TCP socket on the machine
+  and carries no cgroup id, and these tests blocklist the machine's own LAN address, so any other process talking to that
+  address while a test ran was counted as a slip and broke `slips == 0` and `live + slips == N`. Only slips are host-wide
+  (`live_hits` needs a task's cgroup id; the tap's `syn`/`udp` counters match on the task's cgroup). The five affected
+  assertions (`test_sockdiag.py` x3 tests incl. the 3-way lifetime parametrization, `test_nflog.py` x2) now read a per-port tally
+  of the test's own listener (`tests/_ambient.py: watch_slips`), which noise cannot share.
+  - **Proved red then green:** with `CORA_TEST_AMBIENT=1` the unchanged assertions failed 7 of 8 tests; scoped, 8 of 8 pass with
+    noise on and off. The scoped tests still fail when slip accounting breaks (3 of 5 slip-dependent tests under a mutation).
+  - `CORA_TEST_AMBIENT=1` (new): a non-task process connects to the blocklisted address continuously during those tests.
+  - `tests/test_ambient.py` (6, no kernel): the helper, and a guard that no tap test asserts on the host-wide counter alone.
+  - `test_ambient_host_traffic_is_audited_host_wide_and_never_lands_on_a_tests_own_port` (real kernel): the noise IS audited, and
+    none of it is attributable to the test's port. This pins the semantics so nobody "fixes" the monitor to be per-task.
+
+### Added
+- **CI** (`.github/workflows/ci.yml`, which already existed from 0.1.2; its three job names are kept so required-status settings
+  still match). `unprivileged`: the suite on Python **3.10, 3.11, 3.12, 3.13** (was 3.10 and 3.12) plus the vendored-gate check.
+  `package`: vendored copy vs GitHub, `build_release.sh`, `sha256sum -c`, a second build that must be byte-identical, the wheel
+  installed into a clean venv with `cora-selfcheck` run strictly (the old step ended in `|| true`, which hid a damaged install),
+  `lintian --fail-on error`, artifacts uploaded. `privileged`: the original experimental root job, kept as it was (it still
+  cannot block a merge). Read-only permissions, actions pinned to major versions, no sudo around Python in the unprivileged jobs.
+- **`lifecycle.yml`** (manual only): the real systemd lifecycle on a disposable GitHub runner, so the one stubbed part (stop/disable
+  order, restart on upgrade, removing a real floor) can be exercised without touching the live host. Not run yet.
+- `tests/test_ci.py` (9): the matrix floor equals `requires-python` and includes 3.10-3.13, tests never run under sudo, permissions
+  and pinning, and the destructive workflow is manual only (mutation-checked).
+- docs/ci.md.
+
+### Verified
+- The `test` job's steps, as an unprivileged user, on real CPython 3.10.20, 3.11.15, 3.12.3, 3.13.14: **619 passed, 107 skipped on
+  each** (the skips are the kernel tests), with no source change needed. The hardened tap tests also pass as root under noise on
+  3.10 and 3.13. This lifts the "tested on 3.12 only" caveat for everything that runs unprivileged; the kernel tests are still
+  only run on 3.12 on bare metal.
+
+### Not done
+- The workflows have not run on GitHub (they are linted with `actionlint` and their commands were run locally); the first push is the
+  test. `lifecycle.yml` in particular depends on what the hosted runner's kernel allows.
+
 ## 0.8.0
 
 ### Added

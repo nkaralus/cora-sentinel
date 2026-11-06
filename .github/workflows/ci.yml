@@ -1,42 +1,99 @@
+# Three jobs, as before: `unprivileged` (no root, no sudo for the tests), `package`, and the EXPERIMENTAL `privileged` one.
+#
+# `unprivileged`: the kernel tests (cgroups, nftables, NFLOG, network namespaces) see they are not root and skip themselves;
+# they are covered by the author's bare-metal runs. What it proves on every push and pull request: the code and the tests work
+# on every supported Python, and the vendored safety gate is exactly what VENDOR.lock says.
+# `package`: the vendored copy still matches upstream, the wheel/sdist/.deb build and are reproducible and pass lintian, and
+# the wheel installs into a clean environment and its tools run.
 name: ci
 
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
 jobs:
   unprivileged:
     # Everything that does not need root. Kernel tests (cgroups, nftables, NFLOG) skip themselves.
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.10", "3.12"]
+        python: ["3.10", "3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - run: pip install -e ".[dev]"
-      - run: python -m pytest -q
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: install (no runtime dependencies; the dev extras are pytest and jsonschema)
+        run: python -m pip install -e ".[dev]"
+      - name: the vendored safety gate is exactly what VENDOR.lock says
+        run: python tools/vendor_bus.py check
+      - name: tests
+        run: python -m pytest -q -ra
 
   package:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install build
-      - run: python -m build
-      - run: pip install dist/*.whl
-      - run: cora-selfcheck || true   # reports machine capabilities; the runner is not expected to have them all
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: tools
+        run: |
+          python -m pip install build pytest jsonschema
+          sudo apt-get update -q
+          sudo apt-get install -y -q lintian
+      - name: the vendored copy matches upstream at the pinned commit
+        run: CORA_TEST_NETWORK=1 python -m pytest -q tests/test_vendor.py
+      - name: build the sdist, the wheel and the .deb
+        run: packaging/build_release.sh
+      - name: the checksums verify
+        run: cd dist && sha256sum -c SHA256SUMS
+      - name: building again gives the same bytes
+        run: |
+          cp -r dist /tmp/first
+          packaging/build_release.sh >/dev/null
+          for f in dist/*; do cmp "$f" "/tmp/first/$(basename "$f")"; done
+      - name: the wheel installs into a clean environment and its tools run
+        # cora-selfcheck exits 1 only for a REQUIRED problem (a damaged install, a modified vendored gate); the machine
+        # capabilities a hosted runner lacks are reported, not failed. (This step used to end in `|| true`, which hid both.)
+        run: |
+          python -m venv /tmp/clean
+          /tmp/clean/bin/pip install dist/*.whl
+          /tmp/clean/bin/cora-selfcheck
+          /tmp/clean/bin/cora-floor --help >/dev/null
+      - name: lintian (errors fail the build; warnings are listed in docs/packaging.md)
+        run: lintian --fail-on error dist/*.deb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ github.sha }}
+          path: dist/*
+          retention-days: 14
 
   privileged:
     # EXPERIMENTAL. Whether a GitHub-hosted runner exposes cgroup v2 delegation, nfnetlink_log and
     # NETLINK_SOCK_DIAG to a root process has not been verified. Allowed to fail.
     runs-on: ubuntu-latest
     continue-on-error: true
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

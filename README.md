@@ -286,6 +286,9 @@ need a cgroup v2 mount, or `CORA_TEST_CGROUP_MOUNT`).
 restored by the policy's decisions; they use a public address aliased inside the lab, because the policy refuses private
 ones). `tools/dyn_bench.py` measures the per-decision cost.
 
+CI (`.github/workflows/ci.yml`, see [docs/ci.md](docs/ci.md)) runs the unprivileged suite on Python 3.10, 3.11, 3.12 and 3.13 and builds
+the wheel, sdist and `.deb`; the kernel tests run on bare metal. `CORA_TEST_AMBIENT=1` adds deliberate host noise to the tap tests.
+
 0.8.0 adds `tests/test_vendor.py` (the vendored gate matches its lock, a shadowing `subnetbus` is ignored, the update tool)
 and `tests/test_packaging_deb.py` (wheel, sdist and `.deb` contents, reproducibility, and the maintainer scripts against
 stubbed commands). `packaging/lifecycle_test.sh` is the real install/upgrade/remove/purge, for a disposable machine only.

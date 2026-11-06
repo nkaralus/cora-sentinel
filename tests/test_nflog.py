@@ -17,6 +17,8 @@ from pathlib import Path
 
 import pytest
 
+import _ambient  # noqa: E402  (tests/_ambient.py: host-noise helpers)
+
 from cora_sentinel.blocklist import Blocklist
 from cora_sentinel.cgroup import CgroupRoot
 from cora_sentinel.firewall import Firewall
@@ -254,7 +256,10 @@ def env():
     cg.ensure()
     fw = Firewall(cg, table=f"coratest{os.getpid()}")
     made = []
+    noise = _ambient.maybe_noise(LOCAL)             # CORA_TEST_AMBIENT=1: deliberate host noise, see _ambient.py
     yield cg, fw, made
+    if noise:
+        noise.stop()
     for m in made:
         try: m.stop()
         except Exception: pass
@@ -316,6 +321,7 @@ def monitor(cg, fw, made, events, interval=0.05, lines=None, udp=True, udp_timeo
                  net_allow=["0.0.0.0/0"], cgroups=cg, blocklist=bl, cooldown_s=0)
     tap = TapService(fw, GROUP, udp=udp, udp_timeout=udp_timeout)
     nm = NetMonitor(s, interval=interval, tap=tap)
+    nm.slips_by_port = _ambient.watch_slips(nm)    # slips are host-wide; assert on the test's own port (see _ambient.py)
     s.netmon_active = True
     nm.raw = []                                   # diagnostics: every raw SYN message, before coalescing
     orig = nm._on_syn
@@ -353,11 +359,11 @@ def test_every_zero_lifetime_beacon_is_attributed_to_the_right_task(env):
     for e in ev:
         per_task[e["subject"]["cgroup"]] = per_task.get(e["subject"]["cgroup"], 0) + 1
     print(f"\n{sum(plan.values())} zero-lifetime beacons across 3 tasks -> attributed per task: {per_task}; "
-          f"slips={nm.stats['slips']} lost={nm.lost()}")
+          f"slips={nm.slips_by_port[port]} lost={nm.lost()}")
     assert dict(nm.syn_by_task) == plan, "\n".join(explain(nm, k) for k in plan)   # every SYN, to the right task, exactly
     assert per_task == plan and len(ev) == sum(plan.values())  # one event each: no loss, no duplicates
     assert all(e["anomaly"]["evidence"]["via"] == "syn_tap" for e in ev)
-    assert nm.stats["slips"] == 0 and nm.stats["owner_gone"] == 0 and nm.lost() == 0
+    assert nm.slips_by_port[port] == 0 and nm.stats["owner_gone"] == 0 and nm.lost() == 0
     stop_drain.set(); lis.close()
 
 
@@ -371,8 +377,8 @@ def test_flood_of_1500_beacons_loses_nothing(env):
     p = task(cg, fw, "flood", beacons(port, 1500))
     p.wait(timeout=90)
     time.sleep(1.0)
-    print(f"\n1500 beacons: syn events={nm.stats['syn']} lost={nm.lost()} slips={nm.stats['slips']}")
-    assert nm.syn_by_task["flood"] == 1500 and nm.lost() == 0 and nm.stats["slips"] == 0
+    print(f"\n1500 beacons: syn events={nm.stats['syn']} lost={nm.lost()} slips={nm.slips_by_port[port]}")
+    assert nm.syn_by_task["flood"] == 1500 and nm.lost() == 0 and nm.slips_by_port[port] == 0
     stop_drain.set(); lis.close()
 
 

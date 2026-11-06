@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+import _ambient  # noqa: E402  (tests/_ambient.py: host-noise helpers)
+
 from cora_sentinel.blocklist import Blocklist
 from cora_sentinel.cgroup import CgroupRoot
 from cora_sentinel.daemon import Sentinel, read_tcp_table
@@ -174,7 +176,10 @@ def env():
     cg = CgroupRoot(f"{MOUNT}/coranm-{os.getpid()}", MOUNT)
     cg.ensure()
     made = []
+    noise = _ambient.maybe_noise(LOCAL)             # CORA_TEST_AMBIENT=1: deliberate host noise, see _ambient.py
     yield cg, made
+    if noise:
+        noise.stop()
     for m in made:
         m.stop()
     for n in cg.names():
@@ -200,6 +205,7 @@ def monitor(cg, made, events, interval=0.05):
     s = Sentinel("UNUSED", ["/tmp"], spike_mb=10**6, window_s=5, emit=events.append,
                  net_allow=["0.0.0.0/0"], cgroups=cg, blocklist=bl, cooldown_s=0)
     nm = NetMonitor(s, interval=interval)
+    nm.slips_by_port = _ambient.watch_slips(nm)    # slips are host-wide; assert on the test's own port (see _ambient.py)
     s.netmon_active = True
     nm.start(); made.append(nm)
     return s, nm
@@ -231,7 +237,26 @@ def test_slow_beacon_is_caught_alive_attributed_once_and_not_reported_twice(env)
     ev = [e for e in events if e["anomaly"]["kind"] == "unauthorized_connection"]
     assert len(ev) == 1 and ev[0]["subject"]["cgroup"] == "slow"
     assert ev[0]["anomaly"]["evidence"]["blocklist"]["list"] == "rogue"
-    assert nm.stats["slips"] == 0                                      # seen alive, so its destruction is not a slip
+    assert nm.slips_by_port[port] == 0                                 # seen alive, so its destruction is not a slip
+    lis.close()
+
+
+@real
+def test_ambient_host_traffic_is_audited_host_wide_and_never_lands_on_a_tests_own_port(env):
+    """The destroy stream audits EVERY socket on the host, so noise from outside any task is counted as slips (that is the
+    audit working). A test must therefore assert on its own listener's port, which noise can never share."""
+    cg, made = env
+    lis = socket.socket(); lis.bind((LOCAL, 0)); lis.listen(8); port = lis.getsockname()[1]
+    s, nm = monitor(cg, made, [])
+    noise = _ambient.AmbientNoise(LOCAL).start()                       # a non-task process connecting to the blocklisted address
+    try:
+        time.sleep(1.5)
+    finally:
+        noise.stop()
+    time.sleep(0.5)
+    assert nm.slips_by_port[noise.port] > 0, "the host-wide audit did not see the noise"
+    assert nm.stats["slips"] >= nm.slips_by_port[noise.port]
+    assert nm.slips_by_port[port] == 0                                 # ... and none of it is attributable to this test's port
     lis.close()
 
 
@@ -246,7 +271,7 @@ def test_every_connection_in_a_burst_is_accounted_for_live_or_as_a_slip(env):
                           f"    socket.create_connection(('{LOCAL}',{port})).close(); time.sleep(0.004)\ntime.sleep(1)")
     p.wait(timeout=30)
     time.sleep(1.0)
-    live, slips = nm.stats["live_hits"], nm.stats["slips"]
+    live, slips = nm.stats["live_hits"], nm.slips_by_port[port]    # live hits are task-scoped; slips are scoped to this port
     print(f"\nburst of {N}: {live} caught alive+attributed, {slips} detected as unattributed slips")
     assert live + slips == N                                           # nothing unaccounted for
     assert nm.lost() == 0
@@ -313,7 +338,7 @@ def test_where_the_boundary_is_connection_lifetime_vs_poll_interval(env, lifetim
                          f"time.sleep(1)")
     p.wait(timeout=60)
     time.sleep(0.8)
-    live, slips = nm.stats["live_hits"], nm.stats["slips"]
+    live, slips = nm.stats["live_hits"], nm.slips_by_port[port]
     print(f"\nlifetime {lifetime*1000:5.0f} ms vs poll 50 ms: {live:2d}/{N} alive+attributed, {slips:2d}/{N} slips")
     assert live + slips == N and nm.lost() == 0                          # detection is complete at every lifetime
     assert live >= min_live_frac * N
