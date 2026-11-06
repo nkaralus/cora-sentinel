@@ -202,3 +202,33 @@ def test_the_templates_are_comment_only_ascii_and_say_what_they_are():
         text = (DEPLOY / "seed" / d / "00-local.txt").read_text()
         assert text.isascii() and "TEMPLATE" in text
         assert all(l.startswith("#") or not l.strip() for l in text.splitlines()), "a seed must carry no entry"
+
+
+@pytest.mark.skipif(not shutil.which("bash"), reason="needs bash")
+def test_install_renders_the_sync_units_without_enabling_and_uninstall_removes_them(tmp_path, stubbin):
+    root = tmp_path / "root"
+    r = run_install(root, "--bindir", str(stubbin))
+    assert r.returncode == 0, r.stderr
+    units = root / "etc/systemd/system"
+    svc = (units / "cora-sync.service").read_text()
+    assert "@BINDIR@" not in svc
+    assert f"ExecStart={stubbin}/cora-blocklist --dir /var/lib/cora-sentinel/blocklists sync" in svc
+    assert "SuccessExitStatus=10 11" in svc and "CapabilityBoundingSet=\n" in svc
+    assert "ConditionPathExists=/etc/cora-sentinel/cora-security.pub" in svc
+    assert "OnUnitActiveSec=6h" in (units / "cora-sync.timer").read_text()
+    assert not (units / "timers.target.wants").exists()                       # installed, never enabled
+    assert "enable --now cora-sync.timer" in r.stdout
+    assert run_install(root, "--uninstall").returncode == 0
+    assert not (units / "cora-sync.service").exists() and not (units / "cora-sync.timer").exists()
+
+
+@pytest.mark.skipif(not shutil.which("systemd-analyze"), reason="needs systemd-analyze")
+def test_systemd_accepts_the_sync_units(tmp_path, stubbin):
+    root = tmp_path / "root"
+    assert run_install(root, "--bindir", str(stubbin)).returncode == 0
+    (stubbin / "cora-blocklist").write_text("#!/bin/sh\nexit 0\n")
+    (stubbin / "cora-blocklist").chmod(0o755)
+    units = root / "etc/systemd/system"
+    r = subprocess.run(["systemd-analyze", "verify", str(units / "cora-sync.service"), str(units / "cora-sync.timer")],
+                       capture_output=True, text=True)
+    assert "cora-sync" not in r.stderr, r.stderr

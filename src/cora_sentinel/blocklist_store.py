@@ -18,13 +18,15 @@ What this protects against: a silently changed or compromised upstream, a man in
 and redirects may not leave https), a list that suddenly blocks your LAN or that is emptied (flagged), oversized
 or never-ending responses (hard limits), and tampering with the files at rest (verify, and the daemon fails
 closed). It does NOT protect against a change that looks reasonable and is not (that is the human review), a
-malicious FIRST fetch (review it), or a compromised root (root can edit the lock). There are no signatures:
-the standard library has no ed25519 or GPG.
+malicious FIRST fetch (review it), or a compromised root (root can edit the lock). `pull` checks no signatures;
+signed community lists come in through `sync` (cora_sentinel.sync, minisign, docs/blocklist-sync.md).
 
 Prefer URLs pinned to a commit SHA: https://raw.githubusercontent.com/OWNER/REPO/<40-hex>/path never changes
 under you, so "updating" means bumping the commit in sources.json, which is itself a reviewed edit.
 
 Exit codes of `pull`: 0 nothing to review, 10 changes are staged and await review, 1 an error occurred.
+`sync` (signed community lists, see cora_sentinel/sync.py): 0 in sync, 10 held by a delta cap, 11 awaiting a
+valid signature for the current manifest, 1 an error. Nothing changes on any non-zero exit.
 """
 from __future__ import annotations
 
@@ -486,9 +488,33 @@ def main(argv: Optional[List[str]] = None) -> int:
     a.add_argument("--sha256", required=True)
     a.add_argument("--allow-large-change", action="store_true")
     sub.add_parser("verify", help="check every active list against its pin")
+    y = sub.add_parser("sync", help="pull the community lists from cora-security, applied only if the manifest "
+                                    "carries a valid minisign signature from the pinned offline key")
+    y.add_argument("--repo", default="nkaralus/cora-security")
+    y.add_argument("--ref", default="main", help="branch, or a 40-hex commit to pin")
+    y.add_argument("--pubkey", type=Path, default=Path("/etc/cora-sentinel/cora-security.pub"),
+                   help="minisign public key of the signer (root-owned, not group/world-writable)")
+    y.add_argument("--reload-cmd", default="systemctl reload cora-sentinel",
+                   help="run after an apply ('' to disable)")
+    y.add_argument("--allow-large-change", action="store_true", help="apply even if a delta cap holds it")
+    y.add_argument("--dry-run", action="store_true", help="fetch and check everything, write nothing")
+    r = sub.add_parser("sync-rollback", help="restore the community lists from last-good and refuse that "
+                                             "signature until a newer one arrives")
+    r.add_argument("--reload-cmd", default="systemctl reload cora-sentinel")
     args = ap.parse_args(argv)
 
     store = Store(args.dir or default_dir())
+    if args.cmd in ("sync", "sync-rollback"):
+        from cora_sentinel import sync                       # imported here: sync imports this module
+        if args.cmd == "sync-rollback":
+            return sync.rollback(store, args.reload_cmd)
+        try:
+            pub = sync.load_pubkey(args.pubkey)
+        except sync.SyncError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return EXIT_ERROR
+        return sync.run(store, args.repo, args.ref, pub, allow_large_change=args.allow_large_change,
+                        reload_cmd=args.reload_cmd, dry_run=args.dry_run)
     try:
         if args.cmd == "pull":
             sources = load_sources(args.sources or store.sources_path)

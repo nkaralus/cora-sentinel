@@ -1,0 +1,14 @@
+# cora-sync.timer: every ~6 hours, jittered so a fleet does not arrive at GitHub together.
+# Unauthenticated GitHub API calls are limited to 60 an hour per address; this uses 1 per run.
+[Unit]
+Description=cora-sync: periodic signed blocklist update
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=6h
+RandomizedDelaySec=30min
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

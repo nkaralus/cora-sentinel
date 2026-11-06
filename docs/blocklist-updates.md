@@ -78,7 +78,8 @@ SuccessExitStatus=10
 
 ## What this does not do
 
-- **No signatures.** The standard library has no ed25519 or GPG, so the trust is "TLS + a pinned hash + a human".
+- **No signatures on `pull`.** Its trust is "TLS + a pinned hash + a human". The signed community lists from
+  cora-security use `cora-blocklist sync` instead: see [blocklist-sync.md](blocklist-sync.md).
 - **A reasonable-looking bad change passes** if you approve it. The flags catch the loud failures, not the subtle ones.
 - **A malicious first fetch** is trusted if you approve it: read the first diff.
 - **Root can edit the lock.** This protects against the network and against other users, not against root.

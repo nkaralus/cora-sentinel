@@ -1,0 +1,57 @@
+# cora-sync.service: pull the community blocklists from cora-security, applied only if the manifest is
+# signed by the offline minisign key pinned at /etc/cora-sentinel/cora-security.pub.
+#
+# Installed (never enabled) by deploy/install-service.sh. Turn it on with: systemctl enable --now cora-sync.timer
+# The daemon must load the store for this to matter: add to CORA_ARGS in /etc/cora-sentinel/cora-sentinel.conf
+#     --blocklist-store /var/lib/cora-sentinel/blocklists
+#
+# Runs as root only because the store must be root-owned (the store refuses anything else) and because
+# `systemctl reload` is how it hands over. Everything else is taken away below: no capabilities at all,
+# read-only filesystem except the store, no devices, no new privileges.
+# Exit 10 (held by a delta cap) and 11 (awaiting a signature) are normal states, not failures:
+# `journalctl -u cora-sync` says which, and `cora-blocklist sync --allow-large-change` applies a held one.
+
+[Unit]
+Description=cora-sync: signed community blocklist updates from cora-security
+Documentation=https://github.com/nkaralus/cora-sentinel/blob/main/docs/blocklist-sync.md
+Wants=network-online.target
+After=network-online.target cora-sentinel.service
+ConditionPathExists=/etc/cora-sentinel/cora-security.pub
+
+[Service]
+Type=oneshot
+ExecStart=@BINDIR@/cora-blocklist --dir /var/lib/cora-sentinel/blocklists sync
+SuccessExitStatus=10 11
+TimeoutStartSec=180
+
+StateDirectory=cora-sentinel/blocklists
+StateDirectoryMode=0700
+UMask=0077
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# AF_UNIX: the D-Bus socket `systemctl reload` talks to
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# Tighter, if you accept maintaining it: GitHub publishes its ranges at https://api.github.com/meta
+#IPAddressDeny=any
+#IPAddressAllow=localhost 140.82.112.0/20 143.55.64.0/20 185.199.108.0/22 192.30.252.0/22
