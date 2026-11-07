@@ -493,7 +493,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     y.add_argument("--repo", default="nkaralus/cora-security")
     y.add_argument("--ref", default="main", help="branch, or a 40-hex commit to pin")
     y.add_argument("--pubkey", type=Path, default=Path("/etc/cora-sentinel/cora-security.pub"),
-                   help="minisign public key of the signer (root-owned, not group/world-writable)")
+                   help="GENESIS active minisign key (root-owned, not group/world-writable)")
+    y.add_argument("--standby-pubkey", type=Path, default=Path("/etc/cora-sentinel/cora-security.standby.pub"),
+                   help="GENESIS standby key: the only key that can rotate keys (missing: rotations refused)")
     y.add_argument("--reload-cmd", default="systemctl reload cora-sentinel",
                    help="run after an apply ('' to disable)")
     y.add_argument("--allow-large-change", action="store_true", help="apply even if a delta cap holds it")
@@ -510,11 +512,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             return sync.rollback(store, args.reload_cmd)
         try:
             pub = sync.load_pubkey(args.pubkey)
+            standby = sync.load_pubkey(args.standby_pubkey) if args.standby_pubkey.exists() else None
         except sync.SyncError as e:
             print(f"error: {e}", file=sys.stderr)
             return EXIT_ERROR
         return sync.run(store, args.repo, args.ref, pub, allow_large_change=args.allow_large_change,
-                        reload_cmd=args.reload_cmd, dry_run=args.dry_run)
+                        reload_cmd=args.reload_cmd, dry_run=args.dry_run, standby=standby)
     try:
         if args.cmd == "pull":
             sources = load_sources(args.sources or store.sources_path)
