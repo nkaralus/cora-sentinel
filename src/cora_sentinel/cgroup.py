@@ -11,7 +11,8 @@ A task is a directory under one delegated root:  <root>/<name>/
 freeze and kill are core files: no controller needed. Only THROTTLE's primary
 path needs the cpu/memory controllers delegated to this root.
 
-  cora-cgroup list | status NAME | thaw NAME     (root: $CORA_CGROUP_ROOT)
+  cora-cgroup list | status NAME | thaw NAME | reset NAME     (root: $CORA_CGROUP_ROOT)
+  reset undoes THROTTLE (cpu.max, memory.high back to max): the only way back from cora-tray's "Cap memory".
 """
 from __future__ import annotations
 
@@ -229,6 +230,10 @@ def main() -> int:
     if len(a) == 2 and a[0] == "thaw":
         root.thaw(a[1])
         print(f"thawed {a[1]}")
+        return 0
+    if len(a) == 2 and a[0] == "reset":
+        undone = root.reset_limits(a[1])
+        print(f"{a[1]}: {', '.join(undone) if undone else 'no THROTTLE limits were set'}")
         return 0
     print(__doc__)
     return 2

@@ -725,6 +725,11 @@ def main() -> int:
     ap.add_argument("--nft", action="store_true",
                     help="enable the ISOLATE verdict: per-cgroup egress drop via nftables "
                          "(needs --cgroup-root and root/CAP_NET_ADMIN)")
+    ap.add_argument("--ui-socket", metavar="PATH",
+                    help="publish a read-only status feed for desktop clients (cora-tray) on this Unix socket; "
+                         "its directory must be root-owned and not world-writable, e.g. /run/cora-sentinel/ui.sock")
+    ap.add_argument("--ui-group", metavar="GROUP",
+                    help="group allowed to read --ui-socket (mode 0660); without it the socket is root-only (0600)")
     ap.add_argument("--cgroup-mount", default="/sys/fs/cgroup", help="where cgroup v2 is mounted (default %(default)s)")
     ap.add_argument("--spike-mb", type=int, default=150,
                     help="report a memory spike when a task's resident memory rises by at least this many MB above its minimum "
@@ -894,6 +899,44 @@ def main() -> int:
         print(f"[cora-sentinel] dyn policy: {a.dyn_policy} "
               f"({'kernel drops of model-ISOLATEd destinations, flow-level on web ports' if a.dyn_policy == 'enforce' else 'recording what it WOULD block in the decision log; nothing is written to the kernel'})",
               file=sys.stderr)
+    hub = None
+    adj_ref: dict = {"adj": None}
+    if a.ui_socket:
+        from cora_sentinel.uihub import Hub, cgroup_tasks
+        mode = ("enforce" if a.enforce else "dry-run") if a.model else "detect-only"
+        manual_act = None
+        if cg is not None:
+            from cora_sentinel.verdict import Executor
+            # enforce=True on purpose: a breaker press is a person's explicit override, so it acts even when the model's
+            # verdicts are dry-run. ISOLATE needs --nft (the firewall); THROTTLE needs only the cgroup tree.
+            manual = Executor(enforce=True, cgroups=cg, firewall=fw)
+            manual_act = lambda verdict, task: manual.run(verdict, 0, task)  # noqa: E731
+        decisions_f = {"f": None}
+
+        def manual_record(d: dict) -> None:
+            if adj_ref["adj"] is not None:
+                adj_ref["adj"]._record(d)                # same decision log, same line format
+                return
+            line = json.dumps(d, separators=(",", ":"))
+            if a.decisions:
+                if decisions_f["f"] is None:
+                    decisions_f["f"] = open(a.decisions, "a", buffering=1)
+                decisions_f["f"].write(line + "\n")
+            print(f"[ui] manual: {line}", file=sys.stderr, flush=True)
+
+        hub = Hub(a.ui_socket, a.ui_group, mode,
+                  tasks=cgroup_tasks(cg) if cg else None,
+                  evaluating=lambda: adj_ref["adj"].pending() if adj_ref["adj"] else 0,
+                  cgroup_id=cg.cgroup_id if cg else None,
+                  act=manual_act, record=manual_record)
+        try:
+            hub.start()
+        except OSError as e:
+            print(f"[cora-sentinel] --ui-socket unusable: {e}", file=sys.stderr)
+            return 1
+        ui_emit = emit
+        emit = lambda p: (ui_emit(p), hub.note_event(p))  # noqa: E731
+        s.emit = emit
     if a.model:
         from cora_sentinel.verdict import Adjudicator, Executor, Qwen3B  # lazy: heavy deps
         reporter = None
@@ -904,7 +947,8 @@ def main() -> int:
                           Executor(enforce=a.enforce, cgroups=cg, firewall=fw), a.decisions,
                           a.min_conf, reporter=reporter,
                           blocklist_floor=not a.no_blocklist_floor, contain_first=not a.no_contain_first,
-                          dyn=dyn)
+                          dyn=dyn, sink=hub.note_decision if hub else None)
+        adj_ref["adj"] = adj
         adj.start()
         base_emit = emit
         emit = lambda p: (base_emit(p), adj.submit(p))  # noqa: E731
@@ -988,6 +1032,8 @@ def main() -> int:
         netmon.stop()
     if adj:
         adj.stop()
+    if hub:
+        hub.stop()
     reloader.stop()
     if reloader.resolver:
         reloader.resolver.stop()

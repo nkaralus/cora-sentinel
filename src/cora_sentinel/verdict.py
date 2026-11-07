@@ -188,6 +188,7 @@ class Adjudicator:
         self._ifl_lock = threading.Lock()
         self._clock = time.monotonic                      # tests replace it
         self.coalesced = self.follow_ups = self.stale_in_flight = 0
+        self._busy = False                                # handle() running right now (for pending())
 
     # ---- gate -------------------------------------------------------------
     # Actions that may still go ahead when the process that triggered the event has EXITED, provided its cgroup is provably the
@@ -491,15 +492,22 @@ class Adjudicator:
             except Exception as e:
                 print(f"[verdict] could not record the dropped event: {e!r}", file=sys.stderr)
 
+    def pending(self) -> int:
+        """Events queued for the model plus the one being judged now (the status feed's "evaluating")."""
+        return self.q.qsize() + (1 if self._busy else 0)
+
     def _loop(self) -> None:
         while True:
             ev = self.q.get()
             if ev is None:
                 return
+            self._busy = True
             try:
                 self.handle(ev)
             except Exception as e:  # never kill the worker
                 print(f"[verdict] handler error: {e!r}", file=sys.stderr)
+            finally:
+                self._busy = False
 
     def stop(self) -> None:
         self.q.put(None)

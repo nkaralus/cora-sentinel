@@ -119,8 +119,9 @@ PAGES = {
     ),
 
     "cora-cgroup": dict(
-        summary="inspect and thaw cora-sentinel task cgroups",
-        synopsis=["**cora-cgroup** **list**", "**cora-cgroup** **status** //NAME//", "**cora-cgroup** **thaw** //NAME//"],
+        summary="inspect, thaw and un-throttle cora-sentinel task cgroups",
+        synopsis=["**cora-cgroup** **list**", "**cora-cgroup** **status** //NAME//", "**cora-cgroup** **thaw** //NAME//",
+                  "**cora-cgroup** **reset** //NAME//"],
         description=[
             ("p", "A task is a directory under one delegated cgroup v2 root. A sentinel contains a task through that directory: "
                   "suspend (cgroup.freeze), terminate (cgroup.kill, kernel 5.14 or later) and throttle (cpu.max and memory.high, "
@@ -130,6 +131,8 @@ PAGES = {
             ("**list**", "Print every task with its process count, whether it is frozen, and whether a freeze was requested."),
             ("**status** //NAME//", "Print one task's process count and whether it is frozen."),
             ("**thaw** //NAME//", "Unfreeze a suspended task."),
+            ("**reset** //NAME//", "Undo THROTTLE: cpu.max and memory.high back to max. The only way back from cora-tray's "
+                                   "Cap memory breaker, which the tray itself cannot undo."),
         ],
         sections=[
             ("ENVIRONMENT", [
