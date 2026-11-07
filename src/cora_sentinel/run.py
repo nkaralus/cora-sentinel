@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """cora-run NAME CMD [ARGS...]  - run CMD as a cora task.
 
+Refuses (exit 3) if <root>/NAME is left over from an earlier run and still carries containment (an nft drop rule,
+a freeze, or THROTTLE limits): a relaunch reuses that cgroup, so it would start already severed, frozen or capped,
+with nothing saying why. Undo is root-only, and the message names the command. This is about not failing silently;
+the containment itself never depends on it (the kernel rule still matches a reused cgroup), so if the firewall
+cannot be read, cora-run warns and starts anyway.
+
 Creates <root>/NAME, moves *this* process into it, then execs CMD. The task and
 everything it forks stay in that cgroup from its first instruction (no race,
 no marker argument). Root: $CORA_CGROUP_ROOT (default /sys/fs/cgroup/cora).
@@ -9,6 +15,8 @@ import os
 import sys
 
 from cora_sentinel.cgroup import DEFAULT_MOUNT, DEFAULT_ROOT, CgroupError, CgroupRoot
+
+EXIT_CONTAINED = 3      # the task's cgroup still carries containment from an earlier run: release it first
 
 
 def _preinstall_tap(cg: CgroupRoot, name: str) -> None:
@@ -33,12 +41,59 @@ def _preinstall_tap(cg: CgroupRoot, name: str) -> None:
         print(f"cora_run: tap pre-install skipped ({e})", file=sys.stderr)
 
 
+def _firewall(cg: CgroupRoot):
+    try:
+        from cora_sentinel.firewall import Firewall
+        return Firewall(cg, table=os.environ.get("CORA_NFT_TABLE", "cora"))
+    except Exception:
+        return None
+
+
+def preflight(cg: CgroupRoot, name: str, fw=None, warn=lambda m: print(m, file=sys.stderr)) -> "str | None":
+    """None if NAME may start; otherwise why not. Only a cgroup that already exists can carry containment."""
+    try:
+        d = cg._dir(name)
+    except CgroupError:
+        return None                              # a bad name: cg.create() reports it
+    if not d.is_dir():
+        return None
+    cid = cg.cgroup_id(name)
+    if fw is not None:
+        try:
+            rule = fw.rules().get(name)
+        except Exception as e:
+            warn(f"cora_run: could not read the firewall ({e.__class__.__name__}: {e}); starting anyway. If "
+                 f"'{name}' is still isolated, the kernel keeps it isolated: check with 'sudo cora-firewall list'")
+            rule = None
+        # a rule made for an OLDER cgroup of this name does not hold this one
+        if rule is not None and (rule.get("cgid") is None or rule.get("cgid") == cid):
+            return (f"task '{name}' is currently isolated in nftables; "
+                    f"release it first with 'sudo cora-firewall release {name}'")
+    try:
+        if (d / "cgroup.freeze").read_text().strip() == "1":
+            return f"task '{name}' is currently suspended (frozen); release it first with 'sudo cora-cgroup thaw {name}'"
+    except OSError:
+        pass
+    for fname in ("cpu.max", "memory.high"):
+        try:
+            if (d / fname).read_text().split()[0] != "max":
+                return (f"task '{name}' is currently throttled ({fname}); "
+                        f"release it first with 'sudo cora-cgroup reset {name}'")
+        except (OSError, IndexError):
+            continue
+    return None
+
+
 def main() -> int:
     if len(sys.argv) < 3:
         print(__doc__)
         return 2
     cg = CgroupRoot(os.environ.get("CORA_CGROUP_ROOT", DEFAULT_ROOT),
                     os.environ.get("CORA_CGROUP_MOUNT", DEFAULT_MOUNT))
+    refusal = preflight(cg, sys.argv[1], _firewall(cg))
+    if refusal:
+        print(f"cora_run: {refusal}", file=sys.stderr)
+        return EXIT_CONTAINED
     try:
         path = cg.create(sys.argv[1])
         _preinstall_tap(cg, sys.argv[1])         # BEFORE the move: no unobserved first SYN

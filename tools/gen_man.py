@@ -112,7 +112,10 @@ PAGES = {
                 ("tp", "**CORA_NFLOG_GROUP**", "The NFLOG group of the tap. Must match the sentinel's."),
             ]),
             ("EXIT STATUS", [("p", "2 if //NAME// or //CMD// is missing (it prints its usage). 1 if it cannot enter the cgroup. "
-                                   "Otherwise it does not return: the exit status is //CMD//'s.")]),
+                                   "3 if //NAME//'s cgroup is left over from an earlier run and still carries containment "
+                                   "(an nft drop rule, a freeze, or THROTTLE limits): a relaunch would inherit it, so it refuses "
+                                   "and names the root-only undo (**cora-firewall release**, **cora-cgroup thaw** or "
+                                   "**cora-cgroup reset**). Otherwise it does not return: the exit status is //CMD//'s.")]),
             ("EXAMPLES", [("code", "sudo cora-run build python3 build.py\nsudo cora-run fetch curl -s https://example.org/")]),
         ],
         see_also=["cora-sentinel(1)", "cora-cgroup(1)", "cora-firewall(1)"],
