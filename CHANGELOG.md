@@ -1,5 +1,70 @@
 # Changelog
 
+## 0.9.0
+
+### Added
+- **Signed community blocklists: `cora-blocklist sync`** pulls the lists compiled in
+  [cora-security](https://github.com/nkaralus/cora-security) and applies them only if their manifest carries a valid
+  minisign signature from a key pinned offline. The signature *is* the approval: `sync` writes into the same store as
+  `cora-blocklist accept`, pinned the same way in `lock.json`, so `cora-sentinel --blocklist-store` still checks every
+  active file against its pin at start and on every SIGHUP. It is a subcommand of `cora-blocklist`, not a new console
+  script. The unit runs it as root (the store refuses anything not root-owned, and the handoff is
+  `systemctl reload`) with an empty capability set and a read-only filesystem apart from the store. (The `73382ef`
+  commit message calls it "standalone unprivileged"; neither word is accurate, this entry is.)
+  - Every URL is pinned to one 40-hex commit, so the manifest and the lists are always one snapshot.
+  - Nothing is written until every byte has been fetched and checked: a network drop mid-pull changes nothing.
+  - Delta caps hold a signed update for review (exit 10): `EMPTIED`, `REMOVED`, `LAN`, `REJECTS UP`, `BURST`
+    (more than 500 entries added at once), and, once a list has 20+ entries, `LARGE CHANGE` and `SHRINK`. Below
+    20 entries the percentage rules are off, or every early update would have been held.
+  - Apply order: journal, `last-good/` snapshot, files, `lock.json` (the single commit point), verify, reload. A crash
+    before the commit is undone at the next run, before anything is fetched, so the store is consistent again even
+    with the network still down. `cora-blocklist sync-rollback` restores last-good and refuses that signature until
+    a newer one arrives.
+  - Exit codes: 0 in sync, 10 held, 11 awaiting a signature (normal right after a compile, until the owner signs),
+    1 error.
+- **Two-key trust with a signed rotation chain (sync v2).** Nodes pin a genesis active key and a standby key in
+  `/etc/cora-sentinel/`. Rotations (`keys/rotation-<n>.json`) are accepted only when signed by the current
+  **standby** key: the active key signs manifests and can never change keys, so stealing it from the signing machine
+  cannot lock the owner out or install the thief's key. Manifests signed by the standby key or by any revoked key are
+  refused by name. The chain lives in `lock.json` (`cora_keys`) and must start from the `/etc` pins.
+  - **Future skew:** a manifest or rotation signed more than 24 h ahead is refused. Without it a thief could sign far in
+    the future and make every real update look like a replay, permanently; each rotation also resets the counter.
+  - **Compromise:** a rotation with `compromised_after: T` purges any applied community list signed after `T`, discards
+    `last-good/`, and lets the next manifest signed by the new key apply over the delta caps.
+  - Runbooks for planned rotation, a lost key, a stolen key and losing both: `docs/blocklist-sync.md`. The signing
+    tools (`sign-manifest.sh`, `sign-rotation.sh`) live in cora-security.
+- `cora_sentinel/minisign.py`: minisign verification in the standard library (Ed25519 from RFC 8032 in plain integers,
+  BLAKE2b prehash), so the package still declares `dependencies = []`. Verify only: there is no signing code in the
+  package. Not constant-time, which does not matter for public inputs. Rejects non-canonical `S`.
+- `deploy/cora-sync.service` and `deploy/cora-sync.timer` (every ~6 h, jittered). `deploy/install-service.sh` installs
+  them and enables nothing.
+
+### Fixed
+- **`cora-blocklist sync-rollback` was unreachable without `--dir`.** The dispatcher in `blocklist.py` routed
+  `rollback` instead of `sync-rollback` (`c61ff7e`, fixed in `ba593cb`), so the emergency undo printed usage and
+  exited 2 in exactly the form you would type in an emergency. The 0.9.0 CLI tests called the store's `main` directly
+  and never went through the dispatcher; `test_dispatcher_routes_sync_rollback_without_dir` now goes through it.
+- **The sdist would have shipped without `tests/fixtures/minisign/`.** `MANIFEST.in` took only `tests/*.py`, so the
+  release tarball's own suite would fail its minisign interop tests. Found while preparing this release (the built
+  sdist held 0 of the 5 files). `MANIFEST.in` now includes `tests/fixtures`, and
+  `test_every_tracked_test_data_file_is_in_the_sdist_allow_list` fails if any git-tracked file under `tests/` is
+  not covered by a rule (checked: it fails with the line removed).
+
+### Checked
+- `minisign.py` against the RFC 8032 test vector and against real `minisign 0.11` output, prehashed and legacy
+  (`tests/fixtures/minisign/`).
+- Every safety rule in `sync.py` was disabled in turn (signature, global signature, canonical `S`, hash, replay,
+  repo binding, delta caps, the 20-entry floor, crash recovery; then the active key rotating, the rotation signature,
+  epoch and repo binding, forced revocation, a revoked key returning, a revoked or standby key signing a manifest,
+  skew, epoch reset, taint, the tainted last-good, the persisted override, the genesis check, the spent override):
+  each one fails at least one test. One did not at first: disabling crash recovery still passed because the retry
+  rolled forward anyway; the test now keeps the network down for the retry.
+- End to end with real minisign keys against a copy of cora-security: tampered bot commit refused at signing; a
+  signed manifest applied and loaded by the daemon's own loader; a planned rotation K1 to K2 (the old key refused
+  the moment it was revoked); a stolen active key pushing `github.com`, then the owner's revert, compromise rotation
+  and re-sign: the node purged the tainted list and applied the clean set.
+- `tests/test_sync.py` (50) and `tests/test_sync_rotation.py` (34).
+
 ## 0.8.9
 
 ### Fixed

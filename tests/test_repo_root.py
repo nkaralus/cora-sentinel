@@ -43,3 +43,21 @@ def test_the_old_layouts_are_not_in_the_sdist_allow_list():
     manifest = (ROOT / "MANIFEST.in").read_text()
     for name in LEGACY:
         assert name not in [w for l in manifest.splitlines() if l.startswith(("include", "recursive-include", "graft")) for w in l.split()], name
+
+
+def test_every_tracked_test_data_file_is_in_the_sdist_allow_list():
+    """0.9.0 nearly shipped without tests/fixtures/minisign/*: the allow-list took only tests/*.py, so the sdist's
+    own suite would have failed its interop tests. Every git-tracked file under tests/ must match a MANIFEST.in rule."""
+    import fnmatch
+    import subprocess
+    rules = []
+    for line in (ROOT / "MANIFEST.in").read_text().splitlines():
+        parts = line.split()
+        if parts[:1] == ["recursive-include"]:
+            rules.append((parts[1].rstrip("/") + "/", parts[2:]))
+    tracked = subprocess.run(["git", "-C", str(ROOT), "ls-files", "tests"], capture_output=True, text=True)
+    if tracked.returncode:
+        pytest.skip("not a git checkout")
+    missing = [f for f in tracked.stdout.split() if "__pycache__" not in f and not any(
+        f.startswith(d) and any(fnmatch.fnmatch(f.rsplit("/", 1)[-1], p) for p in pats) for d, pats in rules)]
+    assert not missing, f"tracked under tests/ but not shipped in the sdist: {missing}"

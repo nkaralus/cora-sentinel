@@ -19,7 +19,7 @@ The model is never in the hot path and never chooses the target.
           (SUSPEND = cgroup.freeze, TERMINATE = cgroup.kill, THROTTLE = cpu/memory)    + anonymized report
 ```
 
-**Status: beta (0.8.9).** Verified by the test suite on Linux 6.18 (a VM), and by the author on bare-metal
+**Status: beta (0.9.0).** Verified by the test suite on Linux 6.18 (a VM), and by the author on bare-metal
 Ubuntu for the TCP tap and the demo. UDP/QUIC/DNS support has so far only been verified in the VM.
 
 ## Requirements
