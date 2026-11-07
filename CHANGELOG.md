@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.10.1
+
+### Fixed
+- **Two privileged tap tests failed under 0.10.0's `cora-run` pre-flight** (`test_an_isolated_tasks_attempts_are_still_logged`,
+  `test_an_isolated_tasks_udp_is_still_logged`). They block a task's cgroup *before* starting it, on purpose, to show that
+  containment does not blind the tap; the pre-flight then refused the launch with exit 3. Found running the suite as root
+  on bare metal: those tests need root, nft, NFLOG and a writable cgroup tree, so they skip in the author's sandbox, which
+  is how 0.10.0 shipped with them failing. Only the tests were affected; no product behaviour changed for anyone else.
+  - **`CORA_NO_PREFLIGHT=1`** (exactly `1`) makes `cora-run` skip the check, with a warning, and start the task inside
+    whatever its cgroup carries. It weakens nothing: containment never depended on the check (the kernel rule still
+    matches a reused cgroup). Documented in `cora-run(1)`.
+  - The two tests opt in through the tap harness (`task(..., contained=True)`); every other task in the suite still
+    goes through the real check.
+  - Noted, not changed: `tests/test_firewall.py` also starts tasks after a block, and passes only because its harness
+    does not pass its own nft table to `cora-run`, so the pre-flight looks in the production `cora` table.
+- **The privileged CI's pytest run died at cleanup with `PermissionError: '/tmp/pytest-of-root'`.** Also 0.10.0's
+  pre-flight tests: three of them call `cora-run`'s `main()` in-process with `execvp` stubbed, and `main()` drops
+  privileges in-process (`setgroups`, `setgid`, `setuid`) when it is root with `SUDO_UID` set, which `sudo pytest` sets.
+  That turned the pytest process itself into the unprivileged user: every later test ran as that user, and the cleanup
+  of root's temp directory failed. The author's sandbox never sets `SUDO_UID`, so it never happened there.
+  - Those tests now run with no `SUDO_*` and with `setuid`/`setgid`/`setgroups` replaced by a guard that fails the test;
+    `test_main_still_drops_to_the_sudo_user_before_exec` checks the drop itself (calls, order, before exec) on stubs.
+  - `tests/conftest.py`: after EVERY test, the pytest process must still have the same uid/euid/gid/egid. If not, it
+    names the test at once, outside pytest's capture (the cleanup crash that follows kills the run before pytest's
+    summary). Checked: with the fix removed it names `test_main_proceeds_past_preflight_when_clean`.
+  - The reverted CI change (`8155a5e`) is not needed: `tmp_path_factory_cleanup_failed_is_warning` is not a pytest
+    option, and the cause was in the tests.
+  - Checked: the suite passes as root with `SUDO_UID` set (the privileged CI's condition), as plain root, and unprivileged.
+- After upgrading an editable install, run `pip install -e .` again: `test_version_matches_the_installed_metadata` reads
+  the installed metadata, which keeps the old version until then.
+
 ## 0.10.0
 
 ### Added

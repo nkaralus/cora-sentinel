@@ -5,6 +5,18 @@ from cora_sentinel import run
 from cora_sentinel.cgroup import CgroupRoot
 
 
+@pytest.fixture(autouse=True)
+def never_drop_the_test_process(monkeypatch):
+    """run.main() drops privileges IN-PROCESS when root with SUDO_UID set, and these tests call it in-process with execvp
+    stubbed. Under the privileged CI (`sudo pytest` sets SUDO_UID) that turned the pytest process itself into the
+    unprivileged user for the rest of the run, and its cleanup of /tmp/pytest-of-root died with PermissionError. So:
+    no SUDO_* here, and a privilege change in this process fails the test instead of happening."""
+    monkeypatch.delenv("SUDO_UID", raising=False)
+    monkeypatch.delenv("SUDO_GID", raising=False)
+    for fn in ("setuid", "setgid", "setgroups"):
+        monkeypatch.setattr(run.os, fn, lambda *a, _fn=fn: pytest.fail(f"os.{_fn}{a} in the pytest process"))
+
+
 class FakeFirewall:
     def __init__(self, rules=None, fail=None):
         self.rules_, self.fail = rules or {}, fail
@@ -131,3 +143,52 @@ def test_main_proceeds_past_preflight_when_clean(cg, monkeypatch):
     monkeypatch.setattr("sys.argv", ["cora-run", "traytest", "true"])
     run.main()
     assert started == [["true"]]
+
+
+# ---------------------------------------------------------------- CORA_NO_PREFLIGHT=1: the deliberate bypass
+
+def _launch(cg, monkeypatch, value):
+    d = leftover(cg)
+    monkeypatch.setenv("CORA_CGROUP_ROOT", str(cg.root))
+    if value is None:
+        monkeypatch.delenv("CORA_NO_PREFLIGHT", raising=False)
+    else:
+        monkeypatch.setenv("CORA_NO_PREFLIGHT", value)
+    monkeypatch.setattr(run, "_firewall", lambda c: isolated(c))
+    monkeypatch.setattr(run, "_preinstall_tap", lambda *a: None)
+    started = []
+    monkeypatch.setattr(run.os, "execvp", lambda f, a: started.append(a))
+    monkeypatch.setattr("sys.argv", ["cora-run", "traytest", "true"])
+    return run.main(), started
+
+
+def test_no_preflight_starts_an_isolated_task_and_says_so(cg, monkeypatch, capsys):
+    rc, started = _launch(cg, monkeypatch, "1")
+    assert started == [["true"]] and rc is None
+    assert "CORA_NO_PREFLIGHT=1" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("value", [None, "", "0", "yes", "true", " 1"])
+def test_only_exactly_1_bypasses(cg, monkeypatch, value):
+    rc, started = _launch(cg, monkeypatch, value)
+    assert rc == run.EXIT_CONTAINED and started == []
+
+
+
+def test_main_still_drops_to_the_sudo_user_before_exec(cg, monkeypatch):
+    """The drop itself, checked against recording stubs (the real calls would change this test process)."""
+    leftover(cg)
+    monkeypatch.setenv("CORA_CGROUP_ROOT", str(cg.root))
+    monkeypatch.setenv("SUDO_UID", "1000")
+    monkeypatch.setenv("SUDO_GID", "1000")
+    monkeypatch.setattr(run, "_firewall", lambda c: FakeFirewall())
+    monkeypatch.setattr(run, "_preinstall_tap", lambda *a: None)
+    monkeypatch.setattr(run.os, "geteuid", lambda: 0)
+    calls = []
+    monkeypatch.setattr(run.os, "setgroups", lambda g: calls.append(("setgroups", g)))
+    monkeypatch.setattr(run.os, "setgid", lambda g: calls.append(("setgid", g)))
+    monkeypatch.setattr(run.os, "setuid", lambda u: calls.append(("setuid", u)))
+    monkeypatch.setattr(run.os, "execvp", lambda f, a: calls.append(("exec", a)))
+    monkeypatch.setattr("sys.argv", ["cora-run", "traytest", "true"])
+    run.main()
+    assert calls == [("setgroups", []), ("setgid", 1000), ("setuid", 1000), ("exec", ["true"])]

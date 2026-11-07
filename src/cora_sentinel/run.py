@@ -5,7 +5,8 @@ Refuses (exit 3) if <root>/NAME is left over from an earlier run and still carri
 a freeze, or THROTTLE limits): a relaunch reuses that cgroup, so it would start already severed, frozen or capped,
 with nothing saying why. Undo is root-only, and the message names the command. This is about not failing silently;
 the containment itself never depends on it (the kernel rule still matches a reused cgroup), so if the firewall
-cannot be read, cora-run warns and starts anyway.
+cannot be read, cora-run warns and starts anyway. CORA_NO_PREFLIGHT=1 skips the check on purpose (the task then
+starts inside whatever its cgroup carries): the tap tests use it to watch an already-isolated task.
 
 Creates <root>/NAME, moves *this* process into it, then execs CMD. The task and
 everything it forks stay in that cgroup from its first instruction (no race,
@@ -90,7 +91,12 @@ def main() -> int:
         return 2
     cg = CgroupRoot(os.environ.get("CORA_CGROUP_ROOT", DEFAULT_ROOT),
                     os.environ.get("CORA_CGROUP_MOUNT", DEFAULT_MOUNT))
-    refusal = preflight(cg, sys.argv[1], _firewall(cg))
+    if os.environ.get("CORA_NO_PREFLIGHT") == "1":
+        print(f"cora_run: CORA_NO_PREFLIGHT=1: starting '{sys.argv[1]}' without the containment check; it runs inside "
+              "whatever its cgroup carries", file=sys.stderr)
+        refusal = None
+    else:
+        refusal = preflight(cg, sys.argv[1], _firewall(cg))
     if refusal:
         print(f"cora_run: {refusal}", file=sys.stderr)
         return EXIT_CONTAINED

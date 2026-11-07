@@ -110,6 +110,9 @@ PAGES = {
                 ("tp", "**CORA_CGROUP_MOUNT**", "Where cgroup v2 is mounted. Default /sys/fs/cgroup."),
                 ("tp", "**CORA_NFT_TABLE**", "The nftables table the tap uses. Default cora."),
                 ("tp", "**CORA_NFLOG_GROUP**", "The NFLOG group of the tap. Must match the sentinel's."),
+                ("tp", "**CORA_NO_PREFLIGHT**", "Exactly 1 skips the containment check (exit 3) and starts the task inside whatever "
+                       "its cgroup still carries, with a warning. Containment never depended on the check; the tap tests use it to "
+                       "watch an already-isolated task."),
             ]),
             ("EXIT STATUS", [("p", "2 if //NAME// or //CMD// is missing (it prints its usage). 1 if it cannot enter the cgroup. "
                                    "3 if //NAME//'s cgroup is left over from an earlier run and still carries containment "

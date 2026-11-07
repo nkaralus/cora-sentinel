@@ -278,11 +278,15 @@ def env():
             time.sleep(0.1)
 
 
-def task(cg, fw, name, code, preinstall=True, python=None, cwd=None):
+def task(cg, fw, name, code, preinstall=True, python=None, cwd=None, contained=False):
     """Start `code` as a task. `python` is the interpreter the TASK runs (default: this one): cora-run itself always starts with this one,
-    as root, but the task may be dropped to another user, who has to be able to execute its interpreter."""
+    as root, but the task may be dropped to another user, who has to be able to execute its interpreter.
+    contained=True: the test blocked the task's cgroup FIRST, on purpose, so cora-run's pre-flight would refuse it (exit 3); the
+    test opts out with CORA_NO_PREFLIGHT=1. Only those tests: every other task here still goes through the real check."""
     e = {**os.environ, "CORA_CGROUP_ROOT": str(cg.root), "CORA_CGROUP_MOUNT": MOUNT,
          "CORA_NFT_TABLE": fw.table, "CORA_NFLOG_GROUP": str(GROUP)}
+    if contained:
+        e["CORA_NO_PREFLIGHT"] = "1"
     py = python or sys.executable
     cmd = ([sys.executable, "-m", "cora_sentinel.run", name, py, "-c", code] if preinstall
            else [py, "-c", code])
@@ -447,7 +451,7 @@ def test_an_isolated_tasks_attempts_are_still_logged(env):
     nl = NflogListener(GROUP)
     code = (f"import socket\nfor _ in range(5):\n    s=socket.socket(); s.settimeout(0.3)\n"
             f"    print(s.connect_ex(('{GW}',80)))")
-    p = task(cg, fw, "jailed", code)
+    p = task(cg, fw, "jailed", code, contained=True)
     errs = p.communicate(timeout=30)[0].split()
     seen = []
     end = time.monotonic() + 2
@@ -865,7 +869,7 @@ def test_an_isolated_tasks_udp_is_still_logged(env):
     nl = NflogListener(GROUP)
     code = (f"import socket\nfor _ in range(3):\n    s=socket.socket(2,2)\n"
             f"    try:\n        s.sendto(b'x',('{GW}',9)); print(0)\n    except OSError as e:\n        print(e.errno)")
-    errs = task(cg, fw, "jailu", code).communicate(timeout=30)[0].split()
+    errs = task(cg, fw, "jailu", code, contained=True).communicate(timeout=30)[0].split()
     seen = []
     end = time.monotonic() + 2
     while time.monotonic() < end and len(seen) < 3:
