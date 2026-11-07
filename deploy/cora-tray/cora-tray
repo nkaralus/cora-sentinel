@@ -1,0 +1,192 @@
+#!/usr/bin/python3
+"""
+cora-tray - GNOME/Ubuntu tray indicator for cora-sentinel's status feed. A thin GTK shell: every decision about what
+to show lives in cora_sentinel.uiclient (StatusClient.view, menu_spec, confirm_text), which is tested without a GUI.
+
+    cora-tray [--socket /run/cora-sentinel/ui.sock]
+
+Needs (Ubuntu): python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1, and cora-sentinel importable by the
+system python3. GNOME Shell shows tray icons only with the AppIndicator extension (Ubuntu ships it enabled:
+gnome-shell-extension-appindicator).
+
+Icon: green all clear, amber model evaluating, indigo containment active, red ALARM (see the decision log),
+grey unreachable. Grey whenever the daemon is silent: a dead daemon never looks clear.
+Breakers only tighten (sever network, cap memory) and always ask first. Undo is root-only on the command line.
+
+Testing aids (not for daily use): --dump-after SECONDS prints the rendered menu and icon, then exits;
+--press CMD:TASK presses a breaker once the task appears, with --yes to skip the confirmation dialog.
+"""
+import argparse
+import os
+import sys
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("AyatanaAppIndicator3", "0.1")
+from gi.repository import AyatanaAppIndicator3 as AppIndicator, GLib, Gtk  # noqa: E402
+
+try:
+    from cora_sentinel.uiclient import DEFAULT_SOCKET, StatusClient, confirm_text, menu_spec
+except ImportError:
+    sys.exit("cora-tray: cannot import cora_sentinel with the system python3 (install the cora-sentinel .deb, "
+             "or run with PYTHONPATH=/path/to/cora-sentinel/src)")
+
+ICONS = os.path.join(os.path.dirname(os.path.realpath(__file__)), "icons")
+for candidate in ("/usr/share/cora-sentinel/cora-tray/icons", ICONS):
+    if os.path.isdir(candidate):
+        ICONS = candidate
+        break
+TICK_MS = 250
+RECONNECT_S = 2.0
+
+
+class Tray:
+    def __init__(self, args):
+        self.args = args
+        self.client = StatusClient(args.socket)
+        self.ind = AppIndicator.Indicator.new("cora-tray", "cora-grey",
+                                              AppIndicator.IndicatorCategory.SYSTEM_SERVICES)
+        self.ind.set_icon_theme_path(ICONS)
+        self.ind.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+        self.ind.set_title("cora")
+        self.menu = Gtk.Menu()
+        self.ind.set_menu(self.menu)
+        self.icon, self.spec, self.last = None, None, None
+        self.pending = {}                      # tag -> (cmd, task)
+        self.next_connect = 0.0
+        self.pressed = False
+        self.render()
+        GLib.timeout_add(TICK_MS, self.tick)
+
+    # ---------------------------------------------------------------- loop
+    def tick(self):
+        now = GLib.get_monotonic_time() / 1e6
+        if self.client.sock is None and now >= self.next_connect:
+            self.client.connect()
+            self.next_connect = now + RECONNECT_S
+        self.client.poll()
+        for tag in [t for t in self.pending if t in self.client.results]:
+            cmd, task = self.pending.pop(tag)
+            r = self.client.results.pop(tag)
+            verb = {"sever": "severed network for", "cap": "capped memory for"}[cmd]
+            if r.get("ok"):
+                self.last = f"last: {verb} {task}"
+            else:
+                self.last = f"last: FAILED to {cmd} {task}"
+                self.error(f"Could not {cmd} \u201c{task}\u201d", r.get("error") or "unknown error")
+        self.render()
+        if self.args.press and not self.pressed:
+            self.try_scripted_press()
+        return True
+
+    def render(self):
+        v = self.client.view()
+        icon = f"cora-{v['colour']}"
+        if icon != self.icon:
+            self.ind.set_icon_full(icon, v["title"])
+            self.icon = icon
+        spec = menu_spec(v, self.last)
+        if spec == self.spec:
+            return
+        self.spec = spec
+        for child in self.menu.get_children():
+            self.menu.remove(child)
+        for item in spec:
+            kind = item[0]
+            if kind == "sep":
+                self.menu.append(Gtk.SeparatorMenuItem())
+            elif kind == "label":
+                mi = Gtk.MenuItem(label=item[1])
+                mi.set_sensitive(False)
+                self.menu.append(mi)
+            elif kind == "task":
+                _, text, breakers, name, cid = item
+                mi = Gtk.MenuItem(label=text)
+                sub = Gtk.Menu()
+                for cmd, label, enabled in breakers:
+                    b = Gtk.MenuItem(label=label)
+                    b.set_sensitive(enabled)
+                    b.connect("activate", self.on_breaker, cmd, name, cid)
+                    sub.append(b)
+                mi.set_submenu(sub)
+                self.menu.append(mi)
+            elif kind == "quit":
+                mi = Gtk.MenuItem(label=item[1])
+                mi.connect("activate", lambda *_: Gtk.main_quit())
+                self.menu.append(mi)
+        self.menu.show_all()
+
+    # ---------------------------------------------------------------- breakers
+    def on_breaker(self, _item, cmd, task, cid):
+        if not self.args.yes and not self.confirm(cmd, task):
+            return
+        tag = self.client.send(cmd, task, cid)
+        if tag is None:
+            self.error(f"Could not {cmd} \u201c{task}\u201d", self.client.error or "not connected to cora-sentinel")
+            return
+        self.pending[tag] = (cmd, task)
+        self.last = f"last: {cmd} {task}: waiting for cora-sentinel\u2026"
+        self.render()
+
+    def confirm(self, cmd, task):
+        head, body = confirm_text(cmd, task)
+        d = Gtk.MessageDialog(message_type=Gtk.MessageType.WARNING, buttons=Gtk.ButtonsType.NONE, text=head)
+        d.format_secondary_text(body)
+        d.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        ok = d.add_button({"sever": "Sever network", "cap": "Cap memory"}[cmd], Gtk.ResponseType.OK)
+        ok.get_style_context().add_class("destructive-action")
+        d.set_default_response(Gtk.ResponseType.CANCEL)          # Enter must not sever by accident
+        resp = d.run()
+        d.destroy()
+        return resp == Gtk.ResponseType.OK
+
+    def error(self, head, body):
+        if self.args.dump_after is not None:                     # headless test run: print, do not block
+            print(f"ERROR: {head}: {body}", flush=True)
+            return
+        d = Gtk.MessageDialog(message_type=Gtk.MessageType.ERROR, buttons=Gtk.ButtonsType.CLOSE, text=head)
+        d.format_secondary_text(body)
+        d.run()
+        d.destroy()
+
+    # ---------------------------------------------------------------- testing aids
+    def try_scripted_press(self):
+        cmd, _, task = self.args.press.partition(":")
+        for item in self.spec or []:
+            if item[0] == "task" and item[3] == task:
+                for c, _, enabled in item[2]:
+                    if c == cmd and enabled:
+                        self.pressed = True
+                        self.on_breaker(None, cmd, task, item[4])
+
+    def dump(self):
+        print(f"ICON {self.icon}")
+        for mi in self.menu.get_children():
+            if isinstance(mi, Gtk.SeparatorMenuItem):
+                print("  ----")
+                continue
+            print(f"  [{'x' if mi.get_sensitive() else ' '}] {mi.get_label()}")
+            sub = mi.get_submenu()
+            for b in (sub.get_children() if sub else []):
+                print(f"        [{'x' if b.get_sensitive() else ' '}] {b.get_label()}")
+        sys.stdout.flush()
+        Gtk.main_quit()
+        return False
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="cora-tray")
+    ap.add_argument("--socket", default=DEFAULT_SOCKET)
+    ap.add_argument("--dump-after", type=float, default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--press", default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--yes", action="store_true", help=argparse.SUPPRESS)
+    args = ap.parse_args()
+    tray = Tray(args)
+    if args.dump_after is not None:
+        GLib.timeout_add(int(args.dump_after * 1000), tray.dump)
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

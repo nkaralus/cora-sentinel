@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=cora-tray
+Comment=cora-sentinel status and emergency breakers
+Exec=cora-tray
+Icon=security-high
+Terminal=false
+Categories=System;Security;
+X-GNOME-Autostart-enabled=true
