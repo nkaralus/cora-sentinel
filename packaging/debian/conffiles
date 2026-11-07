@@ -2,3 +2,4 @@
 /etc/cora-sentinel/blocklists/00-local.txt
 /etc/cora-sentinel/allow/00-local.txt
 /etc/logrotate.d/cora-sentinel
+/etc/xdg/autostart/cora-tray.desktop

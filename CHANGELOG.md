@@ -1,5 +1,82 @@
 # Changelog
 
+## 0.10.0
+
+### Added
+- **A status feed for desktop clients** (`cora-sentinel --ui-socket PATH --ui-group GROUP`, `cora_sentinel/uihub.py`).
+  Newline-delimited JSON over a Unix socket: a state message on every change (at most 4 a second) and a heartbeat every
+  2 s. The daemon never waits on a client: a slow or flooding one is dropped, and at most 8 connect.
+  - Status precedence: **alarm** (an event dropped uncontained, or an action failed, this session; it stays until the
+    daemon restarts, so it cannot heal itself and hide the event that mattered) > **contained** > **evaluating** (the
+    model's queue) > **clear**.
+  - Per task: memory (`memory.current`) and its change since the task was first seen; per session: blocklist hits,
+    community-list hits apart.
+  - The socket lives in `/run/cora-sentinel` (the unit's `RuntimeDirectory`), never in `/tmp`, where any local user
+    could create the path first and impersonate the daemon. It is created 0600 and opened to the group as 0660; the
+    hub refuses a world-writable directory or a path that is not its own socket. Each client's uid is logged.
+  - `cora_sentinel/uiclient.py`: the client core and a terminal HUD (`python3 -m cora_sentinel.uiclient`). Silence or
+    no connection is **unreachable**, never the last colour: a dead daemon never looks clear.
+- **Emergency breakers: a one-way ratchet.** A client may send only `sever` (ISOLATE: nft drops the task's egress) or
+  `cap` (THROTTLE: `memory.high` = current, `cpu.max` 20%). Nothing that loosens exists on the socket; undo stays
+  root-only on the command line. A press is accepted from uid 0 or a member of `--ui-group` (checked with
+  `SO_PEERCRED`, on top of the socket's mode), for a live task that is still the same cgroup as in the snapshot, at
+  most once a second per client and four at once, in its own thread so a slow nft never stalls the feed. It acts even
+  when the daemon is in dry-run, as an explicit human override, recorded in the decision log as
+  `"policy": "manual_operator_override"` with the operator's uid. A failed press is reported to the operator and is not
+  turned into the session alarm.
+- **`cora-tray`**, the GNOME indicator (`deploy/cora-tray/`; GTK 3 + Ayatana AppIndicator). Five shield icons, each
+  with its own symbol as well as its colour: green all clear, amber evaluating, indigo containment, red alarm, grey
+  unreachable. Per task: memory and its change, and the two breakers, offered only while not already in force. Every
+  press asks first (Cancel is the default, so Enter cannot sever) and the dialog names the root-only undo.
+- **`cora-cgroup reset NAME`**: undoes THROTTLE. Before it, nothing could take back a memory cap short of editing the
+  cgroup files; it is the undo the tray's "Cap memory" dialog names.
+- **The `cora` group** is created by `deploy/install-service.sh` and by the `.deb`'s `postinst` (both idempotent), and
+  the shipped config now ends with `--ui-socket /run/cora-sentinel/ui.sock --ui-group cora`: the daemon refuses to
+  start if `--ui-group` names a missing group. **Nobody is added to it**: membership can press the breakers, so it is
+  granted by hand (`usermod -aG cora USER`); a test fails if either installer ever runs `usermod`, `gpasswd` or
+  `adduser`. An existing config is never edited (the installer prints the two flags if they are missing). Removal and
+  purge keep the group, and say so.
+- **`cora-run` refuses to relaunch into a cgroup that still carries containment** (exit 3). Task cgroups are never
+  removed and `cora-run` reuses them, so a relaunch under the same name inherited the old nft rule, freeze or limits
+  and started already severed, with nothing saying why. It now stops before creating, moving or executing anything:
+  `task '<name>' is currently isolated in nftables; release it first with 'sudo cora-firewall release <name>'` (and
+  the same for frozen, `cora-cgroup thaw`, and throttled, `cora-cgroup reset`). A rule for an older cgroup of the name
+  does not block. If the firewall cannot be read it warns and starts: containment never depended on this check (the
+  kernel rule still matches a reused cgroup); it only stops a silent failure.
+- **Packaging**: the `.deb` now ships `cora-tray` (`/usr/share/cora-sentinel/cora-tray/`, with `/usr/bin/cora-tray` a
+  symlink so it finds its icons), `/usr/share/applications/cora-tray.desktop`, a hicolor icon, and
+  `/etc/xdg/autostart/cora-tray.desktop` (a conffile) that starts `cora-tray --autostart`, which exits quietly for an
+  account outside group `cora` or without GTK. The GTK stack is only **Suggested**: a server never pulls in a desktop.
+  It also ships `cora-sync.service` and `cora-sync.timer`, which 0.9.0's `.deb` was missing (only
+  `install-service.sh` installed them).
+
+### Fixed
+- **The tray reported what the decision log said, not what the kernel held.** Found live: after a manual Sever,
+  `sudo cora-firewall release traytest` restored the network, but the tray stayed indigo `[ISOLATE]` for the whole
+  window. The hub now reads, on every update, the nft rules over netlink (ISOLATE only if the rule names the task's
+  *current* cgroup id), `cpu.max` / `memory.high` (THROTTLE) and `cgroup.freeze` (SUSPEND); the decision log only adds
+  what the model *would* have done in dry-run. An unreadable firewall is reported as unknown (`[ISOLATE?]`), never as
+  in force. Verified live: the tray turns green within 2 s of a command-line release. A task whose processes have all
+  exited is marked `exited`, since its cgroup, and any block on it, persists.
+- **"WOULD contain (dry-run: nothing was done)" after a real manual sever.** Found by running the tray: in dry-run the
+  label treated every containment as hypothetical. Real containment is now reported apart (`enforced`), and the label
+  follows it.
+- **The tray hid "Sever" on a task the model had only would-have isolated** in dry-run: a breaker greys out only once it
+  is really in force.
+- **A relaunch under the same name could inherit an earlier run's containment in the tray's view** if it happened
+  between two snapshots: containment is keyed on the kernel cgroup id, not the name.
+- **The breaker tests only passed as root.** The fixture built a root-only hub, so as uid 1000 every press was refused
+  (13 failures on a workstation). The fixture now uses the runner's group; the refusal tests keep a real non-member.
+
+### Checked
+- Live on Ubuntu GNOME: the service publishing to `/run/cora-sentinel/ui.sock` (0660 root:cora), the tray going green,
+  a dummy task (`cora-run traytest`) appearing with its memory, Sever and Cap acting, a command-line release turning
+  the tray green, and a relaunch into an isolated cgroup refused with exit 3.
+- The tray run for real under Xvfb from the repository and from the built `.deb` (through the `/usr/bin` symlink); the
+  desktop files pass `desktop-file-validate`.
+- Every safety rule of the feed, the breakers, the reconciliation and the pre-flight was disabled in turn, and each one
+  fails at least one test. The suite passes as root and as an unprivileged user.
+
 ## 0.9.0
 
 ### Added

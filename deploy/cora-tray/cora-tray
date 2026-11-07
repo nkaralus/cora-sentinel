@@ -17,14 +17,19 @@ Testing aids (not for daily use): --dump-after SECONDS prints the rendered menu 
 --press CMD:TASK presses a breaker once the task appears, with --yes to skip the confirmation dialog.
 """
 import argparse
+import grp
 import os
 import sys
 
-import gi
+GTK_ERROR = None
+try:
+    import gi
 
-gi.require_version("Gtk", "3.0")
-gi.require_version("AyatanaAppIndicator3", "0.1")
-from gi.repository import AyatanaAppIndicator3 as AppIndicator, GLib, Gtk  # noqa: E402
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("AyatanaAppIndicator3", "0.1")
+    from gi.repository import AyatanaAppIndicator3 as AppIndicator, GLib, Gtk  # noqa: E402
+except (ImportError, ValueError) as e:                   # ValueError: gi present, a typelib missing
+    GTK_ERROR = e
 
 try:
     from cora_sentinel.uiclient import DEFAULT_SOCKET, StatusClient, confirm_text, menu_spec
@@ -175,18 +180,41 @@ class Tray:
         return False
 
 
+GTK_HINT = ("sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 "
+            "gnome-shell-extension-appindicator")
+
+
+def member_of(group="cora"):
+    """True for root, for a member of the group, and when the group does not exist (a custom --ui-group setup)."""
+    if os.getuid() == 0:
+        return True
+    try:
+        return grp.getgrnam(group).gr_gid in os.getgroups()
+    except KeyError:
+        return True
+
+
 def main():
     ap = argparse.ArgumentParser(prog="cora-tray")
     ap.add_argument("--socket", default=DEFAULT_SOCKET)
+    ap.add_argument("--autostart", action="store_true",
+                    help="started by the session: exit quietly if you are not in group cora or GTK is missing")
     ap.add_argument("--dump-after", type=float, default=None, help=argparse.SUPPRESS)
     ap.add_argument("--press", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--yes", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
+    if args.autostart and not member_of():
+        return 0                                         # every account gets the autostart entry; only cora shows it
+    if GTK_ERROR is not None:
+        if args.autostart:
+            return 0
+        sys.exit(f"cora-tray: GTK or the Ayatana indicator is missing ({GTK_ERROR}).\n  {GTK_HINT}")
     tray = Tray(args)
     if args.dump_after is not None:
         GLib.timeout_add(int(args.dump_after * 1000), tray.dump)
     Gtk.main()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

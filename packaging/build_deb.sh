@@ -3,8 +3,8 @@
 #
 #   packaging/build_deb.sh [--wheel PATH] [--out DIR] [--revision N]
 #
-# The package is the wheel unpacked into /usr/lib/python3/dist-packages plus /usr/bin wrappers, the systemd unit
-# (deploy/cora-sentinel.service with @BINDIR@ = /usr/bin), the config and logrotate files as conffiles, docs, and the
+# The package is the wheel unpacked into /usr/lib/python3/dist-packages plus /usr/bin wrappers, the systemd units
+# (cora-sentinel.service, cora-sync.service/.timer, @BINDIR@ = /usr/bin), cora-tray under /usr/share/cora-sentinel, the config and logrotate files as conffiles, docs, and the
 # maintainer scripts in packaging/debian. It is Architecture: all with no Python dependencies: the safety gate is vendored.
 #
 # Reproducible: the same wheel and the same SOURCE_DATE_EPOCH give the same bytes. Default epoch: the last commit's time
@@ -73,6 +73,21 @@ PY
 
 # ---- service, config (conffiles), logrotate (conffile), docs -------------------------------------------------------
 sed 's|@BINDIR@|/usr/bin|g' "$repo/deploy/cora-sentinel.service" > "$stage/usr/lib/systemd/system/cora-sentinel.service"
+# signed community lists: installed, never enabled (systemctl enable --now cora-sync.timer once the key is pinned)
+sed 's|@BINDIR@|/usr/bin|g' "$repo/deploy/cora-sync.service" > "$stage/usr/lib/systemd/system/cora-sync.service"
+cp "$repo/deploy/cora-sync.timer" "$stage/usr/lib/systemd/system/cora-sync.timer"
+
+# ---- cora-tray: the GNOME indicator. Its GTK libraries are only Suggested, so a server never pulls in a desktop stack.
+tray="$stage/usr/share/cora-sentinel/cora-tray"
+mkdir -p "$tray/icons" "$stage/usr/share/applications" "$stage/etc/xdg/autostart" "$stage/usr/share/icons/hicolor/scalable/apps"
+cp "$repo/deploy/cora-tray/cora-tray" "$tray/cora-tray"
+cp "$repo"/deploy/cora-tray/icons/*.svg "$tray/icons/"
+ln -s ../share/cora-sentinel/cora-tray/cora-tray "$stage/usr/bin/cora-tray"      # a symlink: the script finds its icons
+cp "$repo/deploy/cora-tray/icons/cora-green.svg" "$stage/usr/share/icons/hicolor/scalable/apps/cora-tray.svg"
+cp "$repo/deploy/cora-tray/cora-tray.desktop" "$stage/usr/share/applications/cora-tray.desktop"
+# autostart for every user, but cora-tray --autostart exits quietly for anyone not in group cora (and without GTK)
+sed 's|^Exec=cora-tray$|Exec=cora-tray --autostart|' "$repo/deploy/cora-tray/cora-tray.desktop" > "$stage/etc/xdg/autostart/cora-tray.desktop"
+cp "$repo/deploy/cora-tray/README.md" "$doc/cora-tray.md"
 cp "$repo/deploy/cora-sentinel.conf" "$stage/etc/cora-sentinel/cora-sentinel.conf"
 cp "$repo/deploy/cora-sentinel.logrotate" "$stage/etc/logrotate.d/cora-sentinel"
 # The directories the suggested --blocklist / --blocklist-allow flags point at, each with an INERT template (it blocks and allows
@@ -127,6 +142,7 @@ cp "$here/debian/conffiles" "$stage/DEBIAN/conffiles"
 install -m 0755 "$here/debian/postinst" "$here/debian/prerm" "$here/debian/postrm" "$stage/DEBIAN/"
 find "$stage" -type d -exec chmod 0755 {} +
 find "$stage" -type f ! -path "$stage/DEBIAN/*" ! -path "$stage/usr/bin/*" -exec chmod 0644 {} +
+chmod 0755 "$tray/cora-tray"
 # md5sums for everything dpkg does not track as a conffile, so `dpkg -V cora-sentinel` can verify an install
 ( cd "$stage" && find . -type f ! -path './DEBIAN/*' | sed 's|^\./||' | LC_ALL=C sort \
     | grep -vxFf <(sed 's|^/||' "$here/debian/conffiles") | xargs -d '\n' md5sum > DEBIAN/md5sums )
@@ -139,7 +155,7 @@ Maintainer: ${maint}
 Installed-Size: ${size}
 Depends: python3 (>= 3.10), nftables
 Recommends: logrotate
-Suggests: systemd
+Suggests: systemd, python3-gi, gir1.2-gtk-3.0, gir1.2-ayatanaappindicator3-0.1, gnome-shell-extension-appindicator
 Section: admin
 Priority: optional
 Homepage: https://github.com/nkaralus/cora-sentinel
@@ -155,6 +171,10 @@ Description: out-of-band security sentinel for Linux
  .
  Running the local model needs llama-cpp-python, which is not in the Ubuntu
  archive: see /usr/share/doc/cora-sentinel/packaging.md.
+ .
+ cora-tray, a GNOME indicator for the status feed with tighten-only breakers,
+ runs for members of group cora (created on install; nobody is added) and
+ needs the suggested GTK packages: see /usr/share/doc/cora-sentinel/cora-tray.md.
 CTRL
 chmod 0644 "$stage/DEBIAN/control" "$stage/DEBIAN/conffiles" "$stage/DEBIAN/md5sums"
 

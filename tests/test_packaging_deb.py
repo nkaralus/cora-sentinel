@@ -199,6 +199,10 @@ def test_control_metadata(ctl):
     assert c["Recommends"] == "logrotate" and c["Section"] == "admin" and c["Installed-Size"].isdigit()
     assert re.fullmatch(r".+ <[^@\s]+@[^@\s]+>", c["Maintainer"])
     assert "NOT start" in c["Description"] and "llama-cpp-python" in c["Description"]
+    # the tray's GTK stack is only Suggested: a server must never pull in a desktop
+    assert c["Suggests"] == ("systemd, python3-gi, gir1.2-gtk-3.0, gir1.2-ayatanaappindicator3-0.1, "
+                             "gnome-shell-extension-appindicator")
+    assert "gtk" not in c["Depends"].lower() and "gtk" not in c.get("Recommends", "").lower()
 
 
 @have_tools
@@ -208,10 +212,11 @@ def test_the_maintainer_email_can_be_overridden(wheel, tmp_path):
 
 
 @have_tools
-def test_conffiles_are_the_config_the_two_list_templates_and_the_logrotate_file_and_nothing_else(ctl, data):
+def test_conffiles_are_the_config_the_two_list_templates_the_logrotate_file_and_the_tray_autostart(ctl, data):
     listed = (ctl / "conffiles").read_text().split()
     assert listed == ["/etc/cora-sentinel/cora-sentinel.conf", "/etc/cora-sentinel/blocklists/00-local.txt",
-                      "/etc/cora-sentinel/allow/00-local.txt", "/etc/logrotate.d/cora-sentinel"]
+                      "/etc/cora-sentinel/allow/00-local.txt", "/etc/logrotate.d/cora-sentinel",
+                      "/etc/xdg/autostart/cora-tray.desktop"]
     assert all((data / p.lstrip("/")).is_file() for p in listed)
     assert sorted(str(p.relative_to(data)) for p in (data / "etc").rglob("*") if p.is_file()) == sorted(l.lstrip("/") for l in listed)
 
@@ -245,10 +250,15 @@ def test_nothing_that_is_not_the_product_is_in_the_package(data):
 @have_tools
 def test_every_entry_is_owned_by_root_with_sane_modes(deb):
     for line in sh("dpkg-deb", "-c", str(deb)).stdout.splitlines():
-        perm, owner, *_ , path = line.split()
+        perm, owner, *rest = line.split()
+        path = rest[-3] if perm.startswith("l") else rest[-1]          # "a -> b" for a symlink
         assert owner == "root/root", line
         if path.endswith("/"):
             assert perm == "drwxr-xr-x", line
+        elif path == "./usr/bin/cora-tray":
+            assert perm == "lrwxrwxrwx", line
+        elif path == "./usr/share/cora-sentinel/cora-tray/cora-tray":
+            assert perm == "-rwxr-xr-x", line
         elif path.startswith("./usr/bin/"):
             assert perm == "-rwxr-xr-x", line
         else:
@@ -330,7 +340,9 @@ def test_the_copyright_file_credits_both_licenses_and_names_the_vendored_commit(
 def test_md5sums_cover_every_file_except_the_conffiles_and_are_right(ctl, data):
     lines = (ctl / "md5sums").read_text().splitlines()
     got = {l.split("  ", 1)[1]: l.split("  ", 1)[0] for l in lines}
-    files = {p.relative_to(data).as_posix() for p in data.rglob("*") if p.is_file()} - {"etc/cora-sentinel/blocklists/00-local.txt", "etc/cora-sentinel/allow/00-local.txt", "etc/cora-sentinel/cora-sentinel.conf", "etc/logrotate.d/cora-sentinel"}
+    conffiles = {l.lstrip("/") for l in (ctl / "conffiles").read_text().split()}
+    # dpkg checksums regular files only: a symlink (/usr/bin/cora-tray) has no md5sums line
+    files = {p.relative_to(data).as_posix() for p in data.rglob("*") if p.is_file() and not p.is_symlink()} - conffiles
     assert set(got) == files
     assert all(hashlib.md5((data / f).read_bytes()).hexdigest() == h for f, h in got.items())
 
@@ -356,6 +368,59 @@ def test_the_scripts_are_posix_sh_and_parse(name):
     assert name != "postinst" or "try-restart" in code                                    # the only start it may do: an upgrade of a running one
 
 
+@have_tools
+def test_the_sync_units_ship_and_point_at_usr_bin(data):
+    svc = (data / "usr/lib/systemd/system/cora-sync.service").read_text()
+    assert "ExecStart=/usr/bin/cora-blocklist --dir /var/lib/cora-sentinel/blocklists sync" in svc and "@BINDIR@" not in svc
+    assert "OnUnitActiveSec=6h" in (data / "usr/lib/systemd/system/cora-sync.timer").read_text()
+
+
+@have_tools
+def test_cora_tray_ships_with_its_icons_on_path_and_in_the_menus(data):
+    tray = data / "usr/share/cora-sentinel/cora-tray"
+    assert os.access(tray / "cora-tray", os.X_OK) and (tray / "cora-tray").read_text().startswith("#!/usr/bin/python3\n")
+    assert sorted(p.name for p in (tray / "icons").iterdir()) == [f"cora-{c}.svg" for c in
+                                                                  ("amber", "green", "grey", "indigo", "red")]
+    link = data / "usr/bin/cora-tray"
+    assert link.is_symlink() and os.readlink(link) == "../share/cora-sentinel/cora-tray/cora-tray"
+    assert link.resolve() == (tray / "cora-tray").resolve()      # so the script's realpath finds icons/ beside it
+    app = (data / "usr/share/applications/cora-tray.desktop").read_text()
+    auto = (data / "etc/xdg/autostart/cora-tray.desktop").read_text()
+    assert "Exec=cora-tray\n" in app and "Exec=cora-tray --autostart\n" in auto
+    assert (data / "usr/share/icons/hicolor/scalable/apps/cora-tray.svg").is_file()
+    assert (data / "usr/share/doc/cora-sentinel/cora-tray.md").is_file()
+
+
+@have_tools
+def test_the_shipped_desktop_files_validate(data):
+    v = shutil.which("desktop-file-validate")
+    if not v:
+        pytest.skip("needs desktop-file-validate")
+    for p in ("usr/share/applications/cora-tray.desktop", "etc/xdg/autostart/cora-tray.desktop"):
+        r = sh(v, str(data / p))
+        assert r.returncode == 0 and not r.stdout.strip(), r.stdout
+
+
+def test_postinst_creates_the_cora_group_once_and_adds_nobody(tmp_path):
+    rc, out, calls = Box(tmp_path).run("postinst", "configure")
+    assert rc == 0 and "addgroup --system --quiet cora" in calls
+    assert "usermod -aG cora" in out                                      # told, not done
+    code = (DEB_DIR / "postinst").read_text()
+    assert not re.search(r"^\s*(usermod|gpasswd|adduser)\b", code, re.M)
+
+
+def test_postinst_leaves_an_existing_cora_group_alone(tmp_path):
+    box = Box(tmp_path)
+    box.env["STUB_GROUP"] = "1"
+    rc, _, calls = box.run("postinst", "configure")
+    assert rc == 0 and not [c for c in calls if c.startswith("addgroup")]
+
+
+def test_purge_keeps_the_group_and_says_so(tmp_path):
+    rc, out, calls = Box(tmp_path).run("postrm", "purge")
+    assert rc == 0 and "kept the group cora" in out and not [c for c in calls if c.startswith(("delgroup", "groupdel"))]
+
+
 class Box:
     """A scratch root for one script run: stub commands that log their calls, and the script's absolute paths redirected."""
 
@@ -373,6 +438,8 @@ class Box:
                     '[ "$STUB_TABLE" = chains ] && printf "table inet cora {\\n\\tchain egress {\\n\\t}\\n}\\n" && exit 0; '
                     '[ "$STUB_TABLE" = empty ] && printf "table inet cora {\\n}\\n" && exit 0; exit 1 ;; esac')
         stub("cora-floor", "exit 0")
+        stub("getent", '[ -n "$STUB_GROUP" ]')            # never the host's group database
+        stub("addgroup", "exit 0")
         self.env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", STUB_ACTIVE="1" if active else "", STUB_TABLE=table or "")
 
     @staticmethod
