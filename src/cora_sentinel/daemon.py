@@ -925,7 +925,7 @@ def main() -> int:
             print(f"[ui] manual: {line}", file=sys.stderr, flush=True)
 
         hub = Hub(a.ui_socket, a.ui_group, mode,
-                  tasks=cgroup_tasks(cg) if cg else None,
+                  tasks=cgroup_tasks(cg, fw) if cg else None,
                   evaluating=lambda: adj_ref["adj"].pending() if adj_ref["adj"] else 0,
                   cgroup_id=cg.cgroup_id if cg else None,
                   act=manual_act, record=manual_record)

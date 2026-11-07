@@ -12,6 +12,12 @@ lock for microseconds and return. Every client gets newline-delimited JSON:
 sent on every change (at most 4 a second) and as a heartbeat every 2 s even when nothing changed. A client that hears
 nothing for longer than STALE_AFTER_S must show "unreachable", never the last colour: a dead daemon must not look clear.
 
+What is IN FORCE comes from the kernel, not from the decision log: a task is ISOLATEd if the nft chain holds a
+"cora:<task>:<cgroup id>" rule for its CURRENT cgroup, THROTTLEd if cpu.max or memory.high is not "max", SUSPENDed if
+cgroup.freeze is 1. So an operator's `cora-firewall release` / `cora-cgroup reset` / `thaw` on the command line shows
+up within one update, and a block made outside the daemon shows up too. The decision log only adds what the model
+WOULD have done in dry-run. If the firewall cannot be read, ISOLATE is reported as unknown (never as in force).
+
 Status precedence (the worst wins):
   alarm       an event was DROPPED without being contained, or an action FAILED, this session (stays until restart:
               the operator has to look at the log; a light that heals itself hides exactly the event that mattered)
@@ -173,17 +179,25 @@ class Hub:
                 if name not in live:
                     del self._baseline[name]
             tasks = []
+            truth_errors: set = set()
             for name in sorted(live):
                 info = live[name]
                 mem = info.get("mem_bytes")
                 if mem is not None:
                     self._baseline.setdefault(name, mem)
+                marks = self._contained[name][1] if name in self._contained else {}
+                if "enforced" in info:                   # the kernel's word: what is in force right now
+                    enforced = sorted(info["enforced"])
+                else:                                    # no kernel reader (tests, or no cgroup tree): the log's word
+                    enforced = sorted(v for v, k in marks.items() if k == "done")
+                would = sorted(v for v, k in marks.items() if k == "dry-run")
                 tasks.append({"name": name, "cgroup_id": info.get("id"), "pids": info.get("pids", 0), "mem_bytes": mem,
                               "mem_delta_bytes": None if mem is None else mem - self._baseline[name],
-                              "contained": sorted(self._contained[name][1]) if name in self._contained else [],
-                              # what was really done (not dry-run): the tray offers a breaker only if it is not here
-                              "enforced": sorted(v for v, k in self._contained[name][1].items() if k == "done")
-                                          if name in self._contained else []})
+                              "contained": sorted(set(enforced) | set(would)),
+                              # really in force (not dry-run): the tray offers a breaker only if it is not here
+                              "enforced": enforced,
+                              "unknown": sorted(info.get("unknown", []))})
+                truth_errors.update(info.get("errors", []))
             s = dict(self.session)
             if s["dropped_uncontained"] or s["failed_actions"]:
                 status = "alarm"
@@ -196,7 +210,7 @@ class Hub:
             self._seq += 1
             return {"schema": SCHEMA, "type": "state", "seq": self._seq, "ts": _now_iso(), "status": status,
                     "mode": self.mode, "evaluating": evaluating, "tasks": tasks, "session": s,
-                    "breakers": sorted(COMMANDS) if self._act else []}
+                    "breakers": sorted(COMMANDS) if self._act else [], "truth_errors": sorted(truth_errors)}
 
     # ------------------------------------------------------------------ socket
     def start(self) -> None:
@@ -443,24 +457,59 @@ class Hub:
                 pass
 
 
-def cgroup_tasks(cg) -> Callable[[], Dict[str, dict]]:
-    """Live tasks and their memory, read from the cgroup tree (memory.current is the whole subtree)."""
+def _limited(text: str) -> bool:
+    first = (text.split() or ["max"])[0]
+    return first != "max"
+
+
+def cgroup_tasks(cg, fw=None) -> Callable[[], Dict[str, dict]]:
+    """Live tasks, their memory, and what is IN FORCE on each, read from the kernel: the nft rules (over netlink, one
+    read per call) and each task's cpu.max, memory.high and cgroup.freeze. memory.current is the whole subtree."""
     def read() -> Dict[str, dict]:
         out = {}
         try:
             names = cg.names()
         except OSError:
             return out
+        rules, fw_error = {}, None
+        if fw is not None:
+            try:
+                rules = fw.rules()
+            except Exception as e:                       # unreadable is NOT "not isolated": say we do not know
+                fw_error = f"firewall unreadable ({e.__class__.__name__})"
         for name in names:
+            d = cg._dir(name)
             mem = None
             try:
-                mem = int((cg._dir(name) / "memory.current").read_text())
+                mem = int((d / "memory.current").read_text())
             except (OSError, ValueError):
                 pass
             try:
                 pids = len(cg.pids(name))
             except OSError:
                 pids = 0
-            out[name] = {"pids": pids, "mem_bytes": mem, "id": cg.cgroup_id(name)}
+            cid = cg.cgroup_id(name)
+            enforced, unknown, errors = set(), set(), []
+            if fw_error:
+                unknown.add("ISOLATE")
+                errors.append(fw_error)
+            else:
+                r = rules.get(name)
+                # a rule made for an OLDER cgroup of this name does not hold this one (gc removes it soon)
+                if r is not None and (r.get("cgid") is None or r.get("cgid") == cid):
+                    enforced.add("ISOLATE")
+            for fname in ("cpu.max", "memory.high"):
+                try:
+                    if _limited((d / fname).read_text()):
+                        enforced.add("THROTTLE")
+                except OSError:
+                    pass
+            try:
+                if (d / "cgroup.freeze").read_text().strip() == "1":
+                    enforced.add("SUSPEND")
+            except OSError:
+                pass
+            out[name] = {"pids": pids, "mem_bytes": mem, "id": cid, "enforced": sorted(enforced),
+                         "unknown": sorted(unknown), "errors": errors}
         return out
     return read

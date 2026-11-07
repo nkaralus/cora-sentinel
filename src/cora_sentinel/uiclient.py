@@ -149,15 +149,20 @@ class StatusClient:
         breakers = set(s.get("breakers") or [])
         tasks = [{"name": t["name"], "cgroup_id": t.get("cgroup_id"),
                   "line": f"{t['name']}: {human_bytes(t.get('mem_bytes'))} ({human_bytes(t.get('mem_delta_bytes'), True)})"
-                          + (f" [{', '.join(t['contained'])}]" if t.get("contained") else ""),
+                          + (f" [{', '.join(t['contained'])}]" if t.get("contained") else "")
+                          + (f" [{', '.join(u + '?' for u in t['unknown'])}]" if t.get("unknown") else "")
+                          + (" \u2014 exited" if t.get("pids") == 0 else ""),
                   # offered only if the daemon has the breaker AND it is not already in force on this task
                   "can_sever": "sever" in breakers and "ISOLATE" not in (t.get("enforced") or []),
                   "can_cap": "cap" in breakers and "THROTTLE" not in (t.get("enforced") or [])}
                  for t in s.get("tasks", [])]
         alarm_bits = [f"{sess.get(k)} {w}" for k, w in (("dropped_uncontained", "dropped uncontained"),
                                                           ("failed_actions", "failed actions")) if sess.get(k)]
+        detail = ", ".join(alarm_bits) or f"{sess.get('community_blocked', 0)} community trackers blocked"
+        if s.get("truth_errors"):
+            detail += " | " + "; ".join(s["truth_errors"])
         return {"status": st, "colour": COLOURS.get(st, "grey"), "title": f"cora: {label}",
-                "detail": ", ".join(alarm_bits) or f"{sess.get('community_blocked', 0)} community trackers blocked",
+                "detail": detail,
                 "mode": mode, "tasks": tasks, "session": sess}
 
 
