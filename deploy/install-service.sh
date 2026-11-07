@@ -4,7 +4,12 @@
 #   sudo deploy/install-service.sh [--bindir DIR]       install (default DIR: where `cora-sentinel` is on PATH)
 #   sudo deploy/install-service.sh --uninstall [--remove-floor]
 #
-# CORA_ROOT=/some/prefix installs under that prefix and skips systemctl (used by the tests).
+# CORA_ROOT=/some/prefix installs under that prefix and skips systemctl and groupadd (used by the tests).
+#
+# Creates the system group `cora` (idempotent): the default config publishes cora-tray's status feed to it with
+# --ui-socket /run/cora-sentinel/ui.sock --ui-group cora, and the daemon refuses to start if that group is missing.
+# It adds NOBODY to the group: membership lets a user read the status AND press the tray's breakers (sever a task's
+# network, cap its memory), so it is granted by hand:  usermod -aG cora USER
 set -euo pipefail
 
 root="${CORA_ROOT:-}"
@@ -25,6 +30,10 @@ done
 
 if [ -z "$root" ] && [ "$(id -u)" -ne 0 ]; then echo "run as root" >&2; exit 1; fi
 sc() { [ -n "$root" ] || systemctl "$@"; }
+ensure_group() {
+  if [ -n "$root" ]; then echo "CORA_ROOT set: not creating the system group cora"; return; fi
+  if getent group cora >/dev/null; then echo "group cora exists"; else groupadd --system cora && echo "created system group cora"; fi
+}
 
 if [ "$mode" = uninstall ]; then
   sc disable --now cora-sync.timer 2>/dev/null || true
@@ -40,6 +49,7 @@ if [ "$mode" = uninstall ]; then
     echo "The kernel floor is still in place if it was confirmed. Remove it with: cora-floor remove"
   fi
   echo "Unit removed. $conf_dir and /var/lib/cora-sentinel are left alone."
+  echo "The group cora is left alone too (users may still be in it): groupdel cora when nothing uses it."
   exit 0
 fi
 
@@ -57,8 +67,12 @@ install -m 0644 "$here/cora-sync.timer" "$unit_dir/cora-sync.timer"
 chmod 0644 "$unit_dir/cora-sync.service"
 install -d -m 0755 "$root/etc/logrotate.d"
 install -m 0644 "$here/cora-sentinel.logrotate" "$root/etc/logrotate.d/cora-sentinel"
+ensure_group
 if [ -e "$conf_dir/cora-sentinel.conf" ]; then
   echo "kept your existing $conf_dir/cora-sentinel.conf"
+  if ! grep -q -- '--ui-socket' "$conf_dir/cora-sentinel.conf"; then
+    echo "  it has no --ui-socket: for cora-tray, add to CORA_ARGS  --ui-socket /run/cora-sentinel/ui.sock --ui-group cora"
+  fi
 else
   install -m 0640 "$here/cora-sentinel.conf" "$conf_dir/cora-sentinel.conf"
 fi
@@ -79,6 +93,8 @@ Next:
   2. systemctl enable --now cora-sentinel
   3. cora-floor confirm        # within the --floor-confirm window, the first time (and when the allow set changes)
   Logs: journalctl -u cora-sentinel -f
+cora-tray (the GNOME indicator; deploy/cora-tray/README.md):
+  usermod -aG cora ${SUDO_USER:-YOUR_USER}     # lets that user read the status AND press the breakers; log out and in
 Signed community lists (optional; installed, not enabled):
   install -o root -m 0644 cora-security.pub $conf_dir/cora-security.pub     # the minisign PUBLIC key
   add  --blocklist-store /var/lib/cora-sentinel/blocklists  to CORA_ARGS, restart cora-sentinel

@@ -232,3 +232,49 @@ def test_systemd_accepts_the_sync_units(tmp_path, stubbin):
     r = subprocess.run(["systemd-analyze", "verify", str(units / "cora-sync.service"), str(units / "cora-sync.timer")],
                        capture_output=True, text=True)
     assert "cora-sync" not in r.stderr, r.stderr
+
+
+# ---------------------------------------------------------------- cora-tray's status feed
+
+def test_the_shipped_config_publishes_the_tray_feed_where_the_unit_creates_its_directory():
+    args = conf_args()
+    i = args.index("--ui-socket")
+    assert args[i + 1] == "/run/cora-sentinel/ui.sock" and args[args.index("--ui-group") + 1] == "cora"
+    assert keys("Service", "RuntimeDirectory") == ["cora-sentinel"] and keys("Service", "RuntimeDirectoryMode") == ["0755"]
+
+
+@pytest.mark.skipif(not shutil.which("bash"), reason="needs bash")
+def test_install_handles_the_group_without_touching_the_host_under_cora_root(tmp_path, stubbin):
+    r = run_install(tmp_path / "root", "--bindir", str(stubbin))
+    assert r.returncode == 0, r.stderr
+    assert "not creating the system group cora" in r.stdout
+    assert "usermod -aG cora" in r.stdout and "press the breakers" in r.stdout   # granted by hand, never automatically
+    assert "--ui-group cora" in (tmp_path / "root/etc/cora-sentinel/cora-sentinel.conf").read_text()
+
+
+@pytest.mark.skipif(not shutil.which("bash"), reason="needs bash")
+def test_install_tells_an_existing_config_how_to_turn_the_feed_on_and_never_edits_it(tmp_path, stubbin):
+    root = tmp_path / "root"
+    conf = root / "etc/cora-sentinel/cora-sentinel.conf"
+    conf.parent.mkdir(parents=True)
+    conf.write_text("CORA_ARGS=--my-edit\n")
+    r = run_install(root, "--bindir", str(stubbin))
+    assert r.returncode == 0 and "it has no --ui-socket" in r.stdout
+    assert conf.read_text() == "CORA_ARGS=--my-edit\n"
+    conf.write_text("CORA_ARGS=--ui-socket /run/cora-sentinel/ui.sock --ui-group cora\n")
+    assert "it has no --ui-socket" not in run_install(root, "--bindir", str(stubbin)).stdout
+
+
+@pytest.mark.skipif(not shutil.which("bash"), reason="needs bash")
+def test_uninstall_leaves_the_group_and_says_so(tmp_path, stubbin):
+    root = tmp_path / "root"
+    assert run_install(root, "--bindir", str(stubbin)).returncode == 0
+    r = run_install(root, "--uninstall")
+    assert r.returncode == 0 and "group cora is left alone" in r.stdout
+
+
+def test_the_installer_never_adds_anyone_to_the_group():
+    src = INSTALL.read_text()
+    code = "\n".join(l for l in src.splitlines() if not l.lstrip().startswith("#") and "echo" not in l)
+    body = code.split("cat <<MSG")[0]                    # the printed instructions may mention usermod; the code may not run it
+    assert "usermod" not in body and "gpasswd" not in body and "adduser" not in body
