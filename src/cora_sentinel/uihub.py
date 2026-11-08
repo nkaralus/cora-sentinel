@@ -7,7 +7,11 @@ The daemon never waits on a client. A thread owns the socket; the daemon only ca
 lock for microseconds and return. Every client gets newline-delimited JSON:
 
     {"schema": "cora.sentinel.ui/v1", "type": "state", "seq": N, "ts": "...", "status": "clear|evaluating|contained|alarm",
-     "mode": "enforce|dry-run|detect-only", "evaluating": K, "tasks": [...], "session": {...}}
+     "mode": "enforce|dry-run|detect-only", "evaluating": K, "tasks": [...], "session": {...}, "mono": SECONDS}
+
+Each task carries "psi": {"some_avg10", "some_avg60", "full_avg10", "full_avg60", "some_total_us", "full_total_us"}
+read on every update (None without PSI). For an exact stall fraction over a window, take two updates:
+(total_us[b] - total_us[a]) / ((mono[b] - mono[a]) * 1e6). The avgs are the kernel's rolling averages.
 
 sent on every change (at most 4 a second) and as a heartbeat every 2 s even when nothing changed. A client that hears
 nothing for longer than STALE_AFTER_S must show "unreachable", never the last colour: a dead daemon must not look clear.
@@ -244,7 +248,10 @@ class Hub:
                               "contained": sorted(set(enforced) | set(would)),
                               # really in force (not dry-run): the tray offers a breaker only if it is not here
                               "enforced": enforced,
-                              "unknown": sorted(info.get("unknown", []))})
+                              "unknown": sorted(info.get("unknown", [])),
+                              # continuous memory pressure for every update, not only on a trip: avg10/avg60 (%) and
+                              # the cumulative *_total_us stall counters; None when the kernel gives none
+                              "psi": info.get("psi")})
                 pr = self._pressure.get(name)
                 if pr is not None:
                     tasks[-1]["pressure"] = {"active": now_c - pr["last"] <= PRESSURE_HOLD_S, "count": pr["count"],
@@ -266,7 +273,9 @@ class Hub:
             else:
                 status = "clear"
             self._seq += 1
-            return {"schema": SCHEMA, "type": "state", "seq": self._seq, "ts": _now_iso(), "status": status,
+            return {"schema": SCHEMA, "type": "state", "seq": self._seq, "ts": _now_iso(),
+                    "mono": round(time.monotonic(), 6),   # the daemon's clock: rate = d(total_us) / d(mono) / 1e6
+                    "status": status,
                     "mode": self.mode, "evaluating": evaluating, "tasks": tasks, "session": s,
                     "breakers": sorted(COMMANDS) if self._act else [], "truth_errors": sorted(truth_errors)}
 
@@ -623,7 +632,13 @@ def cgroup_tasks(cg, fw=None) -> Callable[[], Dict[str, dict]]:
                     enforced.add("SUSPEND")
             except OSError:
                 pass
+            psi = None
+            try:
+                from cora_sentinel.psi import read_pressure
+                psi = read_pressure((d / "memory.pressure").read_text(), totals=True) or None
+            except OSError:
+                pass                                     # no PSI on this kernel or cgroup: say nothing, not zero
             out[name] = {"pids": pids, "mem_bytes": mem, "id": cid, "enforced": sorted(enforced),
-                         "unknown": sorted(unknown), "errors": errors}
+                         "unknown": sorted(unknown), "errors": errors, "psi": psi}
         return out
     return read

@@ -50,8 +50,10 @@ def parse_trigger(v) -> Optional[str]:
     return t
 
 
-def read_pressure(text: str) -> Dict[str, float]:
-    """'some avg10=1.23 avg60=... total=...' lines -> {'some_avg10': 1.23, 'full_avg10': ...}."""
+def read_pressure(text: str, totals: bool = False) -> Dict[str, float]:
+    """'some avg10=1.23 avg60=... total=...' lines -> {'some_avg10': 1.23, 'full_avg10': ...}. totals=True also
+    returns the cumulative stall counters, 'some_total_us' / 'full_total_us' (integers, microseconds): two of them a
+    known time apart give the EXACT stall fraction of that window, which a rolling average cannot."""
     out: Dict[str, float] = {}
     for line in text.splitlines():
         parts = line.split()
@@ -59,11 +61,13 @@ def read_pressure(text: str) -> Dict[str, float]:
             continue
         for kv in parts[1:]:
             k, _, val = kv.partition("=")
-            if k in ("avg10", "avg60"):
-                try:
+            try:
+                if k in ("avg10", "avg60"):
                     out[f"{parts[0]}_{k}"] = float(val)
-                except ValueError:
-                    pass
+                elif k == "total" and totals:
+                    out[f"{parts[0]}_total_us"] = int(val)
+            except ValueError:
+                pass
     return out
 
 
