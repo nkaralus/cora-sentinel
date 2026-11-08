@@ -8,7 +8,13 @@ GNOME tray indicator for cora-sentinel. It shows the daemon's status and offers 
 | amber … | the model is evaluating events |
 | indigo 🔒 | containment active (or, in dry-run, what the model WOULD contain) |
 | red ! | ALARM: an event was dropped uncontained, or an action failed. Stays red until the daemon restarts: read the decision log |
+| red ! | BLIND: the daemon cannot read what is in force (e.g. the firewall is unreadable); the exact error is in the menu |
+| red ! | UNKNOWN: the daemon sent a status or an enforcement verb this tray does not know, or a snapshot it cannot read; the raw value is in the menu |
+| grey ✕ | connecting: connected, waiting for the first snapshot (at most 6 s, then unreachable) |
 | grey ✕ | unreachable: no daemon, no permission, or no update for 6 s. Never shows a stale colour |
+
+A memory ceiling you set at launch (`cora-run --app --memory-high`) is not containment: the task stays green and *Cap
+memory* stays available, so you can still tighten it.
 
 **Breakers only tighten.** *Sever network* (ISOLATE: nft drops the task's egress) and *Cap memory* (THROTTLE: memory held
 at its current size, CPU 20%). Each asks for confirmation (Cancel is the default) and acts even when the daemon is in

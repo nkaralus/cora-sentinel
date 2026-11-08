@@ -274,7 +274,7 @@ def test_silence_is_unreachable_never_the_last_colour(hub):
     assert c.view()["colour"] == "green"
     now[0] += uihub.STALE_AFTER_S + 0.1                           # nothing arrived for too long
     v = c.view()
-    assert v["status"] == "unreachable" and v["colour"] == "grey" and "no update" in v["detail"]
+    assert v["status"] == "unreachable" and v["colour"] == "grey" and "connected, no data for 6 s" in v["detail"]
 
 
 def test_daemon_gone_is_unreachable(rundir, live):
@@ -369,3 +369,188 @@ def test_the_service_unit_provides_the_socket_directory():
     from pathlib import Path
     unit = (Path(__file__).resolve().parents[1] / "deploy" / "cora-sentinel.service").read_text()
     assert "RuntimeDirectory=cora-sentinel" in unit and "RuntimeDirectoryMode=0755" in unit
+
+
+# ---------------------------------------------------------------- Track A: blind, and launch limits are not THROTTLE
+
+def test_truth_errors_escalate_to_blind_and_clear_when_the_read_works_again(live):
+    live.tasks = {"t": {"pids": 1, "mem_bytes": 1, "id": 7, "enforced": [], "unknown": ["ISOLATE"],
+                        "errors": ["firewall unreadable (PermissionError)"], "psi": None}}
+    h = Hub("/nonexistent/ui.sock", tasks=lambda: dict(live.tasks), log=lambda m: None)
+    s = h.snapshot()
+    assert s["status"] == "blind" and s["truth_errors"] == ["firewall unreadable (PermissionError)"]
+    live.tasks["t"].update(unknown=[], errors=[])
+    assert h.snapshot()["status"] == "clear"
+
+
+def test_alarm_beats_blind_and_blind_beats_contained(live):
+    live.tasks = {"t": {"pids": 1, "mem_bytes": 1, "id": 7, "enforced": ["ISOLATE"], "unknown": [],
+                        "errors": ["firewall unreadable (X)"], "psi": None}}
+    h = Hub("/nonexistent/ui.sock", tasks=lambda: dict(live.tasks), log=lambda m: None)
+    assert h.snapshot()["status"] == "blind"
+    h.note_decision({"final": "DROPPED"})
+    assert h.snapshot()["status"] == "alarm"
+
+
+def test_a_blind_daemon_is_red_with_the_exact_error_end_to_end(hub, live):
+    live.tasks = {"t": {"pids": 1, "mem_bytes": 1, "id": 7, "enforced": [], "unknown": ["ISOLATE"],
+                        "errors": ["firewall unreadable (PermissionError)"], "psi": None}}
+    hub.note_event({})
+    c = StatusClient(str(hub.path))
+    c.connect()
+    end = time.monotonic() + 3
+    while time.monotonic() < end and not (c.state and c.state["status"] == "blind"):
+        c.poll()
+        time.sleep(0.02)
+    v = c.view()
+    assert (v["status"], v["colour"]) == ("blind", "red")
+    assert v["detail"].startswith("firewall unreadable (PermissionError)")
+    assert "firewall unreadable (PermissionError)" in f"{v['title']}\n{v['detail']}"   # the trays' tooltip
+
+
+@pytest.fixture
+def scoped(tmp_path):
+    from cora_sentinel.cgroup import CgroupRoot
+    from cora_sentinel.scope import Scopes
+    root = tmp_path / "cora"
+    root.mkdir()
+    cg = CgroupRoot(str(root))
+    scopes = Scopes(cg, state_path=str(tmp_path / "scopes.json"))
+
+    def make(memory_max=None, memory_high=None, mem=64 << 20):
+        name = scopes.create_scope("tracka", uid=1000, memory_max=memory_max, memory_high=memory_high)
+        d = root / name
+        for f, v in (("cgroup.procs", "4242"), ("cpu.max", "max 100000"), ("memory.current", str(mem)),
+                     ("cgroup.freeze", "0")):
+            (d / f).write_text(v + "\n")
+        for f in ("memory.high", "memory.max"):
+            if not (d / f).exists():
+                (d / f).write_text("max\n")
+        return name, d
+    h = Hub("/nonexistent/ui.sock", tasks=uihub.cgroup_tasks(cg, None), cgroup_id=cg.cgroup_id, scopes=scopes,
+            act=lambda v, t: "done", log=lambda m: None)
+    return h, cg, make
+
+
+def snap_task(h, name):
+    s = h.snapshot()
+    return s, next(t for t in s["tasks"] if t["name"] == name)
+
+
+def can_cap(state, name):
+    c = StatusClient("/x", clock=lambda: 0.0)
+    c.sock, c.last_rx, c.connected_at, c.state = object(), 0.0, 0.0, state
+    return next(t for t in c.view()["tasks"] if t["name"] == name)["can_cap"], c.view()
+
+
+def test_a_launch_ceiling_is_not_throttle_and_cap_stays_offered(scoped):
+    """Track A item 1b: cora-run --app --memory-high 400M alone read as THROTTLE and turned the tray indigo."""
+    h, cg, make = scoped
+    name, d = make(memory_max="512M", memory_high="400M")
+    assert (d / "memory.high").read_text().strip() == str(400 << 20)
+    s, t = snap_task(h, name)
+    assert t["enforced"] == [] and t["contained"] == [] and s["status"] == "clear"
+    assert t["limits"] == {"source": "launch", "cpu_max": None, "memory_high": 400 << 20, "memory_max": 512 << 20}
+    ok, v = can_cap(s, name)
+    assert ok and v["colour"] == "green"
+
+
+def test_the_cap_breaker_on_a_launch_limited_task_is_sentinel_throttle(scoped):
+    h, cg, make = scoped
+    name, d = make(memory_max="512M", memory_high="400M")
+    cg.throttle(name)                                        # what the Cap button runs: cpu.max 20%, memory.high=current
+    s, t = snap_task(h, name)
+    assert t["enforced"] == ["THROTTLE"] and s["status"] == "contained"
+    assert t["limits"]["source"] == "sentinel" and t["limits"]["cpu_max"] == "20000 100000"
+    assert t["limits"]["memory_high"] == 64 << 20
+    ok, v = can_cap(s, name)
+    assert not ok and v["colour"] == "indigo"
+
+
+def test_memory_high_moved_off_the_launch_value_is_sentinel_even_without_cpu(scoped):
+    h, cg, make = scoped
+    name, d = make(memory_max="512M", memory_high="400M")
+    (d / "memory.high").write_text(str(100 << 20))
+    _, t = snap_task(h, name)
+    assert t["enforced"] == ["THROTTLE"] and t["limits"]["source"] == "sentinel"
+
+
+def test_a_launch_with_only_a_hard_ceiling_is_launch_and_not_throttle(scoped):
+    h, cg, make = scoped
+    name, _ = make(memory_max="512M")
+    s, t = snap_task(h, name)
+    assert t["enforced"] == [] and t["limits"]["source"] == "launch" and s["status"] == "clear"
+
+
+def test_a_task_that_is_not_a_launch_scope_has_no_launch_limits(scoped, tmp_path):
+    h, cg, make = scoped
+    d = tmp_path / "cora" / "agent"
+    d.mkdir()
+    for f, v in (("cgroup.procs", "1"), ("cpu.max", "max 100000"), ("memory.high", str(400 << 20)),
+                 ("memory.current", "1"), ("cgroup.freeze", "0"), ("memory.max", "max")):
+        (d / f).write_text(v + "\n")
+    _, t = snap_task(h, "agent")
+    assert t["enforced"] == ["THROTTLE"] and t["limits"]["source"] == "sentinel"   # exactly as before
+
+
+def test_no_kernel_reader_means_no_limits_claimed(live):
+    live.tasks = {"t": {"pids": 1, "mem_bytes": 1}}
+    t = Hub("/nonexistent/ui.sock", tasks=lambda: dict(live.tasks), log=lambda m: None).snapshot()["tasks"][0]
+    assert t["limits"] is None
+
+
+def test_a_cpu_limit_on_a_launch_limited_task_is_sentinel_even_at_the_launch_memory_value(scoped):
+    h, cg, make = scoped
+    name, d = make(memory_max="512M", memory_high="400M")
+    (d / "cpu.max").write_text("20000 100000\n")             # memory.high still exactly the launch value
+    _, t = snap_task(h, name)
+    assert t["enforced"] == ["THROTTLE"] and t["limits"]["source"] == "sentinel"
+
+
+def test_the_hub_ranks_contained_over_pressure_over_evaluating_over_clear(live):
+    live.tasks = {"t": {"pids": 1, "mem_bytes": 1, "id": 7, "enforced": [], "unknown": [], "errors": [], "psi": None}}
+    h = Hub("/nonexistent/ui.sock", tasks=lambda: dict(live.tasks), evaluating=lambda: live.evaluating,
+            log=lambda m: None)
+    assert h.snapshot()["status"] == "clear"
+    live.evaluating = 1
+    assert h.snapshot()["status"] == "evaluating"
+    h.note_pressure("t", {"some_avg10": 40.0, "full_avg10": 5.0})
+    assert h.snapshot()["status"] == "pressure"
+    live.tasks["t"]["enforced"] = ["ISOLATE"]
+    assert h.snapshot()["status"] == "contained"
+
+
+def test_the_hub_never_sends_a_null_source(scoped, tmp_path):
+    h, cg, make = scoped
+    make(memory_max="512M", memory_high="400M")
+    make(memory_max="512M")
+    d = tmp_path / "cora" / "plain"
+    d.mkdir()
+    for f, v in (("cgroup.procs", "1"), ("cpu.max", "max 100000"), ("memory.high", "max"), ("memory.current", "1"),
+                 ("cgroup.freeze", "0"), ("memory.max", "max")):
+        (d / f).write_text(v + "\n")
+    sources = {t["name"]: t["limits"]["source"] for t in h.snapshot()["tasks"]}
+    assert sources["plain"] == "none" and set(sources.values()) <= {"launch", "sentinel", "none"}
+
+
+def test_high_psi_on_a_launch_limited_task_is_amber_pressure(scoped):
+    """Before Track A a launch ceiling read as `contained`, which outranks `pressure`: the tripwire's amber alert was
+    hidden for exactly the tasks that have tripwires."""
+    h, cg, make = scoped
+    name, _ = make(memory_max="512M", memory_high="400M")
+    h.note_pressure(name, {"some_avg10": 42.0, "full_avg10": 7.5})
+    s, t = snap_task(h, name)
+    assert s["status"] == "pressure" and t["limits"]["source"] == "launch" and t["pressure"]["active"]
+    ok, v = can_cap(s, name)
+    assert (v["status"], v["colour"]) == ("pressure", "amber") and ok
+    assert name in v["title"] and "[PRESSURE some 42.0%]" in next(x["line"] for x in v["tasks"] if x["name"] == name)
+
+
+def test_pressure_on_a_capped_task_stays_visible_on_its_line(scoped):
+    h, cg, make = scoped
+    name, _ = make(memory_max="512M", memory_high="400M")
+    cg.throttle(name)
+    h.note_pressure(name, {"some_avg10": 42.0, "full_avg10": 7.5})
+    s, _ = snap_task(h, name)
+    _, v = can_cap(s, name)
+    assert v["status"] == "contained" and "[PRESSURE some 42.0%]" in next(x["line"] for x in v["tasks"] if x["name"] == name)

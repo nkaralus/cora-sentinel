@@ -164,7 +164,7 @@ class StatusWindow(QWidget):
         self.head.setText(v["title"])
         self.detail.setText("\n".join([v["detail"]] + notes))
         self.table.setVisible(bool(rows))
-        self.empty.setVisible(v["status"] != "unreachable" and not rows)
+        self.empty.setVisible(v["status"] not in ("unreachable", "connecting") and not rows)
         keys = [(r["name"], r["cgroup_id"], r["can_sever"], r["can_cap"]) for r in rows]
         if keys != self.row_keys:                        # buttons are rebuilt only when what they act on changes
             self.row_keys = keys
@@ -302,7 +302,7 @@ class Tray:
         for text in [v["title"], v["detail"]] + notes:
             self.menu.addAction(text).setEnabled(False)
         self.menu.addSeparator()
-        if v["status"] != "unreachable":
+        if v["status"] not in ("unreachable", "connecting"):
             if not rows:
                 self.menu.addAction("no sandboxed tasks running").setEnabled(False)
             for r in rows:

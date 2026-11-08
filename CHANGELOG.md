@@ -1,5 +1,39 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+Found by the Track A live check on Dimgeon (2026-11-08), which drove the real daemon and a test hub:
+- **A state message with no `status` rendered green "all clear"** (`uiclient.view()` defaulted to `"clear"`). A status
+  that is missing, null or not one the client knows is now **unknown** (red), with the raw value in the detail line.
+  So is an enforcement verb the client does not know (it was drawn as quiet indigo containment, e.g. `[MELT]`), a
+  malformed verb list, and a snapshot the client cannot read at all.
+- **An unreadable firewall left the overall status green.** Tasks already showed `ISOLATE?`, but the light said "all
+  clear" while the daemon could not see what was enforced. Any `truth_errors` now make the status **blind** (red, under
+  alarm, above contained), with the exact error text first in the detail line and the tooltip. The client escalates on
+  its own too, so an older daemon that still says "clear" with truth errors is shown blind.
+- **A launch ceiling read as THROTTLE.** `cora-run --app --memory-high` writes `memory.high`, which the kernel reader
+  counted as a Sentinel throttle: the task was `contained`, the tray went indigo, *Cap memory* was hidden, and a real
+  Cap press could not be seen in the feed. Each task now carries `limits: {source: "launch" | "sentinel" | null,
+  cpu_max, memory_high, memory_max}`; a scope's own recorded `memory_high` with `cpu.max` untouched is "launch" and not
+  THROTTLE. Anything the scope did not ask for (a CPU limit, `memory.high` moved off the launch value: what Cap writes)
+  is still THROTTLE. Tasks that are not launch scopes are unchanged.
+- **A reconnect showed "no update for 19 s"** for a moment: the previous connection's clock and snapshot survived. A new
+  connection now starts its own watchdog, drops the old snapshot, and shows **connecting** (grey, "connected, awaiting
+  first snapshot") until the first frame; silent past 6 s it is unreachable, as before.
+- **Several faults at once: the worst wins, every fault is listed.** The client ranks alarm > unknown > blind >
+  contained > pressure > evaluating > clear over everything that is true (the daemon's status, truth errors, unknown
+  verbs, limits without provenance), and the detail line names each of them.
+- **Missing provenance is never "launch".** A THROTTLE knob (`cpu.max`, or `memory.high`) whose `limits.source` is not
+  exactly `"launch"` (null, missing, anything else) is the sentinel's: contained, Cap greyed out, and the detail says
+  so. The hub never sends a null source: `"none"` now means nothing is limited.
+- **A wedged daemon is told apart from a dead socket:** open but silent past 6 s is "connected, no data for N s"
+  (garbage or foreign frames do not count as data); a closed socket says it was closed.
+- **Pressure on launch-limited tasks is amber again.** A launch ceiling used to read as `contained`, which outranks
+  `pressure`, so a PSI tripwire on an `--app` scope (the tasks that have tripwires) could not turn the tray amber.
+- Tests: `tests/test_uiclient.py` (new: every scenario of the live check, also replayed over a real socket) and the
+  Track A section of `tests/test_uihub.py`; 40 mutants of the new branches, all caught.
+
 ## 0.10.1
 
 ### Fixed

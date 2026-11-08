@@ -6,8 +6,17 @@ cora_sentinel.uihub - the daemon's read-only status feed for desktop clients (co
 The daemon never waits on a client. A thread owns the socket; the daemon only calls the note_*() methods, which take a
 lock for microseconds and return. Every client gets newline-delimited JSON:
 
-    {"schema": "cora.sentinel.ui/v1", "type": "state", "seq": N, "ts": "...", "status": "clear|evaluating|contained|alarm",
+    {"schema": "cora.sentinel.ui/v1", "type": "state", "seq": N, "ts": "...",
+     "status": "clear|evaluating|pressure|contained|blind|alarm",
      "mode": "enforce|dry-run|detect-only", "evaluating": K, "tasks": [...], "session": {...}, "mono": SECONDS}
+
+Each task carries "limits": {"source": "launch" | "sentinel" | "none", "cpu_max", "memory_high", "memory_max"}: the
+kernel's limits and who set them. A ceiling the operator asked for at launch (cora-run --app --memory-high: the
+scope's recorded memory_high, cpu.max untouched) is "launch" and is NOT a THROTTLE: it neither makes the task
+"contained" nor greys out the Cap breaker. A limit the scope did not ask for (cpu.max, or memory.high moved off the
+launch value: what the Cap breaker writes) is "sentinel" and is THROTTLE. Tasks that are not launch scopes have no
+launch limits, so any limit on them is "sentinel", as before. "none": nothing is limited. The hub never sends a null
+source; a client that meets one (or no source key) must treat any limit as the sentinel's, never as "launch".
 
 Each task carries "psi": {"some_avg10", "some_avg60", "full_avg10", "full_avg60", "some_total_us", "full_total_us"}
 read on every update (None without PSI). For an exact stall fraction over a window, take two updates:
@@ -25,6 +34,8 @@ WOULD have done in dry-run. If the firewall cannot be read, ISOLATE is reported 
 Status precedence (the worst wins):
   alarm       an event was DROPPED without being contained, or an action FAILED, this session (stays until restart:
               the operator has to look at the log; a light that heals itself hides exactly the event that mattered)
+  blind       the kernel's state could not be read (truth_errors: e.g. the firewall is unreadable), so the feed cannot
+              say what is in force; loud, never "clear", until the next read succeeds
   contained   at least one live task is isolated, throttled or suspended right now
   pressure    a launch scope's memory-pressure tripwire fired within PRESSURE_HOLD_S (signal only: nothing is changed)
   evaluating  the model has events queued or in flight
@@ -242,6 +253,8 @@ class Hub:
                     enforced = sorted(info["enforced"])
                 else:                                    # no kernel reader (tests, or no cgroup tree): the log's word
                     enforced = sorted(v for v, k in marks.items() if k == "done")
+                rec = self.scopes.describe(name) if self.scopes is not None else None
+                limits = self._provenance(info.get("limits"), rec, enforced)
                 would = sorted(v for v, k in marks.items() if k == "dry-run")
                 tasks.append({"name": name, "cgroup_id": info.get("id"), "pids": info.get("pids", 0), "mem_bytes": mem,
                               "mem_delta_bytes": None if mem is None else mem - self._baseline[name],
@@ -249,6 +262,7 @@ class Hub:
                               # really in force (not dry-run): the tray offers a breaker only if it is not here
                               "enforced": enforced,
                               "unknown": sorted(info.get("unknown", [])),
+                              "limits": limits,
                               # continuous memory pressure for every update, not only on a trip: avg10/avg60 (%) and
                               # the cumulative *_total_us stall counters; None when the kernel gives none
                               "psi": info.get("psi")})
@@ -256,7 +270,6 @@ class Hub:
                 if pr is not None:
                     tasks[-1]["pressure"] = {"active": now_c - pr["last"] <= PRESSURE_HOLD_S, "count": pr["count"],
                                              "some_avg10": pr.get("some_avg10"), "full_avg10": pr.get("full_avg10")}
-                rec = self.scopes.describe(name) if self.scopes is not None else None
                 if rec:
                     tasks[-1]["scope"] = {"app": rec["app"], "uid": rec["uid"], "profile": rec.get("profile", "app"),
                                           "memory_max": rec.get("memory_max"), "memory_high": rec.get("memory_high")}
@@ -264,6 +277,8 @@ class Hub:
             s = dict(self.session)
             if s["dropped_uncontained"] or s["failed_actions"]:
                 status = "alarm"
+            elif truth_errors:
+                status = "blind"
             elif any(t["contained"] for t in tasks):
                 status = "contained"
             elif any((t.get("pressure") or {}).get("active") for t in tasks):
@@ -278,6 +293,23 @@ class Hub:
                     "status": status,
                     "mode": self.mode, "evaluating": evaluating, "tasks": tasks, "session": s,
                     "breakers": sorted(COMMANDS) if self._act else [], "truth_errors": sorted(truth_errors)}
+
+    @staticmethod
+    def _provenance(limits: Optional[dict], rec: Optional[dict], enforced: List[str]) -> Optional[dict]:
+        """Who set the kernel's limits. Removes THROTTLE from `enforced` (in place) when the only limit is the launch
+        ceiling the scope was created with. None when there is no kernel reader."""
+        if limits is None:
+            return None
+        out = dict(limits, source="none")
+        launch_high = rec.get("memory_high") if rec else None
+        if ("THROTTLE" in enforced and launch_high is not None and limits.get("cpu_max") is None
+                and limits.get("memory_high") == launch_high):
+            enforced.remove("THROTTLE")              # the operator's own ceiling, not the sentinel's
+        if "THROTTLE" in enforced:
+            out["source"] = "sentinel"
+        elif rec and (launch_high is not None or rec.get("memory_max") is not None):
+            out["source"] = "launch"
+        return out
 
     # ------------------------------------------------------------------ socket
     def start(self) -> None:
@@ -585,6 +617,14 @@ def _limited(text: str) -> bool:
     return first != "max"
 
 
+def _bytes(text: str) -> Optional[int]:
+    first = (text.split() or ["max"])[0]
+    try:
+        return None if first == "max" else int(first)
+    except ValueError:
+        return None
+
+
 def cgroup_tasks(cg, fw=None) -> Callable[[], Dict[str, dict]]:
     """Live tasks, their memory, and what is IN FORCE on each, read from the kernel: the nft rules (over netlink, one
     read per call) and each task's cpu.max, memory.high and cgroup.freeze. memory.current is the whole subtree."""
@@ -621,12 +661,18 @@ def cgroup_tasks(cg, fw=None) -> Callable[[], Dict[str, dict]]:
                 # a rule made for an OLDER cgroup of this name does not hold this one (gc removes it soon)
                 if r is not None and (r.get("cgid") is None or r.get("cgid") == cid):
                     enforced.add("ISOLATE")
-            for fname in ("cpu.max", "memory.high"):
+            limits = {"cpu_max": None, "memory_high": None, "memory_max": None}
+            for fname in ("cpu.max", "memory.high", "memory.max"):
                 try:
-                    if _limited((d / fname).read_text()):
-                        enforced.add("THROTTLE")
+                    text = (d / fname).read_text()
                 except OSError:
-                    pass
+                    continue
+                if fname == "cpu.max":
+                    limits["cpu_max"] = text.strip() if _limited(text) else None
+                else:
+                    limits[fname.replace(".", "_")] = _bytes(text)
+                if fname != "memory.max" and _limited(text):
+                    enforced.add("THROTTLE")              # the hub decides whether it was only the launch ceiling
             try:
                 if (d / "cgroup.freeze").read_text().strip() == "1":
                     enforced.add("SUSPEND")
@@ -639,6 +685,6 @@ def cgroup_tasks(cg, fw=None) -> Callable[[], Dict[str, dict]]:
             except OSError:
                 pass                                     # no PSI on this kernel or cgroup: say nothing, not zero
             out[name] = {"pids": pids, "mem_bytes": mem, "id": cid, "enforced": sorted(enforced),
-                         "unknown": sorted(unknown), "errors": errors, "psi": psi}
+                         "unknown": sorted(unknown), "errors": errors, "psi": psi, "limits": limits}
         return out
     return read

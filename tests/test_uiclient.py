@@ -1,0 +1,338 @@
+"""uiclient fails closed: what it cannot understand is loud (red "unknown"), what it cannot see is never green, and a
+new connection never shows the previous connection's colour. Replays the Track A live check (03-unknown-status.log,
+2026-11-08 on Dimgeon), where a missing status rendered green "all clear"."""
+import json
+import socket
+import threading
+import time
+
+import pytest
+
+from cora_sentinel import uihub, uiclient
+from cora_sentinel.uihub import SCHEMA, STALE_AFTER_S, Hub
+from cora_sentinel.uiclient import StatusClient, menu_spec
+
+BASE = {"schema": SCHEMA, "type": "state", "ts": "x", "mode": "enforce", "evaluating": 0, "tasks": [], "session": {},
+        "breakers": ["cap", "sever"], "truth_errors": []}
+
+
+def task(**kw):
+    t = {"name": "odd", "cgroup_id": 1, "pids": 1, "mem_bytes": 1, "mem_delta_bytes": 0, "contained": [],
+         "enforced": [], "unknown": [], "psi": None}
+    t.update(kw)
+    return t
+
+
+def view_of(state):
+    c = StatusClient("/nonexistent", clock=lambda: 0.0)
+    c.sock, c.last_rx, c.connected_at, c.state = object(), 0.0, 0.0, state
+    return c.view()
+
+
+def loud(v):
+    assert v["colour"] == "red", v
+    assert v["status"] not in ("clear", "unreachable", "connecting")
+
+
+# ================================================================ missing, null, unrecognised status
+@pytest.mark.parametrize("raw, shown", [
+    ("<missing>", "<missing>"),
+    (None, "None"),
+    ("melting", "'melting'"),
+    ("", "''"),
+    ("CLEAR", "'CLEAR'"),                                    # not the same word
+    (1, "1"),
+    ({"status": "clear"}, "{'status': 'clear'}"),
+    (["clear"], "['clear']"),
+])
+def test_a_status_the_client_does_not_know_is_unknown_and_loud(raw, shown):
+    state = {k: v for k, v in BASE.items()} if raw == "<missing>" else {**BASE, "status": raw}
+    v = view_of(state)
+    loud(v)
+    assert v["status"] == "unknown" and v["title"] == "cora: UNKNOWN status from cora-sentinel"
+    assert f"received status: {shown}" in v["detail"]
+
+
+@pytest.mark.parametrize("status, colour", [("clear", "green"), ("evaluating", "amber"), ("pressure", "amber"),
+                                            ("contained", "indigo"), ("blind", "red"), ("alarm", "red")])
+def test_the_statuses_the_daemon_sends_keep_their_colours(status, colour):
+    v = view_of({**BASE, "status": status})
+    assert (v["status"], v["colour"]) == (status, colour) and "received status" not in v["detail"]
+
+
+# ================================================================ truth errors: blind, never green
+def test_truth_errors_make_it_blind_even_if_the_daemon_said_clear():
+    v = view_of({**BASE, "status": "clear", "truth_errors": ["firewall unreadable (PermissionError)"]})
+    loud(v)
+    assert v["status"] == "blind" and v["title"] == "cora: BLIND: cannot read what is enforced"
+    assert v["detail"].startswith("firewall unreadable (PermissionError)")
+
+
+def test_the_hubs_blind_shows_the_exact_error_text():
+    v = view_of({**BASE, "status": "blind", "truth_errors": ["firewall unreadable (OSError)", "second problem"]})
+    loud(v)
+    assert v["detail"].startswith("firewall unreadable (OSError); second problem | ")
+
+
+def test_alarm_stays_alarm_and_still_shows_the_truth_error():
+    v = view_of({**BASE, "status": "alarm", "session": {"failed_actions": 1}, "truth_errors": ["firewall unreadable (X)"]})
+    assert v["status"] == "alarm" and v["colour"] == "red" and "firewall unreadable (X)" in v["detail"]
+
+
+# ================================================================ unrecognised verbs
+@pytest.mark.parametrize("key", ["enforced", "contained", "unknown"])
+def test_an_unknown_verb_is_loud_never_quiet_containment(key):
+    v = view_of({**BASE, "status": "contained", "tasks": [task(**{key: ["MELT"]})]})
+    loud(v)
+    assert v["status"] == "unknown" and v["title"] == "cora: UNKNOWN verb from cora-sentinel"
+    assert "unknown verb 'MELT' on odd" in v["detail"]
+
+
+def test_the_task_line_names_the_unknown_verb_once():
+    v = view_of({**BASE, "status": "contained", "tasks": [task(contained=["ISOLATE", "MELT"], enforced=["ISOLATE", "MELT"])]})
+    assert "[ISOLATE, MELT: unknown verb]" in v["tasks"][0]["line"]
+    assert v["detail"].count("unknown verb 'MELT' on odd") == 1
+
+
+def test_an_unknown_verb_under_an_alarm_keeps_the_alarm_and_says_so():
+    v = view_of({**BASE, "status": "alarm", "session": {"dropped_uncontained": 1}, "tasks": [task(enforced=["MELT"])]})
+    assert v["status"] == "alarm" and "unknown verb 'MELT'" in v["detail"]
+
+
+@pytest.mark.parametrize("bad", ["ISOLATE", {"v": 1}, [1], [None]])
+def test_a_malformed_verb_list_is_unknown(bad):
+    v = view_of({**BASE, "status": "clear", "tasks": [task(enforced=bad)]})
+    loud(v)
+    assert "malformed enforced" in v["detail"]
+
+
+def test_known_verbs_are_not_flagged():
+    v = view_of({**BASE, "status": "contained", "tasks": [task(contained=["ISOLATE", "SUSPEND", "THROTTLE"],
+                                                                 enforced=["ISOLATE", "SUSPEND", "THROTTLE"])]})
+    assert (v["status"], v["colour"]) == ("contained", "indigo") and "unknown verb" not in v["detail"]
+
+
+# ================================================================ unreadable snapshots
+@pytest.mark.parametrize("state", [
+    {**BASE, "status": "clear", "tasks": "not a list"},
+    {**BASE, "status": "clear", "tasks": [{"no": "name"}]},
+    {**BASE, "status": "clear", "tasks": [42]},
+])
+def test_a_snapshot_the_client_cannot_read_is_unknown(state):
+    v = view_of(state)
+    loud(v)
+    assert v["title"] == "cora: UNKNOWN snapshot from cora-sentinel" and "unreadable snapshot" in v["detail"]
+
+
+# ================================================================ the watchdog and the connecting state
+@pytest.fixture
+def hub(tmp_path, monkeypatch):
+    monkeypatch.setattr(uihub, "HEARTBEAT_S", 0.3)
+    monkeypatch.setattr(uihub, "MIN_INTERVAL_S", 0.05)
+    run = tmp_path / "run"
+    run.mkdir(mode=0o755)
+    h = Hub(str(run / "ui.sock"), mode="enforce", log=lambda m: None)
+    h.start()
+    yield h
+    h.stop()
+
+
+def poll_until(c, pred, timeout=3.0):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end and not pred():
+        c.poll()
+        time.sleep(0.02)
+
+
+def test_a_new_connection_is_connecting_until_its_first_snapshot(hub):
+    now = [100.0]
+    c = StatusClient(str(hub.path), clock=lambda: now[0])
+    assert c.connect()
+    v = c.view()
+    assert (v["status"], v["colour"], v["detail"]) == ("connecting", "grey", "connected, awaiting first snapshot")
+    assert v["tasks"] == [] and not any(i[0] == "task" for i in menu_spec(v))
+    assert "no sandboxed tasks" not in json.dumps(menu_spec(v))
+    poll_until(c, lambda: c.state is not None)
+    assert c.view()["status"] == "clear"
+
+
+def test_reconnecting_resets_the_watchdog_and_never_shows_the_old_snapshot(hub):
+    """The live restart log showed 'no update for 19 s' on a fresh connection: the old clock and the old snapshot."""
+    now = [100.0]
+    c = StatusClient(str(hub.path), clock=lambda: now[0])
+    c.connect()
+    poll_until(c, lambda: c.state is not None)
+    assert c.view()["colour"] == "green"
+    c.close()
+    now[0] += 19                                             # the daemon was down this long
+    assert c.view()["status"] == "unreachable"
+    assert c.connect()
+    v = c.view()
+    assert v["status"] == "connecting" and "no data" not in v["detail"]
+    assert c.state is None and c.last_rx is None and c.connected_at == now[0]
+
+
+def test_connected_but_silent_past_the_limit_is_unreachable():
+    now = [0.0]
+    srv_dir = __import__("tempfile").mkdtemp()
+    path = f"{srv_dir}/silent.sock"
+    srv = socket.socket(socket.AF_UNIX)
+    srv.bind(path)
+    srv.listen(1)                                            # accepts, never says anything
+    try:
+        c = StatusClient(path, clock=lambda: now[0])
+        assert c.connect()
+        assert c.view()["status"] == "connecting"
+        now[0] += STALE_AFTER_S + 0.1
+        v = c.view()
+        assert (v["status"], v["colour"]) == ("unreachable", "grey") and v["detail"] == "connected, no data for 6 s"
+    finally:
+        srv.close()
+
+
+def test_silence_after_snapshots_is_still_unreachable(hub):
+    now = [0.0]
+    c = StatusClient(str(hub.path), clock=lambda: now[0])
+    c.connect()
+    poll_until(c, lambda: c.state is not None)
+    now[0] += STALE_AFTER_S + 0.1
+    v = c.view()
+    assert v["status"] == "unreachable" and v["detail"] == "connected, no data for 6 s"
+
+
+# ================================================================ the live check's scenarios, over a real socket
+def fake_server(path, msg):
+    srv = socket.socket(socket.AF_UNIX)
+    srv.bind(path)
+    srv.listen(1)
+
+    def run():
+        conn, _ = srv.accept()
+        try:
+            for _ in range(30):
+                conn.sendall((json.dumps({**msg, "seq": 1}) + "\n").encode())
+                time.sleep(0.05)
+        except OSError:
+            pass
+        conn.close()
+        srv.close()
+    threading.Thread(target=run, daemon=True).start()
+
+
+@pytest.mark.parametrize("label, msg, want_status, want_in_detail", [
+    ("B unknown string", {**BASE, "status": "melting"}, "unknown", "received status: 'melting'"),
+    ("C missing", dict(BASE), "unknown", "received status: <missing>"),
+    ("D null", {**BASE, "status": None}, "unknown", "received status: None"),
+    ("E unknown verb", {**BASE, "status": "contained", "tasks": [task(contained=["MELT"], enforced=["MELT"])]},
+     "unknown", "unknown verb 'MELT' on odd"),
+    ("A truth error", {**BASE, "status": "clear", "truth_errors": ["firewall unreadable (PermissionError)"]},
+     "blind", "firewall unreadable (PermissionError)"),
+])
+def test_the_track_a_scenarios_end_to_end(tmp_path, label, msg, want_status, want_in_detail):
+    path = str(tmp_path / "fake.sock")
+    fake_server(path, msg)
+    c = StatusClient(path)
+    assert c.connect()
+    poll_until(c, lambda: c.state is not None)
+    v = c.view()
+    loud(v)
+    assert v["status"] == want_status and want_in_detail in v["detail"]
+    assert want_in_detail in uiclient.render_line(v)          # the HUD and the tooltip carry it too
+
+
+# ================================================================ several faults at once: the worst wins, all are listed
+def test_the_ranking_is_alarm_unknown_blind_contained_pressure_evaluating_clear():
+    assert sorted(uiclient.RANK, key=uiclient.RANK.get, reverse=True) == \
+        ["alarm", "unknown", "blind", "contained", "pressure", "evaluating", "clear"]
+
+
+ERR = "firewall unreadable (PermissionError)"
+
+
+@pytest.mark.parametrize("state, want, must_list", [
+    ({**BASE, "status": "clear", "truth_errors": [ERR], "tasks": [task(enforced=["MELT"])]},
+     "unknown", [ERR, "unknown verb 'MELT' on odd"]),
+    ({**BASE, "status": "blind", "truth_errors": [ERR], "tasks": [task(contained=["MELT"])]},
+     "unknown", [ERR, "unknown verb 'MELT'"]),
+    ({**BASE, "status": "contained", "truth_errors": [ERR], "tasks": [task(enforced=["ISOLATE"], contained=["ISOLATE"])]},
+     "blind", [ERR]),
+    ({**BASE, "truth_errors": [ERR]},                                                   # no status at all, and blind
+     "unknown", ["received status: <missing>", ERR]),
+    ({**BASE, "status": "alarm", "session": {"failed_actions": 2}, "truth_errors": [ERR],
+      "tasks": [task(enforced=["MELT"])]},
+     "alarm", ["2 failed actions", ERR, "unknown verb 'MELT'"]),
+    ({**BASE, "status": "melting", "truth_errors": [ERR], "tasks": [task(enforced=["MELT"])]},
+     "unknown", ["received status: 'melting'", ERR, "unknown verb 'MELT'"]),
+    ({**BASE, "status": "evaluating", "tasks": [task(limits={"memory_high": 1 << 20})]},
+     "contained", ["limit without launch provenance on odd"]),
+])
+def test_simultaneous_faults_the_worst_wins_and_every_fault_is_in_the_detail(state, want, must_list):
+    v = view_of(state)
+    assert v["status"] == want
+    for fault in must_list:
+        assert fault in v["detail"], (fault, v["detail"])
+
+
+def test_unknown_status_and_unknown_verb_together_say_status_in_the_title():
+    v = view_of({**BASE, "status": None, "tasks": [task(enforced=["MELT"])]})
+    assert v["title"] == "cora: UNKNOWN status from cora-sentinel" and "unknown verb 'MELT'" in v["detail"]
+
+
+# ================================================================ provenance: missing or null is never "launch"
+@pytest.mark.parametrize("limits", [
+    {"memory_high": 400 << 20, "source": None},
+    {"memory_high": 400 << 20},                                         # no source key at all
+    {"memory_high": 400 << 20, "source": "none"},                       # contradicts itself
+    {"memory_high": 400 << 20, "source": "LAUNCH"},
+    {"cpu_max": "20000 100000", "source": "launch"},                    # a launch never sets cpu.max
+    {"cpu_max": "20000 100000", "source": None},
+])
+def test_a_limit_without_launch_provenance_is_the_sentinels(limits):
+    v = view_of({**BASE, "status": "clear", "tasks": [task(limits=limits)]})
+    assert (v["status"], v["colour"]) == ("contained", "indigo")
+    assert not v["tasks"][0]["can_cap"] and "limit without launch provenance on odd" in v["detail"]
+
+
+@pytest.mark.parametrize("limits", [
+    {"source": "launch", "cpu_max": None, "memory_high": 400 << 20, "memory_max": 512 << 20},
+    {"source": "launch", "cpu_max": None, "memory_high": None, "memory_max": 512 << 20},
+    {"source": "none", "cpu_max": None, "memory_high": None, "memory_max": None},
+    {"source": None, "memory_max": 512 << 20},                          # memory.max is a ceiling, never THROTTLE
+    None,                                                               # no kernel reader
+])
+def test_launch_ceilings_and_no_limits_stay_clear_with_cap_offered(limits):
+    v = view_of({**BASE, "status": "clear", "tasks": [task(limits=limits)]})
+    assert (v["status"], v["colour"]) == ("clear", "green") and v["tasks"][0]["can_cap"]
+
+
+# ================================================================ wedged daemon vs dead socket
+def test_a_dead_socket_says_so_and_is_not_called_wedged(hub):
+    c = StatusClient(str(hub.path))
+    c.connect()
+    poll_until(c, lambda: c.state is not None)
+    hub.stop()
+    poll_until(c, lambda: c.sock is None)
+    v = c.view()
+    assert v["status"] == "unreachable" and v["detail"] == "cora-sentinel closed the connection"
+    assert "no data" not in v["detail"]
+
+
+def test_garbage_frames_do_not_count_as_data():
+    now = [0.0]
+    d = __import__("tempfile").mkdtemp()
+    path = f"{d}/garbage.sock"
+    srv = socket.socket(socket.AF_UNIX)
+    srv.bind(path)
+    srv.listen(1)
+    try:
+        c = StatusClient(path, clock=lambda: now[0])
+        c.connect()
+        conn, _ = srv.accept()
+        conn.sendall(b'not json\n{"schema": "someone-else/v1", "type": "state", "status": "clear"}\n')
+        time.sleep(0.1)
+        c.poll()
+        now[0] += STALE_AFTER_S + 2
+        assert c.view()["detail"] == "connected, no data for 8 s"
+        conn.close()
+    finally:
+        srv.close()

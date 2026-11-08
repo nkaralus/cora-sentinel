@@ -128,7 +128,7 @@ def test_unreadable_firewall_is_unknown_never_in_force(tmp_path, tree):
     s = hub_for(tmp_path, cg, fw).snapshot()
     t = task_of(s)
     assert t["enforced"] == [] and t["unknown"] == ["ISOLATE"]
-    assert s["truth_errors"] == ["firewall unreadable (OSError)"] and s["status"] == "clear"
+    assert s["truth_errors"] == ["firewall unreadable (OSError)"] and s["status"] == "blind"   # never "clear"
 
 
 def test_unknown_still_offers_sever(tmp_path, tree):
