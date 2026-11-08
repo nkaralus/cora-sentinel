@@ -94,7 +94,7 @@ PAGES = {
     "cora-run": dict(
         summary="run a command as a cora-sentinel task",
         synopsis=["**cora-run** //NAME// //CMD// [//ARGS//...]",
-                  "**cora-run** **--app** //APP// [**--memory-max** //SIZE//] [**--memory-high** //SIZE//] [**--socket** //PATH//] [**--**] //CMD// [//ARGS//...]"],
+                  "**cora-run** **--app** //APP// [**--memory-max** //SIZE//] [**--memory-high** //SIZE//] [**--psi-memory** //TRIGGER//|**off**] [**--socket** //PATH//] [**--**] //CMD// [//ARGS//...]"],
         description=[
             ("p", "**cora-run** runs //CMD// as a task named //NAME//. It creates the cgroup //root///NAME//, moves itself into it, "
                   "and then replaces itself with //CMD//, so the task and everything it forks are in that cgroup from their first "

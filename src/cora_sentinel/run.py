@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """cora-run NAME CMD [ARGS...]  - run CMD as a cora task.
-cora-run --app APP [--memory-max SIZE] [--memory-high SIZE] [--socket PATH] [--] CMD [ARGS...]
+cora-run --app APP [--memory-max SIZE] [--memory-high SIZE] [--psi-memory TRIGGER|off] [--socket PATH] [--] CMD [ARGS...]
 
 --app: the UNPRIVILEGED path (no root, no sudo). cora-run asks the running cora-sentinel, over its socket, for a new
 ephemeral scope "<app>-<6 hex>" with the given memory limits; the daemon moves THIS process into it (it knows the pid
 from the socket, not from the request). cora-run then checks /proc/self/cgroup and only then execs CMD, which stays in
 the scope with everything it starts. Needs membership of the daemon's --ui-group (usermod -aG cora YOU).
   --app steam      becomes steam-<SteamAppId> when Steam sets SteamAppId: launch options  cora-run --app steam %command%
+  --psi-memory     the scope's memory-pressure tripwire, "some|full STALL_US WINDOW_US"; default "some 150000 1000000"
+                   (150 ms of stall in any 1 s), "off" for none. SIGNAL ONLY: the tray turns amber and the journal
+                   says so; nothing is changed. If the kernel refuses it, the program still starts and you are told.
   APP is lowercased, other characters become '-', at most 32. SIZE: bytes or 512M / 8G. Exit 4 if no scope was made
   (daemon unreachable, permission, refused, or the move cannot be seen in /proc/self/cgroup): CMD never starts unconfined.
 
@@ -128,9 +131,10 @@ def in_scope(scope: str) -> bool:
 
 
 def parse_app_args(argv):
-    opts = {"app": None, "memory_max": None, "memory_high": None,
+    opts = {"app": None, "memory_max": None, "memory_high": None, "psi_memory": None,
             "socket": os.environ.get("CORA_UI_SOCKET", DEFAULT_SOCKET)}
-    keys = {"--app": "app", "--memory-max": "memory_max", "--memory-high": "memory_high", "--socket": "socket"}
+    keys = {"--app": "app", "--memory-max": "memory_max", "--memory-high": "memory_high", "--socket": "socket",
+            "--psi-memory": "psi_memory"}
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -157,7 +161,8 @@ def parse_app_args(argv):
     return opts, cmd
 
 
-def request_scope(path: str, app: str, memory_max=None, memory_high=None, timeout: float = LAUNCH_TIMEOUT_S) -> dict:
+def request_scope(path: str, app: str, memory_max=None, memory_high=None, timeout: float = LAUNCH_TIMEOUT_S,
+                  psi_memory=None) -> dict:
     """Ask the daemon to put THIS process in a new scope. Returns its reply; raises OSError if it cannot be asked."""
     import json
     import socket
@@ -170,6 +175,8 @@ def request_scope(path: str, app: str, memory_max=None, memory_high=None, timeou
             req["memory_max"] = memory_max
         if memory_high is not None:
             req["memory_high"] = memory_high
+        if psi_memory is not None:
+            req["psi_memory"] = psi_memory
         s.sendall((json.dumps(req) + "\n").encode())
         f = s.makefile("rb")
         while True:
@@ -192,7 +199,7 @@ def launch_main(argv) -> int:
         return 2
     path = opts["socket"]
     try:
-        r = request_scope(path, app, opts["memory_max"], opts["memory_high"])
+        r = request_scope(path, app, opts["memory_max"], opts["memory_high"], psi_memory=opts["psi_memory"])
     except (OSError, ValueError) as e:
         hint = {13: " (are you in the daemon's --ui-group? log out and back in after usermod)",
                 2: " (is cora-sentinel running with --ui-socket?)", 111: " (cora-sentinel is not listening)"}
@@ -208,8 +215,11 @@ def launch_main(argv) -> int:
               f"not starting {cmd[0]}", file=sys.stderr)
         return EXIT_LAUNCH
     lim = r.get("memory_max")
-    print(f"cora_run: {cmd[0]} runs in scope {scope}" + (f", memory.max {lim} bytes" if lim else ""),
-          file=sys.stderr, flush=True)
+    print(f"cora_run: {cmd[0]} runs in scope {scope}" + (f", memory.max {lim} bytes" if lim else "")
+          + (f", pressure tripwire '{r['psi_memory']}'" if r.get("psi_memory") else ""), file=sys.stderr, flush=True)
+    if r.get("psi_error"):
+        print(f"cora_run: WARNING: no pressure tripwire: {r['psi_error']} (the program starts anyway; the "
+              f"tripwire only signals)", file=sys.stderr, flush=True)
     os.execvp(cmd[0], cmd)
 
 

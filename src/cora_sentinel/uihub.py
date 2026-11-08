@@ -22,6 +22,7 @@ Status precedence (the worst wins):
   alarm       an event was DROPPED without being contained, or an action FAILED, this session (stays until restart:
               the operator has to look at the log; a light that heals itself hides exactly the event that mattered)
   contained   at least one live task is isolated, throttled or suspended right now
+  pressure    a launch scope's memory-pressure tripwire fired within PRESSURE_HOLD_S (signal only: nothing is changed)
   evaluating  the model has events queued or in flight
   clear       none of the above
 
@@ -76,6 +77,7 @@ COMMANDS = {"sever": "ISOLATE", "cap": "THROTTLE"}      # tighten only: there is
 MAX_ACTIONS = 4
 COMMAND_INTERVAL_S = 1.0
 MANUAL_POLICY = "manual_operator_override"
+PRESSURE_HOLD_S = 10.0                              # a tripped wire keeps the scope amber this long after its last trip
 COMMUNITY_PREFIX = "community-"
 ACTION_RE = re.compile(r"^(done|dry-run):(ISOLATE|THROTTLE|SUSPEND|TERMINATE)@cgroup:(.+?)(\[.*\])?$")
 CONTAINING = ("ISOLATE", "THROTTLE", "SUSPEND")
@@ -119,6 +121,7 @@ class Hub:
                  cgroup_id: Optional[Callable[[str], Optional[int]]] = None,
                  act: Optional[Callable[[str, str], str]] = None,
                  scopes=None,
+                 psi=None,
                  record: Optional[Callable[[dict], None]] = None,
                  log: Callable[[str], None] = lambda m: print(f"[ui] {m}", file=sys.stderr, flush=True),
                  clock: Callable[[], float] = time.monotonic):
@@ -128,6 +131,8 @@ class Hub:
         self._id_fn = cgroup_id or (lambda name: None)
         self._act, self._record = act, record
         self.scopes = scopes                       # cora_sentinel.scope.Scopes, or None (no --cgroup-root)
+        self.psi = psi                             # cora_sentinel.psi.PressureWatcher, or None
+        self._pressure: Dict[str, dict] = {}       # scope -> {"last", "count", "some_avg10", ...}
         self._gid: Optional[int] = None
         self._results: List[tuple] = []           # (conn, reply) finished by action threads, sent by the hub thread
         self._acting = 0
@@ -194,6 +199,17 @@ class Hub:
             self._dirty = True
         self._wake()
 
+    def note_pressure(self, name: str, stats: Dict[str, float]) -> None:
+        """A scope's PSI tripwire fired (the watcher's thread). Signal only."""
+        with self._lock:
+            rec = self._pressure.get(name) or {"count": 0}
+            rec.update(stats, last=self.clock(), count=rec["count"] + 1)
+            self._pressure[name] = rec
+            self._dirty = True
+        self.log(f"memory pressure in {name}: some avg10 {stats.get('some_avg10', '?')}%, full avg10 "
+                 f"{stats.get('full_avg10', '?')}% (trip {rec['count']}; signal only, nothing was changed)")
+        self._wake()
+
     # ------------------------------------------------------------------ the snapshot
     def snapshot(self) -> dict:
         live = self._tasks_fn()                          # {name: {"pids": n, "mem_bytes": b | None}}
@@ -206,6 +222,10 @@ class Hub:
             for name in list(self._baseline):
                 if name not in live:
                     del self._baseline[name]
+            now_c = self.clock()
+            for name in list(self._pressure):
+                if name not in live:
+                    del self._pressure[name]
             tasks = []
             truth_errors: set = set()
             for name in sorted(live):
@@ -225,6 +245,10 @@ class Hub:
                               # really in force (not dry-run): the tray offers a breaker only if it is not here
                               "enforced": enforced,
                               "unknown": sorted(info.get("unknown", []))})
+                pr = self._pressure.get(name)
+                if pr is not None:
+                    tasks[-1]["pressure"] = {"active": now_c - pr["last"] <= PRESSURE_HOLD_S, "count": pr["count"],
+                                             "some_avg10": pr.get("some_avg10"), "full_avg10": pr.get("full_avg10")}
                 rec = self.scopes.describe(name) if self.scopes is not None else None
                 if rec:
                     tasks[-1]["scope"] = {"app": rec["app"], "uid": rec["uid"],
@@ -235,6 +259,8 @@ class Hub:
                 status = "alarm"
             elif any(t["contained"] for t in tasks):
                 status = "contained"
+            elif any((t.get("pressure") or {}).get("active") for t in tasks):
+                status = "pressure"
             elif evaluating:
                 status = "evaluating"
             else:
@@ -426,6 +452,11 @@ class Hub:
         now = self.clock()
         if now - c["last_cmd"] < COMMAND_INTERVAL_S:
             return refuse("slow down: one command per second")
+        from cora_sentinel.psi import PsiError, parse_trigger
+        try:
+            trigger = parse_trigger(msg.get("psi_memory"))
+        except PsiError as e:
+            return refuse(str(e))
         pid, uid = c.get("pid"), c["uid"]
         start = proc_starttime(pid)
         if not pid or start is None or start != c.get("start"):
@@ -434,7 +465,7 @@ class Hub:
         c["last_cmd"] = now
         try:
             name = self.scopes.create_scope(msg.get("app"), uid=uid, memory_max=msg.get("memory_max"),
-                                            memory_high=msg.get("memory_high"))
+                                            memory_high=msg.get("memory_high"), psi_memory=trigger)
         except ScopeError as e:
             return refuse(str(e))
         try:
@@ -443,12 +474,24 @@ class Hub:
             self.scopes.reap()                       # nothing entered: it goes once its TTL lapses
             return refuse(str(e))
         rec = self.scopes.describe(name)
+        psi_error = None
+        if trigger is not None:
+            # SIGNAL ONLY, so it fails OPEN: a refused trigger changes what you are told, not what is enforced
+            if self.psi is None:
+                psi_error = "pressure tripwires are unavailable in this daemon"
+            else:
+                try:
+                    self.psi.add(name, trigger)
+                except PsiError as e:
+                    psi_error = str(e)
         self.log(f"uid {uid} launched pid {pid} into {name} (memory.max {rec.get('memory_max')}, "
-                 f"memory.high {rec.get('memory_high')})")
+                 f"memory.high {rec.get('memory_high')}, pressure "
+                 f"{trigger if trigger and not psi_error else 'OFF' if not trigger else 'UNAVAILABLE: ' + psi_error})")
         with self._lock:
             self._dirty = True
         self._send(conn, {"schema": SCHEMA, "type": "result", "id": tag, "ok": True, "scope": name,
-                          "memory_max": rec.get("memory_max"), "memory_high": rec.get("memory_high")})
+                          "memory_max": rec.get("memory_max"), "memory_high": rec.get("memory_high"),
+                          "psi_memory": trigger if not psi_error else None, "psi_error": psi_error})
 
     def _run_action(self, conn, tag, verdict: str, task: str, uid) -> None:
         try:

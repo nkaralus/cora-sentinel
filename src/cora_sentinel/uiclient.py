@@ -20,7 +20,7 @@ from typing import Callable, Optional
 from cora_sentinel.uihub import SCHEMA, STALE_AFTER_S
 
 DEFAULT_SOCKET = "/run/cora-sentinel/ui.sock"
-COLOURS = {"clear": "green", "evaluating": "amber", "contained": "indigo", "alarm": "red", "unreachable": "grey"}
+COLOURS = {"clear": "green", "evaluating": "amber", "pressure": "amber", "contained": "indigo", "alarm": "red", "unreachable": "grey"}
 MAX_LINE = 1024 * 1024
 
 
@@ -139,7 +139,9 @@ class StatusClient:
         mode = s.get("mode")
         st = s.get("status", "clear")
         sess = s.get("session") or {}
+        hot = [t["name"] for t in s.get("tasks", []) if (t.get("pressure") or {}).get("active")]
         label = {"clear": "all clear", "evaluating": f"model evaluating ({s.get('evaluating', 0)})",
+                 "pressure": f"memory pressure: {', '.join(hot)}",
                  "contained": "containment active", "alarm": "ALARM: check the decision log"}.get(st, st)
         enforced = any(t.get("enforced") for t in s.get("tasks", []))
         if st == "contained" and not enforced and mode != "enforce":
@@ -154,6 +156,8 @@ class StatusClient:
                           + f" ({human_bytes(t.get('mem_delta_bytes'), True)})"
                           + (f" [{', '.join(t['contained'])}]" if t.get("contained") else "")
                           + (f" [{', '.join(u + '?' for u in t['unknown'])}]" if t.get("unknown") else "")
+                          + (f" [PRESSURE some {(t.get('pressure') or {}).get('some_avg10', '?')}%]"
+                             if (t.get("pressure") or {}).get("active") else "")
                           + (" \u2014 exited" if t.get("pids") == 0 else ""),
                   # offered only if the daemon has the breaker AND it is not already in force on this task
                   "can_sever": "sever" in breakers and "ISOLATE" not in (t.get("enforced") or []),

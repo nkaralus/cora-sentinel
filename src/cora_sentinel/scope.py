@@ -94,7 +94,7 @@ class Scopes:
         os.replace(tmp, self.state)
 
     # ------------------------------------------------------------------ create
-    def create_scope(self, app: str, uid: int, memory_max=None, memory_high=None) -> str:
+    def create_scope(self, app: str, uid: int, memory_max=None, memory_high=None, psi_memory: Optional[str] = None) -> str:
         if not isinstance(app, str) or not APP_RE.fullmatch(app):
             raise ScopeError(f"bad app name {app!r}: lowercase letters, digits, '-' and '_', at most 32")
         if not isinstance(uid, int) or isinstance(uid, bool) or uid < 0:
@@ -133,7 +133,7 @@ class Scopes:
             raise ScopeError(f"could not set the limits ({e}); is the memory controller enabled on "
                              f"{self.cg.root}? The scope was removed, nothing started without its ceiling") from None
         self.owned[name] = {"app": app, "uid": uid, "created": self.clock(), "entered": False,
-                            "memory_max": mx, "memory_high": hi}
+                            "memory_max": mx, "memory_high": hi, "psi_memory": psi_memory}
         self._save()
         return name
 

@@ -38,7 +38,7 @@ from typing import Callable, Deque, Dict, List, Optional, Tuple
 from cora_sentinel.report import protocol_of
 from cora_sentinel.blocklist import Blocklist, DomainResolver
 from cora_sentinel.reload import ListError, Reloader, load_lists
-from cora_sentinel.cgroup import CgroupRoot
+from cora_sentinel.cgroup import CgroupError, CgroupRoot
 
 try:
     from cora_sentinel._vendor.subnetbus import AABB, Registry   # the vendored, pinned copy (cora_sentinel/_vendor)
@@ -911,6 +911,24 @@ def main() -> int:
         except OSError as e:
             print(f"[cora-sentinel] launch scopes unavailable: {e}", file=sys.stderr)
             scopes = None
+    psi = None
+    hub_ref: dict = {"hub": None}
+    if scopes is not None:
+        from cora_sentinel.psi import PressureWatcher, PsiError
+
+        def tripped(name: str, stats: dict) -> None:
+            if hub_ref["hub"] is not None:
+                hub_ref["hub"].note_pressure(name, stats)
+            else:
+                print(f"[psi] memory pressure in {name}: {stats} (signal only)", file=sys.stderr, flush=True)
+        psi = PressureWatcher(cg, on_trip=tripped)
+        psi.start()
+        for name, rec in sorted(scopes.owned.items()):   # a restart re-arms what was running before
+            if rec.get("psi_memory") and rec.get("entered"):
+                try:
+                    psi.add(name, rec["psi_memory"])
+                except (PsiError, CgroupError, OSError) as e:
+                    print(f"[psi] could not re-arm {name}: {e}", file=sys.stderr)
     hub = None
     adj_ref: dict = {"adj": None}
     if a.ui_socket:
@@ -940,7 +958,8 @@ def main() -> int:
                   tasks=cgroup_tasks(cg, fw) if cg else None,
                   evaluating=lambda: adj_ref["adj"].pending() if adj_ref["adj"] else 0,
                   cgroup_id=cg.cgroup_id if cg else None,
-                  act=manual_act, record=manual_record, scopes=scopes)
+                  act=manual_act, record=manual_record, scopes=scopes, psi=psi)
+        hub_ref["hub"] = hub
         try:
             hub.start()
         except OSError as e:
@@ -1035,6 +1054,8 @@ def main() -> int:
             next_reap = time.monotonic() + 5.0           # empty launch scopes go away within ~5 s
             try:
                 for name in scopes.reap():
+                    if psi is not None:
+                        psi.remove(name)
                     print(f"[cora-sentinel] launch scope {name} ended and was removed", file=sys.stderr, flush=True)
             except Exception as e:
                 print(f"[cora-sentinel] scope reap failed: {e!r}", file=sys.stderr)
@@ -1054,6 +1075,8 @@ def main() -> int:
         adj.stop()
     if hub:
         hub.stop()
+    if psi is not None:
+        psi.stop()
     reloader.stop()
     if reloader.resolver:
         reloader.resolver.stop()
