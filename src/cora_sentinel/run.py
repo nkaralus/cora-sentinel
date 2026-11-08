@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
 """cora-run NAME CMD [ARGS...]  - run CMD as a cora task.
+cora-run --app APP [--memory-max SIZE] [--memory-high SIZE] [--socket PATH] [--] CMD [ARGS...]
+
+--app: the UNPRIVILEGED path (no root, no sudo). cora-run asks the running cora-sentinel, over its socket, for a new
+ephemeral scope "<app>-<6 hex>" with the given memory limits; the daemon moves THIS process into it (it knows the pid
+from the socket, not from the request). cora-run then checks /proc/self/cgroup and only then execs CMD, which stays in
+the scope with everything it starts. Needs membership of the daemon's --ui-group (usermod -aG cora YOU).
+  --app steam      becomes steam-<SteamAppId> when Steam sets SteamAppId: launch options  cora-run --app steam %command%
+  APP is lowercased, other characters become '-', at most 32. SIZE: bytes or 512M / 8G. Exit 4 if no scope was made
+  (daemon unreachable, permission, refused, or the move cannot be seen in /proc/self/cgroup): CMD never starts unconfined.
 
 Refuses (exit 3) if <root>/NAME is left over from an earlier run and still carries containment (an nft drop rule,
 a freeze, or THROTTLE limits): a relaunch reuses that cgroup, so it would start already severed, frozen or capped,
@@ -13,11 +22,15 @@ everything it forks stay in that cgroup from its first instruction (no race,
 no marker argument). Root: $CORA_CGROUP_ROOT (default /sys/fs/cgroup/cora).
 """
 import os
+import re
 import sys
 
 from cora_sentinel.cgroup import DEFAULT_MOUNT, DEFAULT_ROOT, CgroupError, CgroupRoot
 
 EXIT_CONTAINED = 3      # the task's cgroup still carries containment from an earlier run: release it first
+EXIT_LAUNCH = 4         # --app: no scope was made, so CMD was not started
+DEFAULT_SOCKET = "/run/cora-sentinel/ui.sock"
+LAUNCH_TIMEOUT_S = 10.0
 
 
 def _preinstall_tap(cg: CgroupRoot, name: str) -> None:
@@ -85,7 +98,124 @@ def preflight(cg: CgroupRoot, name: str, fw=None, warn=lambda m: print(m, file=s
     return None
 
 
+def app_name(raw: str, env=os.environ) -> str:
+    """'Dota 2' -> 'dota-2'; 'steam' -> 'steam-570' when Steam set SteamAppId=570. The daemon validates again."""
+    name = re.sub(r"[^a-z0-9_-]+", "-", (raw or "").strip().lower()).strip("-_")
+    appid = env.get("SteamAppId") or env.get("SteamGameId")
+    if name == "steam" and appid and appid.isdigit():
+        name = f"steam-{appid}"
+    name = name[:32].rstrip("-_")
+    if not name:
+        raise ValueError(f"--app {raw!r} leaves no usable name (letters or digits needed)")
+    return name
+
+
+SCOPE_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}-[0-9a-f]{6}", re.ASCII)
+
+
+def in_scope(scope: str) -> bool:
+    """What the kernel says this process is in (cgroup v2: the "0::" line). Only a real scope name can match: an empty
+    or malformed answer must never compare equal to the root cgroup's empty last segment."""
+    if not isinstance(scope, str) or not SCOPE_RE.fullmatch(scope):
+        return False
+    try:
+        for line in open("/proc/self/cgroup"):
+            if line.startswith("0::"):
+                return line.rstrip("\n").rsplit("/", 1)[-1] == scope
+    except OSError:
+        pass
+    return False
+
+
+def parse_app_args(argv):
+    opts = {"app": None, "memory_max": None, "memory_high": None,
+            "socket": os.environ.get("CORA_UI_SOCKET", DEFAULT_SOCKET)}
+    keys = {"--app": "app", "--memory-max": "memory_max", "--memory-high": "memory_high", "--socket": "socket"}
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--":
+            i += 1
+            break
+        k, eq, v = a.partition("=")
+        if k in keys:
+            if not eq:
+                if i + 1 >= len(argv):
+                    raise ValueError(f"{a} needs a value")
+                v, i = argv[i + 1], i + 1
+            opts[keys[k]] = v
+            i += 1
+            continue
+        if a.startswith("--"):
+            raise ValueError(f"unknown option {a}")
+        break
+    cmd = argv[i:]
+    if not cmd:
+        raise ValueError("no command to run")
+    if opts["app"] is None:
+        raise ValueError("--app is required")
+    return opts, cmd
+
+
+def request_scope(path: str, app: str, memory_max=None, memory_high=None, timeout: float = LAUNCH_TIMEOUT_S) -> dict:
+    """Ask the daemon to put THIS process in a new scope. Returns its reply; raises OSError if it cannot be asked."""
+    import json
+    import socket
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.settimeout(timeout)
+        s.connect(path)
+        req = {"cmd": "launch", "app": app, "id": "cora-run"}
+        if memory_max is not None:
+            req["memory_max"] = memory_max
+        if memory_high is not None:
+            req["memory_high"] = memory_high
+        s.sendall((json.dumps(req) + "\n").encode())
+        f = s.makefile("rb")
+        while True:
+            line = f.readline()
+            if not line:
+                raise OSError("cora-sentinel closed the connection without answering")
+            msg = json.loads(line)
+            if msg.get("type") == "result" and msg.get("id") == "cora-run":
+                return msg
+    finally:
+        s.close()                                # never inherited by CMD
+
+
+def launch_main(argv) -> int:
+    try:
+        opts, cmd = parse_app_args(argv)
+        app = app_name(opts["app"])
+    except ValueError as e:
+        print(f"cora_run: {e}\n\n{__doc__}", file=sys.stderr)
+        return 2
+    path = opts["socket"]
+    try:
+        r = request_scope(path, app, opts["memory_max"], opts["memory_high"])
+    except (OSError, ValueError) as e:
+        hint = {13: " (are you in the daemon's --ui-group? log out and back in after usermod)",
+                2: " (is cora-sentinel running with --ui-socket?)", 111: " (cora-sentinel is not listening)"}
+        print(f"cora_run: cannot ask cora-sentinel for a scope at {path}: {e}"
+              f"{hint.get(getattr(e, 'errno', None), '')}; not starting {cmd[0]}", file=sys.stderr)
+        return EXIT_LAUNCH
+    if not r.get("ok"):
+        print(f"cora_run: cora-sentinel refused the scope: {r.get('error')}; not starting {cmd[0]}", file=sys.stderr)
+        return EXIT_LAUNCH
+    scope = r.get("scope") or ""
+    if not in_scope(scope):
+        print(f"cora_run: cora-sentinel answered {scope!r}, but this process is not in it (/proc/self/cgroup); "
+              f"not starting {cmd[0]}", file=sys.stderr)
+        return EXIT_LAUNCH
+    lim = r.get("memory_max")
+    print(f"cora_run: {cmd[0]} runs in scope {scope}" + (f", memory.max {lim} bytes" if lim else ""),
+          file=sys.stderr, flush=True)
+    os.execvp(cmd[0], cmd)
+
+
 def main() -> int:
+    if sys.argv[1:2] and sys.argv[1].startswith("--app"):
+        return launch_main(sys.argv[1:])
     if len(sys.argv) < 3:
         print(__doc__)
         return 2

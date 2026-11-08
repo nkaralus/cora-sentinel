@@ -93,7 +93,8 @@ PAGES = {
 
     "cora-run": dict(
         summary="run a command as a cora-sentinel task",
-        synopsis=["**cora-run** //NAME// //CMD// [//ARGS//...]"],
+        synopsis=["**cora-run** //NAME// //CMD// [//ARGS//...]",
+                  "**cora-run** **--app** //APP// [**--memory-max** //SIZE//] [**--memory-high** //SIZE//] [**--socket** //PATH//] [**--**] //CMD// [//ARGS//...]"],
         description=[
             ("p", "**cora-run** runs //CMD// as a task named //NAME//. It creates the cgroup //root///NAME//, moves itself into it, "
                   "and then replaces itself with //CMD//, so the task and everything it forks are in that cgroup from their first "
@@ -110,11 +111,15 @@ PAGES = {
                 ("tp", "**CORA_CGROUP_MOUNT**", "Where cgroup v2 is mounted. Default /sys/fs/cgroup."),
                 ("tp", "**CORA_NFT_TABLE**", "The nftables table the tap uses. Default cora."),
                 ("tp", "**CORA_NFLOG_GROUP**", "The NFLOG group of the tap. Must match the sentinel's."),
+                ("tp", "**CORA_UI_SOCKET**", "With **--app**: the daemon's socket. Default /run/cora-sentinel/ui.sock."),
+                ("tp", "**SteamAppId**", "With **--app steam**: set by Steam, it makes the scope steam-//APPID//."),
                 ("tp", "**CORA_NO_PREFLIGHT**", "Exactly 1 skips the containment check (exit 3) and starts the task inside whatever "
                        "its cgroup still carries, with a warning. Containment never depended on the check; the tap tests use it to "
                        "watch an already-isolated task."),
             ]),
             ("EXIT STATUS", [("p", "2 if //NAME// or //CMD// is missing (it prints its usage). 1 if it cannot enter the cgroup. "
+                                   "4 with **--app** if no scope was made (the daemon unreachable, permission, a refusal, or the move not visible in "
+                                   "/proc/self/cgroup): //CMD// never starts unconfined. "
                                    "3 if //NAME//'s cgroup is left over from an earlier run and still carries containment "
                                    "(an nft drop rule, a freeze, or THROTTLE limits): a relaunch would inherit it, so it refuses "
                                    "and names the root-only undo (**cora-firewall release**, **cora-cgroup thaw** or "
