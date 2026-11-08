@@ -251,7 +251,7 @@ class Hub:
                                              "some_avg10": pr.get("some_avg10"), "full_avg10": pr.get("full_avg10")}
                 rec = self.scopes.describe(name) if self.scopes is not None else None
                 if rec:
-                    tasks[-1]["scope"] = {"app": rec["app"], "uid": rec["uid"],
+                    tasks[-1]["scope"] = {"app": rec["app"], "uid": rec["uid"], "profile": rec.get("profile", "app"),
                                           "memory_max": rec.get("memory_max"), "memory_high": rec.get("memory_high")}
                 truth_errors.update(info.get("errors", []))
             s = dict(self.session)
@@ -484,12 +484,13 @@ class Hub:
                     self.psi.add(name, trigger)
                 except PsiError as e:
                     psi_error = str(e)
-        self.log(f"uid {uid} launched pid {pid} into {name} (memory.max {rec.get('memory_max')}, "
+        self.log(f"uid {uid} launched pid {pid} into {name} (profile {rec.get('profile')}, memory.max {rec.get('memory_max')}, "
                  f"memory.high {rec.get('memory_high')}, pressure "
                  f"{trigger if trigger and not psi_error else 'OFF' if not trigger else 'UNAVAILABLE: ' + psi_error})")
         with self._lock:
             self._dirty = True
         self._send(conn, {"schema": SCHEMA, "type": "result", "id": tag, "ok": True, "scope": name,
+                          "profile": rec.get("profile"),
                           "memory_max": rec.get("memory_max"), "memory_high": rec.get("memory_high"),
                           "psi_memory": trigger if not psi_error else None, "psi_error": psi_error})
 

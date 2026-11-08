@@ -472,6 +472,27 @@ class Sentinel:
         self.cooldown_s = cooldown_s
         self._last: Dict[Tuple, float] = {}
         self.vip_skipped = self.tick_errors = 0
+        # Policy profile per task (cgroup name -> "agent" | "app"); the daemon points this at the launch-scope registry.
+        # Everything not launched with `cora-run --app` stays "agent": deny-by-default, exactly as before.
+        self.profile_of: Callable[[Optional[str]], str] = lambda name: "agent"
+        self.suppressed: collections.Counter = collections.Counter()
+
+    # The "app" profile, for desktop programs launched with `cora-run --app`. They read all over $HOME and /usr, talk
+    # to public servers and load hundreds of MB at once BY DESIGN, so the agent rules turned every game into an
+    # ISOLATE (a Minecraft session ran at 3-4 FPS behind a drop rule after 72 path violations). An app scope raises
+    # ONLY blocklist hits (community trackers, rogue subnets: still contained at once); memory is governed by its
+    # ceiling and PSI tripwire instead of the spike heuristic. This loosens nothing a member of the group could not
+    # already get by not using cora-run at all, and a scope never changes profile after launch.
+    APP_SILENT = ("path_violation", "memory_spike")
+
+    def app_allows(self, name: Optional[str], kind: str, evidence: Optional[dict]) -> bool:
+        if not name or self.profile_of(name) != "app":
+            return True
+        if kind in self.APP_SILENT:
+            return False
+        if kind == "unauthorized_connection" and not (evidence or {}).get("blocklist"):
+            return False
+        return True
 
     def cgroup_id_of(self, name: Optional[str]) -> Optional[int]:
         """The identity of a task's cgroup NOW (recorded in the event, so the gate can later prove it is still the same one)."""
@@ -509,6 +530,11 @@ class Sentinel:
         self.conn.blocklist = bl
 
     def _fire(self, key: Tuple, now: float, payload: dict) -> None:
+        a = payload.get("anomaly") or {}
+        if not self.app_allows((payload.get("subject") or {}).get("cgroup"), a.get("kind", ""), a.get("evidence")):
+            with self._fire_lock:
+                self.suppressed[a.get("kind", "?")] += 1
+            return                                   # the ONE place every source passes (tick, sockdiag, NFLOG tap)
         with self._fire_lock:
             if now - self._last.get(key, -1e9) < self.cooldown_s:
                 return
@@ -548,15 +574,16 @@ class Sentinel:
                           f"({self.vip_skipped} skipped so far)", file=sys.stderr)
                 continue
             st = read_starttime(pid)
+            app = self.profile_of(self._cg.get(pid)) == "app"   # nothing below would be raised for it: do not pay for it
 
-            rss = read_rss_kb(pid)
+            rss = None if app else read_rss_kb(pid)
             if rss is not None:
                 ev = self.mem.feed(pid, now, rss)
                 if ev:
                     self._fire((pid, "memory_spike"), now,
                                self._payload(pid, vip, cmd, "memory_spike", "medium", ev, st))
 
-            for path in read_open_paths(pid):
+            for path in ([] if app else read_open_paths(pid)):
                 hit = self.policy.check(path)
                 if hit:
                     sev, p = hit
@@ -929,6 +956,8 @@ def main() -> int:
                     psi.add(name, rec["psi_memory"])
                 except (PsiError, CgroupError, OSError) as e:
                     print(f"[psi] could not re-arm {name}: {e}", file=sys.stderr)
+    if scopes is not None:
+        s.profile_of = scopes.profile
     hub = None
     adj_ref: dict = {"adj": None}
     if a.ui_socket:

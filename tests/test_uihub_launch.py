@@ -94,7 +94,8 @@ def test_the_feed_shows_the_scope_and_its_ceiling(world):
     hub, _, _ = world
     r = launch(Conn(hub), memory_max="8G")
     t = next(t for t in hub.snapshot()["tasks"] if t["name"] == r["scope"])
-    assert t["scope"] == {"app": "steam-570", "uid": os.getuid(), "memory_max": 8 * GiB, "memory_high": None}
+    assert t["scope"] == {"app": "steam-570", "uid": os.getuid(), "profile": "app", "memory_max": 8 * GiB,
+                          "memory_high": None}
     c = StatusClient("/x")
     c.sock, c.last_rx, c.clock = object(), 0.0, (lambda: 0.0)
     c.state = hub.snapshot()

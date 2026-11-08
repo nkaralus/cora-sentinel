@@ -37,6 +37,7 @@ from cora_sentinel.cgroup import CgroupRoot, CgroupError
 
 APP_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}", re.ASCII)       # + "-" + 6 hex = at most 39: inside NAME_RE's 40
 MAX_SCOPES = 64
+PROFILES = ("app", "agent")    # see Sentinel.app_allows; fixed at creation, never changed
 ENTER_TTL_S = 30.0
 MIN_MEMORY = 64 * 1024 * 1024                                    # below this a game dies at start; refuse instead
 SIZE_RE = re.compile(r"(\d+)([KMGT]?)", re.ASCII)
@@ -94,11 +95,14 @@ class Scopes:
         os.replace(tmp, self.state)
 
     # ------------------------------------------------------------------ create
-    def create_scope(self, app: str, uid: int, memory_max=None, memory_high=None, psi_memory: Optional[str] = None) -> str:
+    def create_scope(self, app: str, uid: int, memory_max=None, memory_high=None, psi_memory: Optional[str] = None,
+                     profile: str = "app") -> str:
         if not isinstance(app, str) or not APP_RE.fullmatch(app):
             raise ScopeError(f"bad app name {app!r}: lowercase letters, digits, '-' and '_', at most 32")
         if not isinstance(uid, int) or isinstance(uid, bool) or uid < 0:
             raise ScopeError("uid must come from SO_PEERCRED")
+        if profile not in PROFILES:
+            raise ScopeError(f"unknown profile {profile!r}: {', '.join(PROFILES)}")
         mx, hi = parse_size(memory_max), parse_size(memory_high)
         if mx is not None and hi is not None and hi > mx:
             raise ScopeError(f"memory_high ({hi}) above memory_max ({mx}): the soft limit must not exceed the hard one")
@@ -133,7 +137,7 @@ class Scopes:
             raise ScopeError(f"could not set the limits ({e}); is the memory controller enabled on "
                              f"{self.cg.root}? The scope was removed, nothing started without its ceiling") from None
         self.owned[name] = {"app": app, "uid": uid, "created": self.clock(), "entered": False,
-                            "memory_max": mx, "memory_high": hi, "psi_memory": psi_memory}
+                            "memory_max": mx, "memory_high": hi, "psi_memory": psi_memory, "profile": profile}
         self._save()
         return name
 
@@ -211,6 +215,13 @@ class Scopes:
         if gone:
             self._save()
         return gone
+
+    def profile(self, name: Optional[str]) -> str:
+        """"app" or "agent" for a scope this daemon made; "agent" for anything else (root-launched tasks).
+        A registry entry from before profiles existed was an --app launch: "app". Called from the detector threads:
+        one dict lookup, no lock (a dict read is atomic in CPython)."""
+        rec = self.owned.get(name) if name else None
+        return "agent" if rec is None else rec.get("profile", "app")
 
     def describe(self, name: str) -> Optional[dict]:
         rec = self.owned.get(name)
