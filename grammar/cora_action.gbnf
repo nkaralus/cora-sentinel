@@ -1,0 +1,20 @@
+# cora_action.gbnf - one cora action as a Mule Task Block (mule-protocol spec 1.1.0) plus four geometry slots.
+# Layer 1 of tools/cora_exec_bridge.py: it narrows what the model can emit; the bridge still validates every byte.
+#
+# Conforms to both validators downstream:
+#   mule-protocol  every core slot (frame_id, time_slot, subnet, op, target, ref, exclude), subnet a /24 inside
+#                  10.0.0.0/8, target a %Name, ref a host IP, no floats; x/y/w/h are extension slots
+#   subnetbus      subnets are /24, target is a registry node NAME, ref must equal that node's IP (GI_1)
+# v1 opens only 10.2.0.0/16: subnets 10.2.X.0/24. time_slot is always SLOT_3_EXECUTE and exclude is always the
+# five standard exclusions, so the model cannot drop one. Integer bounds match the bridge's mule extensions exactly:
+# x, y in -999999..999999; w, h in 1..99999.
+root ::= "{\"frame_id\":" frame ",\"time_slot\":\"SLOT_3_EXECUTE\",\"subnet\":" subnet ",\"op\":" op ",\"target\":" target ",\"ref\":" ip2 ",\"exclude\":" exclude ",\"x\":" coord ",\"y\":" coord ",\"w\":" size ",\"h\":" size "}"
+frame   ::= "\"0x" [0-9a-f] [0-9a-f] [0-9a-f] [0-9a-f] "\""
+subnet  ::= "\"10.2." octet ".0/24\""
+ip2     ::= "\"10.2." octet "." octet "\""
+octet   ::= [0-9] | [1-9] [0-9] | "1" [0-9] [0-9] | "2" [0-4] [0-9] | "25" [0-5]
+op      ::= "\"create\"" | "\"set\"" | "\"place\""
+target  ::= "\"%" [A-Z] [a-zA-Z0-9]{0,63} "\""
+exclude ::= "[\"untyped_variables\",\"relative_paths_up_tree\",\"cross_subnet_queries\",\"freeform_code_blocks\",\"synthetic_transactions\"]"
+coord   ::= "-"? ([0-9] | [1-9] [0-9]{0,5})
+size    ::= [1-9] [0-9]{0,4}
