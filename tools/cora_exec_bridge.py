@@ -36,6 +36,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import re
 import sys
 import time
 import uuid
@@ -45,6 +46,7 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 
 from cora_sentinel._vendor.mule import MuleValidator, load_spec         # vendored and pinned, like the bus
 from cora_sentinel._vendor.subnetbus import AABB, Action, BusError, Registry, check_all
+from cora_sentinel._vendor.subnetbus.registry import KIND_RE
 
 OPS = frozenset({"create", "set", "place"})
 NAMESPACE = ipaddress.ip_network("10.2.0.0/16")          # v1: every other subnet is closed
@@ -53,6 +55,29 @@ MULE_SPEC_VERSION = "1.1.0"                               # the slots this bridg
 TICKET_TTL_S = 60
 COORD_MAX = 999_999
 SIZE_MAX = 99_999
+
+
+def node_name_rule(spec: Mapping[str, Any]) -> "re.Pattern[str]":
+    """The node-name rule cora enforces, from mule's `target` slot: its charset, with the repetition bound set so the
+    whole name fits maxLength. subnetbus alone allows one character more (%, 1, then 63), a name mule would refuse as
+    a target. Used with fullmatch only."""
+    slot = spec["slots"]["target"]
+    max_len = int(slot["maxLength"])
+    pattern, n = re.subn(r"\{0,\d+\}$", "{0,%d}" % (max_len - 2), slot["pattern"])
+    if n != 1 or not pattern.startswith("%[A-Z]"):
+        raise ValueError(f"mule's target pattern {slot['pattern']!r} is not the %X... shape this rule was written for")
+    return re.compile(pattern, re.ASCII)
+
+
+NODE_NAME_RE = node_name_rule(load_spec())
+NODE_NAME_MAX = int(load_spec()["slots"]["target"]["maxLength"])
+
+
+def name_problems(reg: Registry) -> list:
+    """Nodes whose names cora could never target (too long for mule, or outside the charset)."""
+    return sorted(n.name for n in reg.nodes() if not NODE_NAME_RE.fullmatch(n.name))
+
+
 EXTENSIONS = {"x": {"type": "integer", "minimum": -COORD_MAX, "maximum": COORD_MAX},
               "y": {"type": "integer", "minimum": -COORD_MAX, "maximum": COORD_MAX},
               "w": {"type": "integer", "minimum": 1, "maximum": SIZE_MAX},
@@ -184,6 +209,30 @@ class Bridge:
         return (Verdict(True, "OK", f"{block['op']} {block['target']} ({block['ref']}) in {block['subnet']} at "
                                     f"x={block['x']} y={block['y']} w={block['w']} h={block['h']}, "
                                     f"registry revision {verdict.revision}"), block, verdict.revision)
+
+
+    def mint_reserve(self, name: Any, kind: Any, subnet: Any) -> Tuple[Verdict, Optional[Ticket]]:
+        """An operator's reservation: a node with an IP and no bounds yet, the placeholder `create` fills. Not model
+        output, so not mule's to validate; the same name, subnet and registry rules apply. Never raises."""
+        try:
+            if type(name) is not str or not NODE_NAME_RE.fullmatch(name):
+                return _no("BAD_NAME", f"{name!r}: must match {NODE_NAME_RE.pattern} (at most {NODE_NAME_MAX})"), None
+            if type(kind) is not str or not KIND_RE.fullmatch(kind):
+                return _no("BAD_KIND", f"{kind!r}: must match {KIND_RE.pattern}"), None
+            if type(subnet) is not str or not ipaddress.ip_network(subnet).subnet_of(NAMESPACE):
+                return _no("SUBNET_CLOSED", f"{subnet!r} is outside {NAMESPACE}"), None
+            if self.registry.subnet(subnet) is None:
+                return _no("GI_1:UNKNOWN_SUBNET", subnet), None
+            clash = next((n.name for n in self.registry.nodes() if n.name.casefold() == name.casefold()), None)
+            if clash:
+                return _no("DUPLICATE_NAME", f"{name} collides with {clash}"), None
+            action = {"op": "reserve", "target": name, "kind": kind, "subnet": subnet}
+            raw = json.dumps(action, sort_keys=True, separators=(",", ":"))
+            return Verdict(True, "OK", f"reserve {name} ({kind}) in {subnet}"), Ticket(
+                str(uuid.uuid4()), hashlib.sha256(raw.encode("ascii")).hexdigest(), _freeze(action),
+                self.registry.revision, MappingProxyType({"mono": time.monotonic(), "wall": time.time()}))
+        except Exception as e:
+            return _no("INTERNAL", f"{e.__class__.__name__}: {e}"[:200]), None
 
 
 def process(raw: Any, registry: Registry, expect: Optional[Dict[str, Any]] = None) -> Verdict:

@@ -1,0 +1,7 @@
+# cora_set.gbnf - everything the model writes for `cora-exec set`: the target's bounds after the change, and nothing
+# else. The op, the target, its address, its subnet and every fixed slot come from the operator and the registry and
+# are assembled in code (tools/cora_exec.py), so the model cannot pick, rename or redirect them.
+# Integer ranges match the bridge's mule extensions exactly: x, y in -999999..999999; w, h in 1..99999.
+root  ::= "{\"x\":" coord ",\"y\":" coord ",\"w\":" size ",\"h\":" size "}"
+coord ::= "-"? ([0-9] | [1-9] [0-9]{0,5})
+size  ::= [1-9] [0-9]{0,4}

@@ -1,0 +1,5 @@
+# cora_place.gbnf - everything the model writes for `cora-exec place`: the gap, in px, between the target and the
+# reference node on the side the OPERATOR named (--side). The resulting bounds are computed in code.
+# gap in 0..99999.
+root ::= "{\"gap\":" gap "}"
+gap  ::= [0-9] | [1-9] [0-9]{0,4}

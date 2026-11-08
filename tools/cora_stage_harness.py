@@ -317,7 +317,9 @@ class Harness:
         """The bridge, against the registry the harness reads itself. (verdict, ticket | None)."""
         return Bridge(self.live_registry()).mint(raw, expect)
 
-    def submit(self, ticket: Any) -> Result:
+    def submit(self, ticket: Any, intent: Optional[Mapping[str, Any]] = None) -> Result:
+        """`intent` (the operator's op, target, ref, side, phrase) is journaled as data beside the ticket; it is never
+        read back as an instruction."""
         if not isinstance(ticket, Ticket) or type(ticket.action.get("subnet")) is not str:
             return Result(False, "BAD_TICKET", detail="only a Ticket minted by cora_exec_bridge")
         if not self.bootstrapped():
@@ -334,6 +336,8 @@ class Harness:
                     base_vid = self._live_vid()
                     rec = {"t": "RECEIVED", "id": ticket.id, "ticket": ticket.to_dict(), "subnet": subnet,
                            "base": base_vid, "pre": digest(manifest(self.versions / base_vid)), "vid": f"t-{ticket.id}"}
+                    if intent is not None:
+                        rec["intent"] = json.loads(json.dumps(dict(intent), default=str))   # plain data, nothing else
                     self.journal.append(rec)
                 self._f("after_received")
                 return self._run(rec)
@@ -350,7 +354,18 @@ class Harness:
         idx = self._index()
         return {"halted": self.halted(), "live": self._live_vid() if self.bootstrapped() else None,
                 "tickets": {i: t["state"] for i, t in idx.items()},
-                "parked": {t["subnet"]: i for i, t in idx.items() if t["state"] == "PARKED"}}
+                "parked": {t["subnet"]: i for i, t in idx.items() if t["state"] == "PARKED"},
+                "reserved": self.reserved() if self.bootstrapped() else []}
+
+    def reserved(self) -> List[dict]:
+        """Live nodes with no bounds yet (placeholders for create), with how long ago the journal committed their
+        reservation; None for one that predates the journal (e.g. bootstrapped into v0)."""
+        since = {t["ticket"]["action"].get("target"): t.get("committed_ts") for t in self._index().values()
+                 if t["state"] == "COMMITTED" and t["ticket"]["action"].get("op") == "reserve"}
+        now = time.time()
+        return [{"name": n.name, "ip": n.ip, "kind": n.kind, "subnet": n.subnet,
+                 "age_s": round(now - since[n.name], 1) if since.get(n.name) else None}
+                for n in sorted(self.live_registry().nodes(), key=lambda n: n.name) if n.bounds is None]
 
     def recover(self) -> List[Result]:
         """Roll back every non-terminal ticket whose owner is gone; keep PARKED ones that are intact."""
@@ -441,7 +456,10 @@ class Harness:
         a = t["ticket"]["action"]
         try:
             reg = Registry.load(stage / REGISTRY_FILE)
-            reg.set_bounds(a["target"], AABB(a["x"], a["y"], a["w"], a["h"]))   # re-runs the placement gates
+            if a.get("op") == "reserve":
+                reg.allocate(a["target"], a["subnet"], kind=a["kind"])          # an IP, no bounds: the placeholder
+            else:
+                reg.set_bounds(a["target"], AABB(a["x"], a["y"], a["w"], a["h"]))   # re-runs the placement gates
             self._f("apply")
             declared = [str(p) for p in (self.apply_files(stage, a) if self.apply_files else ())]
             reg.save(stage / REGISTRY_FILE)
@@ -461,7 +479,12 @@ class Harness:
         if new.revision != t["ticket"]["registry_rev"] + 1:
             problems.append(f"revision {new.revision}, expected {t['ticket']['registry_rev'] + 1}")
         node = new.get(a["target"])
-        if node is None or node.bounds != AABB(a["x"], a["y"], a["w"], a["h"]):
+        if a.get("op") == "reserve":
+            if old.get(a["target"]) is not None:
+                problems.append(f"{a['target']} existed before the reservation")
+            if node is None or node.bounds is not None or node.kind != a["kind"] or node.subnet != a["subnet"]:
+                problems.append(f"{a['target']} is not an unplaced {a['kind']} in {a['subnet']}")
+        elif node is None or node.bounds != AABB(a["x"], a["y"], a["w"], a["h"]):
             problems.append(f"{a['target']} does not have the ticket's bounds")
         od, nd = old.to_dict(), new.to_dict()
         if od["subnets"] != nd["subnets"]:
@@ -641,6 +664,8 @@ class Harness:
                 idx[r["id"]]["state"] = r["t"]
                 if "new" in r:
                     idx[r["id"]]["new"] = r["new"]
+                if r["t"] == "COMMITTED":
+                    idx[r["id"]]["committed_ts"] = r.get("ts")
         return idx
 
     def _view(self, rec: dict) -> dict:
