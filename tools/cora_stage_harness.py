@@ -357,6 +357,11 @@ class Harness:
                 "parked": {t["subnet"]: i for i, t in idx.items() if t["state"] == "PARKED"},
                 "reserved": self.reserved() if self.bootstrapped() else []}
 
+    def record(self, ticket_id: str) -> Optional[dict]:
+        """What the journal holds for one ticket (its RECEIVED record, current state, digests), as a copy; None if unknown."""
+        t = self._index().get(ticket_id)
+        return json.loads(json.dumps(t, default=list)) if t is not None else None
+
     def reserved(self) -> List[dict]:
         """Live nodes with no bounds yet (placeholders for create), with how long ago the journal committed their
         reservation; None for one that predates the journal (e.g. bootstrapped into v0)."""

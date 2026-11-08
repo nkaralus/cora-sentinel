@@ -89,8 +89,14 @@ def journal(base):
     (("set", "%Crate", "move it"), {"side": "left"}, "UNRESOLVED_INTENT"),
     (("place", "%Crate", "next to it"), {"side": "left"}, "UNRESOLVED_INTENT"),    # no ref
     (("place", "%Crate", "next to it"), {"ref": "%Wall"}, "UNRESOLVED_INTENT"),    # no side
-    (("place", "%Crate", "next to it"), {"ref": "%Wall", "side": "front"}, "UNRESOLVED_INTENT"),
-    (("place", "%Crate", "next to it"), {"ref": "%Wall", "side": "back"}, "UNRESOLVED_INTENT"),
+    (("place", "%Crate", "next to it"), {"ref": "%Wall", "side": "front"}, "UNSUPPORTED_SIDE"),
+    (("place", "%Crate", "next to it"), {"ref": "%Wall", "side": "back"}, "UNSUPPORTED_SIDE"),
+    (("set", "%Crate", None), {"dx": 5, "center": True}, "UNRESOLVED_INTENT"),
+    (("place", "%Crate", "x"), {"ref": "%Wall", "side": "left", "dx": 5}, "UNRESOLVED_INTENT"),
+    (("set", "%Spawn", None), {"dx": 5}, "NOT_PLACED"),
+    (("set", "%Spawn", None), {"center": True}, "NOT_PLACED"),
+    (("set", "%Other", None), {"center": True}, "UNRESOLVED_INTENT"),            # the lobby has no world
+    (("set", "%Crate", None), {"dx": 1.5}, "UNRESOLVED_INTENT"),
     (("place", "%Spawn", "next to it"), {"ref": "%Wall", "side": "left"}, "NOT_PLACED"),
     (("place", "%Crate", "next to it"), {"ref": "%Spawn", "side": "left"}, "NOT_PLACED"),
     (("create", "%Spawn", "make it"), {}, "UNRESOLVED_INTENT"),
@@ -157,7 +163,10 @@ def test_set_assembles_the_whole_block_and_parks_it_with_the_phrase_as_data(base
     assert (a["op"], a["target"], a["ref"], a["subnet"], a["time_slot"]) == ("set", "%Crate", "10.2.1.10", ARENA, "SLOT_3_EXECUTE")
     assert (a["x"], a["y"], a["w"], a["h"]) == (600, 600, 50, 50) and len(a["exclude"]) == 5
     assert rec["intent"] == {"op": "set", "target": "%Crate", "ref": None, "side": None,
-                             "phrase": "move it to x=600, y=600 please", "attempts": 1}
+                             "phrase": "move it to x=600, y=600 please", "attempts": 1,
+                             "model_output": '{"x":600,"y":600,"w":50,"h":50}',
+                             "model_outputs": ['{"x":600,"y":600,"w":50,"h":50}']}
+    assert out.change == "%Crate: [100, 100, 50, 50] -> [600, 600, 50, 50]"
 
 
 def test_set_on_a_reserved_node_is_assembled_as_create(base):
@@ -281,42 +290,53 @@ def test_sampling_the_grammar_never_yields_an_op_a_target_a_ref_or_a_subnet(op):
 @pytest.mark.parametrize("text", ['{"x":1,"y":1,"w":1,"h":1,"target":"%Wall"}', '{"x":1,"y":1,"w":1}', '{"gap":3}',
                                   '{"x":1.5,"y":1,"w":1,"h":1}', '{"x":true,"y":1,"w":1,"h":1}', "not json", ""])
 def test_anything_but_exactly_the_slots_is_refused_even_if_a_worker_returned_it(base, text):
-    out = run(base, Stub(text), "set", "%Crate", "move it")
-    assert out.code == "MODEL_OUTPUT_INVALID" and not (base / ".cascade" / "journal.jsonl").exists()
+    stub = Stub(text, text, text)
+    out = run(base, stub, "set", "%Crate", "move it")
+    assert (out.code, stub.calls) == ("MODEL_OUTPUT_INVALID", 3) and not (base / ".cascade" / "journal.jsonl").exists()
 
 
 # ================================================================ retries
-def test_a_fixable_rejection_is_retried_with_codes_and_numbers_only(base):
-    stub = Stub({"x": 300, "y": 100, "w": 50, "h": 50}, {"x": 990, "y": 100, "w": 50, "h": 50},
-                {"x": 600, "y": 600, "w": 50, "h": 50})
+@pytest.mark.parametrize("slots, code, conflict", [
+    ({"x": 300, "y": 100, "w": 50, "h": 50}, "GI_3:SOLID_OVERLAP", [300.0, 100.0, 20.0, 200.0]),   # the wall
+    ({"x": 990, "y": 100, "w": 50, "h": 50}, "GI_3:OUT_OF_WORLD", [0.0, 0.0, 1000.0, 1000.0]),     # the world
+])
+def test_a_spatial_refusal_goes_to_the_operator_after_exactly_one_call(base, slots, code, conflict):
+    stub = Stub(slots, {"x": 600, "y": 600, "w": 50, "h": 50})          # a legal second answer is never asked for
     out = run(base, stub, "set", "%Crate", "put it on the wall")
-    assert (out.code, stub.calls, out.model_calls) == ("PARKED", 3, 3)
-    assert [a["code"] for a in out.attempts] == ["GI_3:SOLID_OVERLAP", "GI_3:OUT_OF_WORLD", "OK"]
-    fb1 = json.loads(stub.seen[1]["messages"][-1]["content"])
-    fb2 = json.loads(stub.seen[2]["messages"][-1]["content"])
-    assert fb1 == {"rejected": "GI_3:SOLID_OVERLAP", "conflicts": [[300.0, 100.0, 20.0, 200.0]]}   # the wall's bounds
-    assert fb2 == {"rejected": "GI_3:OUT_OF_WORLD", "conflicts": [[0.0, 0.0, 1000.0, 1000.0]]}     # the world
-    assert stub.seen[1]["messages"][-2] == {"role": "assistant", "content": '{"x":300,"y":100,"w":50,"h":50}'}
-    for seen in stub.seen[1:]:                               # no free text from the bus ever reaches the model
-        fb = seen["messages"][-1]["content"]
-        assert "overlaps" not in fb and "world of" not in fb and "solid node" not in fb
-
-
-def test_at_most_two_retries(base):
-    overlap = {"x": 300, "y": 100, "w": 50, "h": 50}
-    stub = Stub(overlap, overlap, overlap, overlap)
-    out = run(base, stub, "set", "%Crate", "put it on the wall")
-    assert (out.code, stub.calls, len(out.attempts)) == ("GI_3:SOLID_OVERLAP", 3, 3)
+    assert (out.ok, out.code, stub.calls, out.model_calls) == (False, code, 1, 1)
+    assert out.conflicts == [conflict] and [a["code"] for a in out.attempts] == [code]
     assert not (base / ".cascade" / "journal.jsonl").exists()
 
 
-def test_a_rejection_the_model_cannot_fix_is_not_retried(base):
-    stub = Stub({"x": 0, "y": 0, "w": 50, "h": 50})
-    out = X.Exec(harness(base), stub).run("set", "%Spawn", "make it", ref="%Wall")
-    assert out.code == "PARKED" and stub.calls == 1                   # control: a reserved node is fine with set
-    stub = Stub(M.ModelError("MODEL_CRASH", "killed by SIGSEGV"), {"x": 1, "y": 1, "w": 1, "h": 1})
+def test_a_schema_rejection_is_retried_with_the_code_only(base):
+    stub = Stub({"x": 1, "y": 1, "w": 0, "h": 1}, {"x": 600, "y": 600, "w": 50, "h": 50})   # w=0: mule, not the bus
+    out = run(base, stub, "set", "%Crate", "make it flat")
+    assert (out.code, stub.calls) == ("PARKED", 2)
+    assert [a["code"] for a in out.attempts] == ["MULE_REJECT", "OK"]
+    assert stub.seen[1]["messages"][-2] == {"role": "assistant", "content": '{"x":1,"y":1,"w":0,"h":1}'}
+    assert json.loads(stub.seen[1]["messages"][-1]["content"]) == {"rejected": "MULE_REJECT", "conflicts": []}
+    assert journal(base)[0]["intent"]["model_outputs"] == ['{"x":1,"y":1,"w":0,"h":1}', '{"x":600,"y":600,"w":50,"h":50}']
+
+
+def test_at_most_two_retries(base):
+    flat = {"x": 1, "y": 1, "w": 0, "h": 1}
+    stub = Stub(flat, flat, flat, flat)
+    out = run(base, stub, "set", "%Crate", "make it flat")
+    assert (out.code, stub.calls, len(out.attempts)) == ("MULE_REJECT", 3, 3)
+    assert not (base / ".cascade" / "journal.jsonl").exists()
+
+
+def test_a_crashed_worker_is_retried_and_a_hung_one_is_not(base):
+    crash = M.ModelError("MODEL_CRASH", "killed by SIGSEGV")
+    stub = Stub(crash, {"x": 600, "y": 600, "w": 50, "h": 50})
+    out = run(base, stub, "set", "%Crate", "move it")
+    assert (out.code, stub.calls) == ("PARKED", 2)
+    stub = Stub(crash, crash, crash, crash)
     out = run(base, stub, "set", "%Other", "move it")
-    assert (out.code, stub.calls) == ("MODEL_CRASH", 1)
+    assert (out.code, stub.calls) == ("MODEL_CRASH", 3)
+    stub = Stub(M.ModelError("MODEL_TIMEOUT", "no reply"), {"x": 1, "y": 1, "w": 1, "h": 1})
+    out = run(base, stub, "set", "%Other", "move it")
+    assert (out.code, stub.calls) == ("MODEL_TIMEOUT", 1)
 
 
 # ================================================================ reserve
@@ -393,7 +413,7 @@ def stub_worker(tmp_path, mode, **kw):
 def test_a_worker_that_segfaults_is_model_crash_and_the_caller_lives_on(base, tmp_path):
     w = stub_worker(tmp_path, "segv")
     out = X.Exec(harness(base), w).run("set", "%Crate", "move it")
-    assert (out.ok, out.code, out.model_calls) == (False, "MODEL_CRASH", 1) and "SIGSEGV" in out.detail
+    assert (out.ok, out.code, out.model_calls) == (False, "MODEL_CRASH", 3) and "SIGSEGV" in out.detail
     assert harness(base).status()["tickets"] == {} and harness(base).halted() is None
     out = X.Exec(harness(base), w).run("set", "%Crate", "move it")   # restarts and crashes again, still contained
     assert out.code == "MODEL_CRASH"
@@ -472,10 +492,6 @@ def test_place_bounds_round_down_when_centring():
         X.place_bounds([0, 0, 1, 1], (1, 1), "front", 0)
 
 
-def test_a_rejection_that_is_not_a_geometry_conflict_ends_after_one_call(base):
-    stub = Stub({"x": 1, "y": 1, "w": 0, "h": 1}, {"x": 600, "y": 600, "w": 50, "h": 50})   # w=0: mule, not the bus
-    out = run(base, stub, "set", "%Crate", "make it flat")
-    assert (out.code, stub.calls) == ("MULE_REJECT", 1) and "w: below minimum" in out.detail
 
 
 def test_create_is_refused_with_the_way_to_do_it(base):
@@ -486,7 +502,8 @@ def test_create_is_refused_with_the_way_to_do_it(base):
 def test_an_assembly_bug_cannot_vouch_for_itself(base, monkeypatch):
     real = X.Exec._block
     monkeypatch.setattr(X.Exec, "_block", lambda self, op, node, b: {**real(self, op, node, b), "ref": "10.2.1.11"})
-    out = run(base, Stub({"x": 600, "y": 600, "w": 50, "h": 50}), "set", "%Crate", "move it")
+    good = {"x": 600, "y": 600, "w": 50, "h": 50}
+    out = run(base, Stub(good, good, good), "set", "%Crate", "move it")
     assert out.code == "MULE_REJECT" and "must equal harness value" in out.detail
 
 
@@ -498,3 +515,71 @@ def test_a_worker_that_died_between_calls_is_restarted(tmp_path):
         os.kill(first, _signal.SIGKILL)                      # e.g. the OOM killer, while nobody was asking
         w.proc.wait()
         assert "x" in json.loads(w.complete("g", [])["text"]) and w.proc.pid != first
+
+
+# ================================================================ NO_CHANGE, exact arithmetic, audit, display
+def test_an_unchanged_answer_is_no_change_and_never_parks(base):
+    stub = Stub({"x": 100, "y": 100, "w": 50, "h": 50}, {"x": 200, "y": 100, "w": 50, "h": 50})
+    out = run(base, stub, "set", "%Crate", "move it 100 px to the right")       # the eval's case 5, verbatim answer
+    assert (out.ok, out.code, stub.calls) == (False, "NO_CHANGE", 1) and "[100, 100, 50, 50]" in out.detail
+    assert not (base / ".cascade" / "journal.jsonl").exists()
+
+
+@pytest.mark.parametrize("kw, want", [({"dx": 100}, [200, 100, 50, 50]), ({"dy": -60}, [100, 40, 50, 50]),
+                                      ({"dx": -100, "dy": 50}, [0, 150, 50, 50]), ({"center": True}, [475, 475, 50, 50])])
+def test_exact_moves_and_centring_are_arithmetic_with_zero_model_calls(base, kw, want):
+    stub = Stub()
+    out = run(base, stub, "set", "%Crate", None, **kw)
+    assert (out.code, stub.calls, out.model_calls) == ("PARKED", 0, 0)
+    a, intent = journal(base)[0]["ticket"]["action"], journal(base)[0]["intent"]
+    assert [a[k] for k in "xywh"] == want and a["op"] == "set"
+    assert intent["model_output"] is None and intent["model_outputs"] == []
+    assert intent["center"] == kw.get("center", False) and intent["dx"] == kw.get("dx")
+
+
+def test_centring_in_a_ref_and_a_refused_exact_move(base):
+    stub = Stub()
+    out = run(base, stub, "set", "%Crate", None, ref="%Wall", center=True)     # 50 wide in a 20-wide wall
+    assert (out.code, stub.calls, out.conflicts) == ("GI_3:SOLID_OVERLAP", 0, [[300.0, 100.0, 20.0, 200.0]])
+    out = run(base, stub, "set", "%Crate", None, dx=900)
+    assert (out.code, stub.calls) == ("GI_3:OUT_OF_WORLD", 0)
+    out = run(base, stub, "set", "%Crate", None, dx=0, dy=0)
+    assert (out.code, stub.calls) == ("NO_CHANGE", 0)
+
+
+def test_subnet_busy_is_enforced_again_at_submit(base):
+    """The pre-check saw a free subnet; another ticket parked while the model was thinking: the harness refuses."""
+    class Racing(Stub):
+        def complete(self, *a, **k):
+            r = super().complete(*a, **k)
+            run(base, Stub(), "set", "%Wall", None, dx=-5)           # parks %Wall in the same subnet meanwhile
+            return r
+    out = run(base, Racing({"x": 600, "y": 600, "w": 50, "h": 50}), "set", "%Crate", "move it")
+    assert (out.code, out.model_calls) == ("SUBNET_BUSY", 1) and "parked" in out.detail
+    assert [j["intent"]["target"] for j in journal(base) if j["t"] == "RECEIVED"] == ["%Wall"]
+
+
+def test_approval_shows_initial_placement_for_a_reserved_node_and_a_delta_otherwise(base):
+    h = harness(base)
+    out = X.Exec(h, Stub({"x": 700, "y": 200, "w": 40, "h": 40})).run("set", "%Spawn", "put it at 700, 200")
+    assert out.change == "initial placement of %Spawn: [700, 200, 40, 40]"
+    assert X.describe_ticket(h, out.ticket_id) == out.change
+    assert h.approve(out.ticket_id).code == "COMMITTED"
+    out = X.Exec(h, Stub()).run("set", "%Crate", None, dx=10)
+    assert X.describe_ticket(h, out.ticket_id) == "%Crate: [100, 100, 50, 50] -> [110, 100, 50, 50]"
+    h.approve(out.ticket_id)
+    out = X.Exec(h, Stub()).reserve("%Lamp", "light", ARENA)
+    assert out.change == "reserve %Lamp (light) in 10.2.1.0/24: an address, no bounds yet"
+    assert X.describe_ticket(h, "no-such-ticket") is None
+
+
+def test_a_resize_in_place_is_a_change(base):
+    out = run(base, Stub({"x": 100, "y": 100, "w": 80, "h": 80}), "set", "%Crate", "resize it to 80 by 80 where it is")
+    assert out.code == "PARKED" and out.change == "%Crate: [100, 100, 50, 50] -> [100, 100, 80, 80]"
+
+
+def test_the_approval_line_is_against_the_staged_from_version_even_after_commit(base):
+    h = harness(base)
+    out = X.Exec(h, Stub()).run("set", "%Crate", None, dx=10)
+    h.approve(out.ticket_id)
+    assert X.describe_ticket(h, out.ticket_id) == "%Crate: [100, 100, 50, 50] -> [110, 100, 50, 50]"
