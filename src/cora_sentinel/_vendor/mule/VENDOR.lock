@@ -1,0 +1,20 @@
+{
+  "commit": "99791550303b5484fcebbbdbd2b09842085b9ef1",
+  "distribution": "mule-protocol",
+  "files": {
+    "LICENSE": "069e1bd791d12b3d179f00e05bf278255b2db17df00f9421f9ca1d34226af754",
+    "NOTICE": "f903734f00c97bc507a26239e0f70e557afb3414a2e9675f99731cd60e1bbf43",
+    "__init__.py": "5ddf9600ae3b3b6fd965dacad7a28f300a29d23feb642e5618328e0616a7a73e",
+    "constrain.py": "0aac2c14ad2b9f646d9ad25dbb2abdeafb832a6b2ec58d423cac45d81a29b2f0",
+    "prompt.py": "02fda1d38a007267ccf8acac0979db948cd647ad14c07411de1849f23e56c965",
+    "runners.py": "66feca2e2d06197606e29c4bb50df2f685e1bc16599e0c0aa3725cb162105d9d",
+    "selftest.py": "024a1f6c93ac632a3e9e5b7b835924c8d11b62c60bc34cb3fd480dcda8100d52",
+    "spec/mule_spec.json": "48e133e66b996cb5adf682d5c7b7d5ab3da3ff12697276a83da7c99b25bbdff1",
+    "validator.py": "45dc80a35399611e08c77a7c17ec68461c090b325742373dab175df9dd255755"
+  },
+  "license": "MIT (LICENSE); NOTICE names Apache-2.0",
+  "name": "mule",
+  "schema": 1,
+  "upstream": "https://github.com/nkaralus/mule-protocol",
+  "version": "0.2.0"
+}

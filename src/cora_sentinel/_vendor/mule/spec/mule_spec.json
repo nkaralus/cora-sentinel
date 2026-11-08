@@ -1,0 +1,62 @@
+{
+  "spec_format": "mule-spec/1",
+  "schema_version": "1.1.0",
+  "title": "MuleTaskBlockSpec",
+  "license": "Apache-2.0",
+  "additionalProperties": false,
+  "limits": { "max_raw_bytes": 2048 },
+  "slots": {
+    "frame_id": {
+      "type": "string",
+      "pattern": "0x[0-9a-fA-F]{4}",
+      "maxLength": 6,
+      "description": "Hexadecimal frame identifier for execution tracking."
+    },
+    "time_slot": {
+      "type": "string",
+      "enum": ["SLOT_1_FETCH", "SLOT_2_ROUTE", "SLOT_3_EXECUTE", "SLOT_4_JUDGE", "SLOT_5_VERIFY"],
+      "description": "Deterministic execution phase."
+    },
+    "subnet": {
+      "type": "string",
+      "format": "ipv4_net24",
+      "pattern": "10\\.[0-9]{1,3}\\.[0-9]{1,3}\\.0/24",
+      "maxLength": 18,
+      "description": "Virtual /24 subnet isolating the scene boundary."
+    },
+    "op": {
+      "type": "string",
+      "pattern": "[a-z][a-z0-9_]{0,31}",
+      "maxLength": 32,
+      "description": "Atomic operation name. Pass allowed_ops to the validator to pin it to a registry."
+    },
+    "target": {
+      "type": "string",
+      "pattern": "%[A-Z][a-zA-Z0-9]{0,63}",
+      "maxLength": 64,
+      "description": "Unique scene node name prefixed with %."
+    },
+    "ref": {
+      "type": "string",
+      "format": "ipv4_host",
+      "pattern": "10\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}",
+      "maxLength": 15,
+      "description": "Virtual IP host address assigned to the target node."
+    },
+    "exclude": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "[a-z][a-z0-9_]{0,47}", "maxLength": 48 },
+      "maxItems": 16,
+      "uniqueItems": true,
+      "description": "Negative constraints forbidden in this frame."
+    }
+  },
+  "cross_checks": ["ref_in_subnet"],
+  "standard_exclusions": [
+    "untyped_variables",
+    "relative_paths_up_tree",
+    "cross_subnet_queries",
+    "freeform_code_blocks",
+    "synthetic_transactions"
+  ]
+}

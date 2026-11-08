@@ -51,6 +51,7 @@ where = ["src"]
 # the vendored bus's own MIT notice and its lock travel with it (the license requires the notice in every copy)
 [tool.setuptools.package-data]
 "cora_sentinel._vendor.subnetbus" = ["LICENSE", "VENDOR.lock"]
+"cora_sentinel._vendor.mule" = ["LICENSE", "NOTICE", "VENDOR.lock", "spec/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

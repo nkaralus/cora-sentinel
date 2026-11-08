@@ -5,6 +5,9 @@
 that changes it is visible: `subnetbus/VENDOR.lock` records the upstream commit and the sha256 of every file, `verify()`
 recomputes them (cora-selfcheck and the daemon's start-up line call it), and `tools/vendor_bus.py` is the only thing that
 rewrites the tree. Imports always come from here, even if another `subnetbus` is installed.
+
+`mule` is a verbatim copy of github.com/nkaralus/mule-protocol, the same way (`mule/VENDOR.lock`,
+`tools/vendor_bus.py --lib mule`): the raw-text validator in front of the gate (tools/cora_exec_bridge.py).
 """
 from __future__ import annotations
 
@@ -15,6 +18,7 @@ from typing import List, Optional
 
 LOCK_NAME = "VENDOR.lock"
 HERE = Path(__file__).resolve().parent / "subnetbus"
+MULE = Path(__file__).resolve().parent / "mule"
 
 
 def sha256_file(path: Path) -> str:
@@ -56,7 +60,7 @@ def describe(root: Optional[Path] = None) -> str:
     try:
         lock = read_lock(root)
     except (OSError, ValueError):
-        return "vendored subnetbus: NO LOCK FILE"
+        return f"vendored {Path(root).name if root else 'subnetbus'}: NO LOCK FILE"
     bad = verify(root)
-    return (f"vendored subnetbus {lock.get('version', '?')} @ {str(lock.get('commit', '?'))[:7]} "
+    return (f"vendored {lock.get('name', 'subnetbus')} {lock.get('version', '?')} @ {str(lock.get('commit', '?'))[:7]} "
             + ("verified" if not bad else f"MODIFIED ({len(bad)} problem(s): {'; '.join(bad[:3])})"))

@@ -1,7 +1,6 @@
 """tools/cora_exec_bridge.py: raw model text -> mule-protocol -> policy -> subnetbus.check_all() -> Verdict.
 
-Real mule-protocol and the real vendored subnetbus throughout; nothing is mocked. mule is not a dependency of
-cora-sentinel, so without a dev install (pip install -e ~/mule-protocol) these are skipped and say why."""
+Real mule-protocol and subnetbus throughout, both the vendored, pinned copies; nothing is mocked."""
 import importlib.util
 import json
 import re
@@ -10,8 +9,7 @@ from pathlib import Path
 
 import pytest
 
-pytest.importorskip("mule", reason="mule-protocol not installed: pip install -e ~/mule-protocol")
-from mule import load_spec  # noqa: E402
+from cora_sentinel._vendor.mule import load_spec
 
 REPO = Path(__file__).resolve().parent.parent
 _spec = importlib.util.spec_from_file_location("cora_exec_bridge", REPO / "tools" / "cora_exec_bridge.py")
@@ -232,3 +230,8 @@ def test_grammar_constants_match_the_bridge_and_mule():
     assert rule("subnet") == '"\\"10.2." octet ".0/24\\""'
     assert rule("coord") == '"-"? ([0-9] | [1-9] [0-9]{0,5})' and bridge.COORD_MAX == 999_999
     assert rule("size") == "[1-9] [0-9]{0,4}" and bridge.SIZE_MAX == 99_999
+
+
+def test_the_bridge_uses_the_vendored_mule_whatever_else_is_installed():
+    assert bridge.MuleValidator.__module__ == "cora_sentinel._vendor.mule.validator"
+    assert bridge.load_spec.__module__ == "cora_sentinel._vendor.mule"

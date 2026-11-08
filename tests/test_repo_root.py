@@ -11,7 +11,7 @@ FILES = {".gitignore", "CHANGELOG.md", "LICENSE", "MANIFEST.in", "README.md", "p
          "models",                                                       # a symlink to a local models directory (see the CHANGELOG, 0.8.5)
          "exceptions.txt", "rogue-subnets.txt", "trackers-starter.txt",  # loose starter lists that docs/ and examples/ still name
          "violation-reports.md", "violation.example.json", "violation.schema.json"}
-DIRS = {".github", "deploy", "docs", "examples", "packaging", "schema", "src", "tests", "tools"}
+DIRS = {".github", "deploy", "docs", "examples", "grammar", "packaging", "schema", "src", "tests", "tools"}   # grammar: GBNF for cora-exec
 LEGACY = {"cora-os", "cora-security-starter", "release-0.8.0", "superseded-flat"}   # old layouts nothing live uses: delete when you like
 CLUTTER = (".patch", ".diff", ".zip", ".deb", ".whl", ".tar.gz", ".orig", ".rej")
 
