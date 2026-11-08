@@ -899,6 +899,18 @@ def main() -> int:
         print(f"[cora-sentinel] dyn policy: {a.dyn_policy} "
               f"({'kernel drops of model-ISOLATEd destinations, flow-level on web ports' if a.dyn_policy == 'enforce' else 'recording what it WOULD block in the decision log; nothing is written to the kernel'})",
               file=sys.stderr)
+    scopes = None
+    if cg is not None:
+        from cora_sentinel.scope import Scopes
+        try:
+            os.makedirs(a.state_dir, exist_ok=True)
+            scopes = Scopes(cg, state_path=os.path.join(a.state_dir, "scopes.json"))
+            gone = scopes.reap()                      # what a previous run left behind
+            if gone:
+                print(f"[cora-sentinel] reaped {len(gone)} empty launch scope(s) left from before", file=sys.stderr)
+        except OSError as e:
+            print(f"[cora-sentinel] launch scopes unavailable: {e}", file=sys.stderr)
+            scopes = None
     hub = None
     adj_ref: dict = {"adj": None}
     if a.ui_socket:
@@ -928,7 +940,7 @@ def main() -> int:
                   tasks=cgroup_tasks(cg, fw) if cg else None,
                   evaluating=lambda: adj_ref["adj"].pending() if adj_ref["adj"] else 0,
                   cgroup_id=cg.cgroup_id if cg else None,
-                  act=manual_act, record=manual_record)
+                  act=manual_act, record=manual_record, scopes=scopes)
         try:
             hub.start()
         except OSError as e:
@@ -1011,6 +1023,7 @@ def main() -> int:
     print(f"[cora-sentinel] watching '{a.match}' every {a.interval}s -> {a.out}",
           file=sys.stderr)
     n = 0
+    next_reap = 0.0
     while not stop["v"]:
         s.guarded_tick()
         n += 1
@@ -1018,6 +1031,13 @@ def main() -> int:
             floor_ref["sync"].poll()            # reports the dead-man's outcome once
         if dyn is not None and a.dyn_policy == "enforce" and n % 3600 == 0:
             dyn.reconcile()                     # an operator unblock must not leave the ledger claiming a block
+        if scopes is not None and time.monotonic() >= next_reap:
+            next_reap = time.monotonic() + 5.0           # empty launch scopes go away within ~5 s
+            try:
+                for name in scopes.reap():
+                    print(f"[cora-sentinel] launch scope {name} ended and was removed", file=sys.stderr, flush=True)
+            except Exception as e:
+                print(f"[cora-sentinel] scope reap failed: {e!r}", file=sys.stderr)
         if fw and n % 60 == 0:  # housekeeping: drop rules whose task cgroup is gone
             try:                # Firewall serializes itself; holding the registry lock across nft stalled everyone
                 fw.gc(cg.names())

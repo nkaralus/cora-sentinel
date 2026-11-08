@@ -38,6 +38,13 @@ task that is live AND still the same cgroup (`cgroup_id` from the snapshot: a re
 at most one per second per client and MAX_ACTIONS at once. It runs in its own thread, so a slow nft never stalls the
 feed, and it acts even when the daemon is in dry-run: a person pressing the button is an explicit override, recorded
 as policy "manual_operator_override" with the operator's uid. The reply is {"type": "result", "id": ..., "ok": ...}.
+
+LAUNCH (cora-run's unprivileged path): {"cmd": "launch", "app": "steam-570", "memory_max": "8G", "memory_high": "7G",
+"id": ...} asks the daemon to make an ephemeral scope (cora_sentinel.scope) and move THE CALLER into it. There is no
+pid in the request: the pid and uid are the kernel's (SO_PEERCRED, read when the client connected), and the pid's
+start time is compared again before the move, so a launcher that exited and had its pid reused cannot get an unrelated
+process moved. Same gate as the breakers (uid 0 or --ui-group), same one-per-second limit. The reply carries the scope
+name; the caller then execs the program, which stays in the scope. Placing yourself under a ceiling only restricts you.
 """
 from __future__ import annotations
 
@@ -86,12 +93,32 @@ def peer_uid(conn: socket.socket) -> Optional[int]:
         return None
 
 
+def peer_pid(conn: socket.socket) -> Optional[int]:
+    try:
+        creds = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        return struct.unpack("3i", creds)[0]
+    except OSError:
+        return None
+
+
+def proc_starttime(pid: Optional[int]) -> Optional[int]:
+    """Field 22 of /proc/<pid>/stat (clock ticks since boot): with the pid, it names ONE process for its lifetime."""
+    if not pid:
+        return None
+    try:
+        rest = open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()
+        return int(rest[19])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
 class Hub:
     def __init__(self, path: str, group: Optional[str] = None, mode: str = "detect-only",
                  tasks: Optional[Callable[[], Dict[str, dict]]] = None,
                  evaluating: Optional[Callable[[], int]] = None,
                  cgroup_id: Optional[Callable[[str], Optional[int]]] = None,
                  act: Optional[Callable[[str, str], str]] = None,
+                 scopes=None,
                  record: Optional[Callable[[dict], None]] = None,
                  log: Callable[[str], None] = lambda m: print(f"[ui] {m}", file=sys.stderr, flush=True),
                  clock: Callable[[], float] = time.monotonic):
@@ -100,6 +127,7 @@ class Hub:
         self._eval_fn = evaluating or (lambda: 0)
         self._id_fn = cgroup_id or (lambda name: None)
         self._act, self._record = act, record
+        self.scopes = scopes                       # cora_sentinel.scope.Scopes, or None (no --cgroup-root)
         self._gid: Optional[int] = None
         self._results: List[tuple] = []           # (conn, reply) finished by action threads, sent by the hub thread
         self._acting = 0
@@ -197,6 +225,10 @@ class Hub:
                               # really in force (not dry-run): the tray offers a breaker only if it is not here
                               "enforced": enforced,
                               "unknown": sorted(info.get("unknown", []))})
+                rec = self.scopes.describe(name) if self.scopes is not None else None
+                if rec:
+                    tasks[-1]["scope"] = {"app": rec["app"], "uid": rec["uid"],
+                                          "memory_max": rec.get("memory_max"), "memory_high": rec.get("memory_high")}
                 truth_errors.update(info.get("errors", []))
             s = dict(self.session)
             if s["dropped_uncontained"] or s["failed_actions"]:
@@ -299,8 +331,9 @@ class Hub:
             self.log(f"refused a client: {MAX_CLIENTS} already connected")
             return
         conn.setblocking(False)
-        uid = peer_uid(conn)
-        self._clients[conn] = {"out": bytearray(), "uid": uid, "inbuf": b"", "last_cmd": -1e9}
+        uid, pid = peer_uid(conn), peer_pid(conn)
+        self._clients[conn] = {"out": bytearray(), "uid": uid, "pid": pid, "start": proc_starttime(pid),
+                               "inbuf": b"", "last_cmd": -1e9}
         self._sel.register(conn, selectors.EVENT_READ, "client")
         self.log(f"client connected (uid {uid})")
         self._send(conn, self.snapshot())                # a new client gets the picture at once
@@ -354,8 +387,11 @@ class Hub:
         if not isinstance(msg, dict):
             return refuse("not a JSON object")
         cmd, task = msg.get("cmd"), msg.get("task")
+        if cmd == "launch":
+            return self._launch(conn, c, msg, refuse, tag)
         if cmd not in COMMANDS:
-            return refuse(f"unknown command {cmd!r}: the tray can only tighten ({', '.join(sorted(COMMANDS))}); "
+            return refuse(f"unknown command {cmd!r}: the tray can only tighten ({', '.join(sorted(COMMANDS))}), "
+                          "and launch places only the caller itself; "
                           "releasing is root-only: cora-firewall release / cora-cgroup")
         if not self.may_command(c["uid"]):
             self.log(f"refused {cmd} from uid {c['uid']}: not root and not in --ui-group")
@@ -379,6 +415,40 @@ class Hub:
         self.log(f"uid {uid} pressed {cmd} on {task}")
         threading.Thread(target=self._run_action, args=(conn, tag, verdict, task, uid),
                          name=f"ui-{cmd}", daemon=True).start()
+
+    def _launch(self, conn, c: dict, msg: dict, refuse, tag) -> None:
+        from cora_sentinel.scope import ScopeError
+        if not self.may_command(c["uid"]):
+            self.log(f"refused launch from uid {c['uid']}: not root and not in --ui-group")
+            return refuse("not permitted: you are not in the --ui-group group")
+        if self.scopes is None:
+            return refuse("launch unavailable: cora-sentinel runs without --cgroup-root")
+        now = self.clock()
+        if now - c["last_cmd"] < COMMAND_INTERVAL_S:
+            return refuse("slow down: one command per second")
+        pid, uid = c.get("pid"), c["uid"]
+        start = proc_starttime(pid)
+        if not pid or start is None or start != c.get("start"):
+            # the process that connected is gone (its pid may already belong to someone else): move nothing
+            return refuse("the process that connected is no longer the same process; reconnect and retry")
+        c["last_cmd"] = now
+        try:
+            name = self.scopes.create_scope(msg.get("app"), uid=uid, memory_max=msg.get("memory_max"),
+                                            memory_high=msg.get("memory_high"))
+        except ScopeError as e:
+            return refuse(str(e))
+        try:
+            self.scopes.enter(name, pid=pid, uid=uid)
+        except ScopeError as e:
+            self.scopes.reap()                       # nothing entered: it goes once its TTL lapses
+            return refuse(str(e))
+        rec = self.scopes.describe(name)
+        self.log(f"uid {uid} launched pid {pid} into {name} (memory.max {rec.get('memory_max')}, "
+                 f"memory.high {rec.get('memory_high')})")
+        with self._lock:
+            self._dirty = True
+        self._send(conn, {"schema": SCHEMA, "type": "result", "id": tag, "ok": True, "scope": name,
+                          "memory_max": rec.get("memory_max"), "memory_high": rec.get("memory_high")})
 
     def _run_action(self, conn, tag, verdict: str, task: str, uid) -> None:
         try:

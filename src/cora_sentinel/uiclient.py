@@ -148,7 +148,10 @@ class StatusClient:
             label = "containment active (manual override)"
         breakers = set(s.get("breakers") or [])
         tasks = [{"name": t["name"], "cgroup_id": t.get("cgroup_id"),
-                  "line": f"{t['name']}: {human_bytes(t.get('mem_bytes'))} ({human_bytes(t.get('mem_delta_bytes'), True)})"
+                  "line": f"{t['name']}: {human_bytes(t.get('mem_bytes'))}"
+                          + (f" / {human_bytes((t.get('scope') or {}).get('memory_max'))}"
+                             if (t.get("scope") or {}).get("memory_max") else "")
+                          + f" ({human_bytes(t.get('mem_delta_bytes'), True)})"
                           + (f" [{', '.join(t['contained'])}]" if t.get("contained") else "")
                           + (f" [{', '.join(u + '?' for u in t['unknown'])}]" if t.get("unknown") else "")
                           + (" \u2014 exited" if t.get("pids") == 0 else ""),
