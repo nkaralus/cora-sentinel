@@ -108,14 +108,41 @@ def test_no_daemon_starts_nothing(tmp_path, guarded, monkeypatch, capsys):
     assert guarded == [] and "--ui-socket" in err and "not starting game" in err
 
 
-def test_a_daemon_that_hangs_up_starts_nothing(tmp_path, guarded, monkeypatch, capsys):
+@pytest.mark.parametrize("when, says", [
+    ("before_request", "Broken pipe"),            # gone before we send: EPIPE (CI run #44, 3.12)
+    ("unread_request", "reset by peer"),          # gone with our request unread in its buffer: ECONNRESET
+    ("after_request", "closed the connection"),   # read the request, then hung up without answering: EOF
+])
+def test_a_daemon_that_hangs_up_starts_nothing(tmp_path, guarded, monkeypatch, capsys, when, says):
+    """Each moment a daemon can hang up is forced, not raced: the old single test accepted two of these three
+    outcomes and failed on a runner that scheduled the third."""
+    import select
     srv = socket.socket(socket.AF_UNIX)
     srv.bind(str(tmp_path / "s.sock"))
     srv.listen(1)
-    threading.Thread(target=lambda: srv.accept()[0].close(), daemon=True).start()
+    closed = threading.Event()
+
+    def daemon():
+        conn = srv.accept()[0]
+        if when == "unread_request":
+            select.select([conn], [], [], 5)      # the request has arrived; close without reading it
+        elif when == "after_request":
+            conn.recv(65536)
+        conn.close()
+        closed.set()
+    t = threading.Thread(target=daemon, daemon=True)
+    t.start()
+    if when == "before_request":
+        real = socket.socket.sendall
+
+        def sendall(self, data, *a):              # send only once the daemon has really hung up
+            closed.wait(5)
+            return real(self, data, *a)
+        monkeypatch.setattr(socket.socket, "sendall", sendall)
     assert go(["--app", "dota", "--socket", str(tmp_path / "s.sock"), "game"], monkeypatch) == run.EXIT_LAUNCH
     err = capsys.readouterr().err
-    assert guarded == [] and ("closed the connection" in err or "reset by peer" in err) and "not starting game" in err
+    assert guarded == [] and says in err and "not starting game" in err, err
+    t.join(5)
     srv.close()
 
 
