@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from cora_sentinel import uiclient
+from cora_sentinel import ring_buffer as rb
 from cora_sentinel.ring_buffer import RingStore, build_stall_segments
 from cora_sentinel.uihub import SCHEMA
 
@@ -19,7 +20,10 @@ _spec.loader.exec_module(replay)
 
 
 def frames(name):
-    return [f for _, f in replay.scenario_frames(name)]
+    return [f for _, f in replay.scenario_frames(name) if not isinstance(f, replay.Op)]
+
+
+IRREGULAR = {"seq_regression", "mono_regression", "unknown_status"}       # each tested on its own below
 
 
 def only(f):
@@ -43,10 +47,10 @@ def client_view(fs, now=None):
 
 
 # ================================================================ scenarios
-@pytest.mark.parametrize("name", list(replay.SCENARIOS))
+@pytest.mark.parametrize("name", sorted(set(replay.SCENARIOS) - IRREGULAR))
 def test_every_scenario_speaks_the_schema_with_increasing_seq_and_mono(name):
     fs = frames(name)
-    assert len(fs) >= 10
+    assert len(fs) >= 6
     assert all(f["schema"] == SCHEMA and f["type"] == "state" for f in fs)
     assert [f["seq"] for f in fs] == list(range(1, len(fs) + 1))
     assert all(b["mono"] > a["mono"] for a, b in zip(fs, fs[1:]))
@@ -140,7 +144,7 @@ def served(tmp_path):
 
     def make(name="breaker_rate_limit", clock=time.monotonic):
         w = replay.World()
-        srv = replay.ReplayServer(str(tmp_path / "ui.sock"), w, clock=clock)
+        srv = replay.ReplayServer(str(tmp_path / "ui.sock"), w, clock=clock, source=f"scenario:{name}")
         srv.start()
         made.append(srv)
         fs = replay.scenario_frames(name, w)
@@ -316,19 +320,238 @@ def test_a_log_without_frames_is_an_error(tmp_path):
         list(replay.log_frames(str(tmp_path / "empty.log")))
 
 
-def test_run_paces_by_speed_and_keeps_seq_increasing_after_a_breaker_frame(tmp_path):
-    slept = []
+def test_run_paces_by_speed_and_shifts_seq_past_breaker_frames_without_hiding_a_regression(tmp_path):
+    slept, sent = [], []
     srv = replay.ReplayServer(str(tmp_path / "ui.sock"))
-    srv.latest = {"seq": 5}
-    sent = []
-    srv.broadcast = lambda f: (sent.append(f), setattr(srv, "latest", f))
-    n = replay.run(srv, iter([(0.0, {"seq": 1}), (2.0, {"seq": 2}), (2.0, {"seq": 9})]), speed=4.0, sleep=slept.append)
-    assert n == 3 and slept == [0.5, 0.5] and [f["seq"] for f in sent] == [6, 7, 9]
+    srv.broadcast = lambda f, pieces=1: sent.append(f["seq"])
+    srv.inserted = 2                                                      # two breaker replies went out
+    n = replay.run(srv, iter([(0.0, {"seq": 1}), (2.0, {"seq": 2}), (2.0, {"seq": 1})]), speed=4.0, sleep=slept.append)
+    assert n == 3 and slept == [0.5, 0.5] and sent == [3, 4, 3]
 
 
-def test_the_cli_lists_scenarios_and_rejects_unknown_ones(capsys):
+def test_the_cli_lists_scenarios_and_fixtures_and_rejects_unknown_ones(capsys):
     assert replay.main(["list"]) == 0
     out = capsys.readouterr().out
-    assert all(name in out for name in replay.SCENARIOS)
+    assert all(name in out for name in replay.SCENARIOS) and "psiw_trip" in out and "psir_refused_healed" in out
     with pytest.raises(SystemExit):
         replay.main(["scenario", "nope", "--socket", "/nonexistent/x.sock"])
+
+
+
+# ================================================================ played to the real client, on a virtual clock
+def play_to_client(tmp_path, name, reconnect=True):
+    """Serve a scenario and read it with the real StatusClient. Virtual time: every scripted wait advances the shared
+    clock and sleeps only a moment. Returns (states seen, views seen, ring store, client)."""
+    vt = [1000.0]
+    w = replay.World()
+    srv = replay.ReplayServer(str(tmp_path / "ui.sock"), w, clock=lambda: vt[0], source=f"scenario:{name}")
+    srv.start()
+    c = uiclient.StatusClient(str(tmp_path / "ui.sock"), clock=lambda: vt[0])
+    assert c.connect()
+    assert wait_for(lambda: srv.connected() == 1)                         # registered before the first frame
+    store, states, views, done = RingStore(), [], [], []
+
+    def sleep(d):
+        time.sleep(0.03)
+        vt[0] += d
+    import threading
+    th = threading.Thread(target=lambda: (replay.run(srv, replay.scenario_frames(name, w), sleep=sleep), done.append(1)))
+    th.start()
+    last = None
+
+    def take():
+        nonlocal last
+        c.poll()
+        if c.state is not None and c.state is not last:
+            last = c.state
+            states.append(c.state)
+            store.feed(c.state, vt[0])
+    while not done:
+        if c.sock is None and reconnect:
+            store.link_lost()
+            c.connect()
+        take()
+        views.append(c.view())
+        time.sleep(0.003)
+    time.sleep(0.05)
+    take()
+    views.append(c.view())
+    th.join()
+    srv.stop()
+    return states, views, store, c
+
+
+def test_every_frame_on_the_wire_says_it_is_a_replay(tmp_path):
+    states, views, store, c = play_to_client(tmp_path, "steady")
+    assert states and all(f["replay"] == {"source": "scenario:steady"} for f in states)
+
+
+def test_closed_connection_shows_unreachable_then_reconnects_to_the_latest_frame(tmp_path):
+    states, views, store, c = play_to_client(tmp_path, "closed_connection")
+    st = [v["status"] for v in views]
+    i = st.index("unreachable")
+    assert "clear" in st[:i] and "clear" in st[i:]
+    assert store.global_resets == 0 and any(isinstance(p, rb.Gap) for p in store.rings[109].samples)
+
+
+def test_silence_goes_unreachable_never_clear(tmp_path):
+    states, views, store, c = play_to_client(tmp_path, "silence")
+    st = [v["status"] for v in views]
+    assert "unreachable" in st and st[-1] == "clear"
+    assert "no data for" in next(v["detail"] for v in views if v["status"] == "unreachable")
+
+
+def test_garbage_lines_are_skipped_and_the_feed_goes_on(tmp_path):
+    states, views, store, c = play_to_client(tmp_path, "garbage")
+    assert len(states) == 7 and all(f["schema"] == SCHEMA and f["type"] == "state" for f in states)
+    assert {v["status"] for v in views} <= {"connecting", "clear"}
+
+
+def test_split_frames_are_put_back_together(tmp_path):
+    ops = [f for _, f in replay.scenario_frames("split_frames") if isinstance(f, replay.Op)]
+    assert ops and all(o == replay.Op("split", 7) for o in ops)
+    states, views, store, c = play_to_client(tmp_path, "split_frames")
+    assert [f["seq"] for f in states] == list(range(1, 8))
+
+
+def test_duplicate_frames_are_ignored_by_the_ring_buffer(tmp_path):
+    states, views, store, c = play_to_client(tmp_path, "duplicate_frames")
+    ring = store.rings[113]
+    assert len([p for p in ring.samples if isinstance(p, rb.Sample)]) == 7 == len({f["seq"] for f in states})
+
+
+def test_seq_regression_and_mono_regression_start_the_history_over():
+    for name in ("seq_regression", "mono_regression"):
+        fs = frames(name)
+        store = RingStore()
+        for f in fs:
+            store.feed(f, f["mono"])
+        assert store.global_resets == 1, name
+        if name == "seq_regression":
+            assert [f["seq"] for f in fs][5:7] == [6, 1]
+        else:
+            assert fs[6]["mono"] < fs[5]["mono"] and fs[6]["seq"] == 7
+
+
+def test_counter_reset_starts_that_ring_over_with_no_negative_stall():
+    fs = frames("counter_reset")
+    store = RingStore()
+    for f in fs:
+        store.feed(f, f["mono"])
+    ring = store.rings[fs[0]["tasks"][0]["cgroup_id"]]
+    assert ring.resets == 1 and store.global_resets == 0
+    assert all(v >= 0 for seg in build_stall_segments(ring.samples, 1.0) for _, v in seg.points)
+
+
+def test_a_relaunch_under_a_new_cgroup_id_is_a_new_history_and_the_old_id_is_refused(served, tmp_path):
+    fs = frames("relaunch_new_cgroup")
+    ids = [f["tasks"][0]["cgroup_id"] if f["tasks"] else None for f in fs]
+    assert ids[0] == 101 and None in ids and ids[-1] == 214
+    store = RingStore()
+    for f in fs:
+        store.feed(f, f["mono"])
+    assert store.rings[214].state == "live" and store.rings[101].state == "exited"     # two histories, not one
+    srv, w = served("relaunch_new_cgroup")
+    for _ in replay.scenario_frames("relaunch_new_cgroup", w):
+        pass
+    conn = Conn(str(tmp_path / "ui.sock"))
+    conn.msg()
+    conn.send(cmd="sever", task="relaunch-f8a9b0", cgroup_id=101, id="old")
+    assert "is not the task you saw" in conn.until("result")["error"]
+    conn.close()
+
+
+def test_twenty_tasks_cover_every_band_and_the_client_reads_them_all():
+    fs = frames("many_tasks")
+    assert all(len(f["tasks"]) == 20 for f in fs)
+    states = {t["psi_state"] for t in fs[-1]["tasks"]}
+    assert states == {"armed", "refused", "disabled", "unmonitored"}
+    v = client_view(fs)
+    assert len(v["tasks"]) == 20 and v["status"] == "psi_refused"
+
+
+def test_an_unknown_status_string_is_loud_and_then_clears():
+    fs = frames("unknown_status")
+    odd = [f for f in fs if f["status"] == "meltdown"]
+    assert len(odd) == 4 and fs[-1]["status"] == "clear"
+    v = client_view(fs[: fs.index(odd[0]) + 1])
+    assert (v["status"], v["colour"]) == ("unknown", "red") and "received status: 'meltdown'" in v["detail"]
+    assert client_view(fs)["status"] == "clear"
+
+
+# ================================================================ the private socket directory
+def test_the_default_socket_lives_in_a_private_0700_directory(tmp_path, monkeypatch):
+    run = tmp_path / "run"
+    run.mkdir()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(run))
+    sock = replay.default_socket()
+    assert sock == str(run / "cora-replay" / "ui.sock")
+    assert (os.stat(run / "cora-replay").st_mode & 0o777) == 0o700
+    assert replay.default_socket() == sock                                # reused when it is ours and 0700
+    os.chmod(run / "cora-replay", 0o755)
+    with pytest.raises(SystemExit, match="not a 0700 directory of ours"):
+        replay.default_socket()
+
+
+def test_without_a_runtime_dir_it_makes_a_fresh_private_temp_dir(monkeypatch):
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    a, b = replay.default_socket(), replay.default_socket()
+    try:
+        assert a != b and os.path.basename(os.path.dirname(a)).startswith("cora-replay-")
+        assert (os.stat(os.path.dirname(a)).st_mode & 0o777) == 0o700
+    finally:
+        for p in (a, b):
+            os.rmdir(os.path.dirname(p))
+
+
+def test_no_fixed_tmp_path_is_left_in_the_tool():
+    src = (Path(__file__).resolve().parents[1] / "tools" / "cora-replay.py").read_text()
+    assert "/tmp/cora-test-ui.sock" not in src
+
+
+# ================================================================ sanitized real captures
+def test_sanitize_keeps_only_named_tasks_zeroes_the_session_and_picks_the_last_run(tmp_path):
+    f = lambda seq, *names: {"schema": SCHEMA, "type": "state", "seq": seq, "mono": 100.0 + seq, "ts": "2026-11-09T01:00:00+00:00",
+                             "status": "clear", "session": {"community_blocked": 41, "started": "2026-11-08", "failed_actions": 0},
+                             "tasks": [{"name": n} for n in names], "replay": {"source": "x"}}
+    frames_ = [f(1, "psiq-1", "firefox"), f(2, "psiq-1"), f(1, "psiq-1", "steam"), f(2, "psiq-1", "game"), f(3)]
+    out = replay.sanitize(frames_, ["psi"], (1, 2))
+    assert [g["seq"] for g in out] == [1, 2] and out[0]["tasks"] == [{"name": "psiq-1"}]   # the second run
+    assert out[0]["session"] == {"community_blocked": 0, "failed_actions": 0} and "replay" not in out[0]
+    assert out[0]["ts"].startswith("2026-01-01T")
+    assert replay.sanitize(frames_, ["psi"], (7, 8)) == []
+
+
+def fixture_frames(name):
+    return [f for _, f in replay.log_frames(replay.fixture_path(name))]
+
+
+def test_the_shipped_fixtures_are_sanitized():
+    for name in replay.fixtures():
+        text = Path(replay.fixture_path(name)).read_text()
+        for leak in ("/home/", "/media/", "Dimgeon", "nick", "firefox", "steam"):
+            assert leak not in text, (name, leak)
+        for f in fixture_frames(name):
+            assert all(t["name"].startswith("psi") for t in f["tasks"])
+            assert all(v in (0, None) for v in (f.get("session") or {}).values())
+
+
+def test_fixture_psiw_trip_marks_the_live_trips_it_saw():
+    fs = fixture_frames("psiw_trip")
+    store = RingStore()
+    for f in fs:
+        store.feed(f, f["mono"])
+    ring = next(r for r in store.rings.values() if r.name.startswith("psiw-"))
+    trips = [m for m in ring.marks if m.kind == "trip"]
+    assert len(trips) >= 15 and ring.pressure_active is True
+    assert client_view(fs)["status"] == "contained"                       # psiz is isolated in the same frames
+
+
+def test_fixture_psir_is_refused_after_the_restart_and_heals_without_another():
+    fs = fixture_frames("psir_refused_healed")
+    psir = [(f["seq"], f["status"], next(t for t in f["tasks"] if t["name"].startswith("psir-"))["psi_state"]) for f in fs]
+    restart = next(i for i in range(1, len(fs)) if fs[i]["seq"] < fs[i - 1]["seq"])
+    assert psir[restart][1:] == ("psi_refused", "refused")
+    healed = next(i for i in range(restart, len(fs)) if psir[i][2] == "armed")
+    assert psir[healed][1] == "clear" and all(fs[i]["seq"] > fs[i - 1]["seq"] for i in range(restart + 1, len(fs)))
+    assert client_view(fs[: restart + 1])["status"] == "psi_refused" and client_view(fs)["status"] == "clear"

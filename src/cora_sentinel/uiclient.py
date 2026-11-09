@@ -38,6 +38,7 @@ RANK = {"clear": 0, "evaluating": 1, "pressure": 2, "contained": 3, "psi_refused
 _MISSING = object()
 MAX_LINE = 1024 * 1024
 BREAKER_VERB = {"sever": "ISOLATE", "cap": "THROTTLE"}
+CAP_CPU_MAX = "20000 100000"            # what "cap" writes to cpu.max (20 %); memory.high gets memory.current
 ACK_TIMEOUT_S = 2 * HEARTBEAT_S + 0.5   # an acknowledged breaker must be in force by then (the feed shows it at once)
 
 
@@ -52,8 +53,9 @@ class StatusClient:
         self.error: Optional[str] = "not connected yet"
         self.results: dict = {}                     # tag -> the daemon's {"type": "result", ...} reply
         self._tags = itertools.count(1)
-        self._sent: dict = {}                       # tag -> (cmd, task, cgroup_id) of a breaker not yet answered
+        self._sent: dict = {}                       # tag -> the press (cmd, task, cgroup_id, before) not yet answered
         self.awaiting: dict = {}                    # tag -> an acknowledged breaker not yet seen in force
+        self.on_state: Optional[Callable[[dict], None]] = None   # called with EVERY state frame (a poll may read several)
 
     def connect(self) -> bool:
         self.close()
@@ -76,6 +78,12 @@ class StatusClient:
         if self.sock:
             self.sock.close()
         self.sock = None
+        self._forget_breakers()                     # a dropped link (or a reconnect) ends every pending check
+
+    def _forget_breakers(self) -> None:
+        """Pending breaker checks are only meaningful against the feed they were pressed on."""
+        self._sent.clear()
+        self.awaiting.clear()
 
     def poll(self) -> bool:
         """Read whatever is waiting, never block. True if the state changed. Reconnect is the caller's timer."""
@@ -119,15 +127,19 @@ class StatusClient:
             if not (isinstance(msg, dict) and msg.get("schema") == SCHEMA):
                 continue
             if msg.get("type") == "state":
+                if self.state is not None and _went_back(self.state, msg):
+                    self._forget_breakers()             # a restarted daemon: the press it acknowledged is gone
                 self.state, self.last_rx, changed = msg, self.clock(), True
                 self._reflect(msg)
+                if self.on_state is not None:
+                    self.on_state(msg)
             elif msg.get("type") == "result" and msg.get("id") is not None:
                 self.results[str(msg["id"])] = msg
                 sent = self._sent.pop(str(msg["id"]), None)
                 if sent is not None and msg.get("ok") is True:
-                    cmd, task, cid = sent
+                    cmd, task, cid, before = sent
                     self.awaiting[str(msg["id"])] = {"cmd": cmd, "task": task, "cgroup_id": cid,
-                                                     "verb": BREAKER_VERB[cmd], "since": self.clock()}
+                                                     "verb": BREAKER_VERB[cmd], "before": before, "since": self.clock()}
                 changed = True
         return changed
 
@@ -137,7 +149,8 @@ class StatusClient:
         if self.sock is None or cmd not in ("sever", "cap"):
             return None
         tag = f"t{next(self._tags)}"
-        self._sent[tag] = (cmd, task, cgroup_id)
+        self._forget_breakers()                     # a new press supersedes the old checks (and their alert)
+        self._sent[tag] = (cmd, task, cgroup_id, _press_state(self.state, task, cgroup_id))
         line = json.dumps({"cmd": cmd, "task": task, "cgroup_id": cgroup_id, "id": tag}) + "\n"
         try:
             self.sock.setblocking(True)
@@ -153,12 +166,14 @@ class StatusClient:
         return tag
 
     def _reflect(self, state: dict) -> None:
-        """An acknowledged breaker is settled when its task shows the verb in force, or when the task is gone."""
+        """An acknowledged breaker is settled when the feed shows a CHANGE it made: sever, ISOLATE in force that was not
+        at press time; cap, THROTTLE in force with cpu.max or memory.high different from press time. A verb that was
+        already there proves nothing. It is dropped, not settled, when its task is gone or has exited (pids 0)."""
         tasks = state.get("tasks") if isinstance(state.get("tasks"), list) else []
         for tag, a in list(self.awaiting.items()):
             t = next((t for t in tasks if isinstance(t, dict) and t.get("name") == a["task"]
                       and t.get("cgroup_id") == a["cgroup_id"]), None)
-            if t is None or a["verb"] in (t.get("enforced") or []):
+            if t is None or t.get("pids") == 0 or _reflected(a, t):
                 del self.awaiting[tag]
 
     def reachable(self) -> bool:
@@ -169,7 +184,7 @@ class StatusClient:
         """What to draw. Everything a tray needs, nothing it has to work out."""
         def quiet(status: str, title: str, detail: str) -> dict:
             return {"status": status, "colour": COLOURS[status], "title": title, "detail": detail, "mode": None,
-                    "tasks": [], "session": None}
+                    "tasks": [], "session": None, "replay": None}
         if self.sock is None:
             return quiet("unreachable", "cora: unreachable", self.error or "not connected")
         if self.state is None:
@@ -184,7 +199,7 @@ class StatusClient:
         except Exception as e:                      # a snapshot this client cannot read is never drawn as fine
             return {"status": "unknown", "colour": COLOURS["unknown"], "title": "cora: UNKNOWN snapshot from cora-sentinel",
                     "detail": f"unreadable snapshot ({e.__class__.__name__}: {e})"[:300], "mode": None, "tasks": [],
-                    "session": None}
+                    "session": None, "replay": _replay_of(self.state)}
 
     @staticmethod
     def _verbs(t: dict, key: str) -> List[str]:
@@ -271,6 +286,7 @@ class StatusClient:
                   "psi_state": t.get("psi_state") if t.get("psi_state") in PSI_STATES else "unknown",
                   "psi_threshold": t.get("psi_threshold") if t.get("psi_state") == "armed"
                                    and isinstance(t.get("psi_threshold"), dict) else None,
+                  "mem_bytes": t.get("mem_bytes") if type(t.get("mem_bytes")) is int else None,
                   "can_sever": "sever" in breakers and "ISOLATE" not in self._enforced(t),
                   "can_cap": "cap" in breakers and "THROTTLE" not in self._enforced(t)}
                  for t in raw_tasks]
@@ -295,18 +311,61 @@ class StatusClient:
                                f"{a['verb']} not in force" for a in unreflected[:3]) + " | " + detail
         return {"status": st, "colour": COLOURS[st], "title": f"cora: {label}",
                 "detail": detail,
-                "mode": mode, "tasks": tasks, "session": sess}
+                "mode": mode, "tasks": tasks, "session": sess, "replay": _replay_of(s)}
+
+
+def _replay_of(state) -> Optional[str]:
+    """The source a replay harness stamps on its frames (tools/cora-replay.py), or None: the daemon never sends it."""
+    r = state.get("replay") if isinstance(state, dict) else None
+    if r is None:
+        return None
+    return str(r.get("source") if isinstance(r, dict) else r)[:80] or "replay"
+
+
+def _press_state(state: Optional[dict], task: str, cgroup_id) -> Optional[dict]:
+    """What the press was made against: the task's verbs in force and its THROTTLE numbers, or None if unseen."""
+    for t in (state or {}).get("tasks") or []:
+        if isinstance(t, dict) and t.get("name") == task and t.get("cgroup_id") == cgroup_id:
+            lim = t.get("limits") if isinstance(t.get("limits"), dict) else {}
+            return {"enforced": list(t.get("enforced") or []), "cpu_max": lim.get("cpu_max"),
+                    "memory_high": lim.get("memory_high")}
+    return None
+
+
+def _reflected(a: dict, t: dict) -> bool:
+    before = a.get("before") or {"enforced": [], "cpu_max": None, "memory_high": None}
+    now = t.get("enforced") or []
+    if a["verb"] not in now:
+        return False
+    if a["cmd"] == "sever":
+        return "ISOLATE" not in before["enforced"]
+    lim = t.get("limits") if isinstance(t.get("limits"), dict) else {}
+    return (lim.get("cpu_max"), lim.get("memory_high")) != (before["cpu_max"], before["memory_high"])
+
+
+def _went_back(old: dict, new: dict) -> bool:
+    """A seq or a daemon mono that went backwards: a restarted daemon (or a replay that wrapped)."""
+    a, b = old.get("seq"), new.get("seq")
+    if type(a) is int and type(b) is int and b < a:
+        return True
+    a, b = old.get("mono"), new.get("mono")
+    return isinstance(a, (int, float)) and isinstance(b, (int, float)) and b < a
 
 
 UNDO = {"sever": "sudo cora-firewall release {task}", "cap": "sudo cora-cgroup reset {task}"}
 BREAKER_LABEL = {"sever": "Sever network\u2026", "cap": "Cap memory\u2026"}
 
 
-def confirm_text(cmd: str, task: str) -> tuple:
-    """(heading, body) for the confirmation dialog. Says plainly that the tray cannot take it back."""
+def confirm_text(cmd: str, task: str, mem_bytes: Optional[int] = None) -> tuple:
+    """(heading, body) for the confirmation dialog. Says plainly that the tray cannot take it back. For cap, the body
+    names the values it will write (memory.high: what the task uses at that moment, last seen as mem_bytes)."""
     what = {"sever": f"Cut ALL network access for \u201c{task}\u201d?",
             "cap": f"Cap \u201c{task}\u201d at the memory it uses now, and its CPU at 20%?"}[cmd]
-    body = ("It takes effect at once, for the whole task, even if cora-sentinel runs in dry-run.\n"
+    targets = ""
+    if cmd == "cap":
+        targets = (f"It will set memory.high = its memory.current at that moment (last seen {human_bytes(mem_bytes)}) "
+                   f"and cpu.max = {CAP_CPU_MAX} (20% of one CPU).\n")
+    body = (targets + "It takes effect at once, for the whole task, even if cora-sentinel runs in dry-run.\n"
             "The tray cannot undo it. To undo, run as root:\n\n    " + UNDO[cmd].format(task=task))
     return what, body
 

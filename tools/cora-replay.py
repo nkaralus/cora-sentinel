@@ -3,14 +3,21 @@
 cora-replay - a stand-in cora-sentinel status feed, for driving cora-tray and cora-hud without a daemon, a kernel or
 root. Stdlib only (and cora_sentinel itself).
 
-    cora-replay file PATH [--speed 1.0] [--loop] [--socket /tmp/cora-test-ui.sock]
-    cora-replay scenario NAME [--speed 1.0] [--loop] [--socket /tmp/cora-test-ui.sock]
+    cora-replay file PATH [--speed 1.0] [--loop] [--socket PATH]
+    cora-replay scenario NAME [--speed 1.0] [--loop] [--socket PATH]
+    cora-replay fixture NAME [--speed 1.0] [--loop] [--socket PATH]
+    cora-replay sanitize CAPTURE OUT --keep PREFIX [--keep PREFIX ...] [--seq FIRST:LAST]
     cora-replay list
 
   file       replays a recorded feed: raw newline-delimited JSON, or capture lines "<iso time> {json}" (what the live
              checks under cora_scratch recorded). Timing follows the frames' daemon clock (mono), else the capture
              times, scaled by --speed. Within one pass seq and mono are kept as recorded (a daemon restart in the log
              replays as one); with --loop each new pass is shifted forward so the wrap is not mistaken for a restart.
+  fixture    replays a sanitized real capture shipped in tools/replay-fixtures/ (NAME.ndjson): psiw_trip (a live
+             tripwire trip on Dimgeon) and psir_refused_healed (a refused tripwire across a daemon restart, re-armed by
+             the retry without one).
+  sanitize   makes such a fixture from a capture: only the tasks whose names start with a --keep prefix, session
+             counters zeroed (they are the host's blocklist history), ts rebased to 2026-01-01 on the daemon clock.
   scenario   generates a feed. Frames come from the REAL Hub.snapshot() over a scripted world (tasks, tripwires, the
              scope registry), so every field, status and precedence rule is what the daemon would send; only mono,
              ts and seq come from the scenario's virtual clock (so --speed compresses time without changing it).
@@ -21,11 +28,17 @@ refusals word for word (unknown command, one command per second, no such task, n
 breaker shows up in force in the next frame, except in the ack_not_reflected scenario, which acknowledges and
 changes nothing (cora_sentinel.uiclient then raises ACK_NOT_REFLECTED).
 
-Scenarios: steady, burst, refusal_recovery, blind_recovery, coarse_stretch, mid_trip_start, unmonitored,
-exited_refused, breaker_rate_limit, ack_not_reflected.
+Every frame sent carries "replay": {"source": "<mode>:<name>"}, so a client can say loudly that it is not watching
+the daemon (cora-hud shows a REPLAY banner). Nothing in the daemon's own feed ever has that key.
 
-The default socket is in /tmp, which is fine for a test feed and NOT for a daemon (cora-sentinel refuses a
-world-writable directory); the socket itself is created 0600.
+Scenarios (cora-replay list): steady, burst, refusal_recovery, blind_recovery, coarse_stretch, mid_trip_start,
+unmonitored, exited_refused, breaker_rate_limit, ack_not_reflected; transport faults: closed_connection, silence,
+garbage, split_frames, duplicate_frames; state faults: seq_regression, mono_regression, counter_reset,
+relaunch_new_cgroup, many_tasks, unknown_status.
+
+The default socket is ui.sock in a private directory: $XDG_RUNTIME_DIR/cora-replay (made 0700, and refused unless it
+is ours and 0700), else a fresh tempfile.mkdtemp(prefix="cora-replay-"). Never a fixed name in /tmp, where another
+user could squat it. The socket itself is created 0600.
 """
 from __future__ import annotations
 
@@ -40,14 +53,16 @@ import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Dict, Iterator, List, Optional, Tuple
+import tempfile
+from typing import Callable, Dict, Iterator, List, NamedTuple, Optional, Tuple, Union
 
 try:
     from cora_sentinel.uihub import COMMAND_INTERVAL_S, COMMANDS, SCHEMA, Hub
 except ImportError:
     sys.exit("cora-replay: cannot import cora_sentinel (install it, or run with PYTHONPATH=/path/to/cora-sentinel/src)")
 
-DEFAULT_SOCKET = "/tmp/cora-test-ui.sock"
+FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "replay-fixtures")
+TRANSPORT = ("closed_connection", "silence", "garbage", "split_frames", "duplicate_frames")
 TRIGGER = "some 150000 1000000"
 T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
 MAX_LINE_IN = 1024
@@ -68,6 +83,8 @@ class World:
         self.registry_error: Optional[str] = None
         self.evaluating = 0
         self.policy = "accept"                    # "accept": a breaker takes effect; "ack_only": it does not
+        self.status_override: Optional[str] = None   # a status the daemon would never send
+        self.next_seq: Optional[int] = None       # the seq of the next frame (a restarted daemon starts again at 1)
         self.lock = threading.RLock()
         self.hub = Hub("/nonexistent/cora-replay.sock", mode="enforce", tasks=lambda: copy.deepcopy(self.tasks),
                        evaluating=lambda: self.evaluating, psi=self, scopes=self, act=lambda v, t: "unused",
@@ -137,12 +154,21 @@ class World:
             snap = self.hub.snapshot()
         snap["mono"] = round(self.mono, 6)
         snap["ts"] = (T0 + timedelta(seconds=self.mono)).isoformat(timespec="seconds")
+        if self.status_override is not None:
+            snap["status"] = self.status_override
         return snap
 
 
 # ---------------------------------------------------------------------------------------------- scenarios
 # A scenario sets up the world, then yields the virtual seconds to wait before each next frame (it may change the
-# world first). The runner emits a frame at the start and after every yield.
+# world first). The runner emits a frame at the start and after every yield. A scenario may also yield an Op, a
+# transport event with no frame of its own.
+class Op(NamedTuple):
+    kind: str                                     # "close" | "raw" | "split" | "dup" | "silence"
+    arg: object = None                            # raw: bytes; split: pieces; silence: virtual seconds
+
+
+Step = Union[float, Op]
 Scenario = Callable[[World], Iterator[float]]
 
 
@@ -259,13 +285,134 @@ def ack_not_reflected(w: World) -> Iterator[float]:
     yield from _steady(w, name="ackonly-c9d0e1")
 
 
+# ------------------------------------------------ transport faults
+def closed_connection(w: World) -> Iterator[Step]:
+    """The daemon closes every connection mid-feed, then carries on: a client shows unreachable, reconnects, and is
+    handed the latest frame at once."""
+    w.add_task("closed-d0e1f2", 109)
+    for _ in range(4):
+        yield 2.0
+    yield Op("close")
+    for _ in range(6):
+        yield 2.0
+
+
+def silence(w: World) -> Iterator[Step]:
+    """The socket stays open and says nothing for 10 s (over STALE_AFTER_S): a wedged daemon, never "clear"."""
+    w.add_task("silent-e1f2a3", 110)
+    for _ in range(3):
+        yield 2.0
+    yield Op("silence", 10.0)
+    for _ in range(4):
+        yield 2.0
+
+
+def garbage(w: World) -> Iterator[Step]:
+    """Junk between frames: not JSON, half an object, another schema, a bare list. A client skips them all."""
+    w.add_task("garbage-f2a3b4", 111)
+    junk = b'not json at all\n{"schema": "cora.sentinel.ui/v1", "type": "sta\n{"schema": "other/v9", "type": ' \
+           b'"state", "status": "clear"}\n[1, 2, 3]\n\n'
+    for _ in range(3):
+        yield 2.0
+        yield Op("raw", junk)
+    for _ in range(3):
+        yield 2.0
+
+
+def split_frames(w: World) -> Iterator[Step]:
+    """Each frame arrives in pieces over separate writes (7 of them, the last one the newline)."""
+    w.add_task("split-a3b4c5", 112)
+    for _ in range(6):
+        yield Op("split", 7)
+        yield 2.0
+
+
+def duplicate_frames(w: World) -> Iterator[Step]:
+    """Every frame is sent twice, byte for byte: a ring buffer ignores a seq already seen."""
+    w.add_task("dup-b4c5d6", 113)
+    for _ in range(6):
+        w.stall("dup-b4c5d6", 20_000, avg10=1.0)
+        yield 2.0
+        yield Op("dup")
+
+
+# ------------------------------------------------ state faults
+def seq_regression(w: World) -> Iterator[Step]:
+    """The daemon restarts: seq starts again at 1 (its clock carries on). Clients start their history over."""
+    yield from _steady(w, name="seqreg-c5d6e7", seconds=10.0)
+    w.next_seq = 1
+    yield from _stalls(w, "seqreg-c5d6e7", 5)
+
+
+def mono_regression(w: World) -> Iterator[Step]:
+    """The daemon clock goes back 100 s with seq still rising: treated as a restart too."""
+    yield from _steady(w, name="monoreg-d6e7f8", seconds=10.0)
+    w.mono -= 100.0
+    yield from _stalls(w, "monoreg-d6e7f8", 5)
+
+
+def counter_reset(w: World) -> Iterator[Step]:
+    """The cumulative stall counters fall to 0 under the same cgroup id: that ring starts over, never a negative
+    stall."""
+    yield from _steady(w, name="reset-e7f8a9", seconds=10.0)
+    p = w.tasks["reset-e7f8a9"]["psi"]
+    p["some_total_us"] = p["full_total_us"] = 0
+    yield from _stalls(w, "reset-e7f8a9", 5)
+
+
+def relaunch_new_cgroup(w: World) -> Iterator[Step]:
+    """The same name relaunched under a new cgroup id: a new task, a new history; a breaker aimed at the old id is
+    refused ("not the task you saw")."""
+    n = "relaunch-f8a9b0"
+    yield from _steady(w, name=n, seconds=10.0)
+    del w.tasks[n]
+    yield 2.0
+    w.add_task(n, 214)
+    yield from _stalls(w, n, 5)
+
+
+def many_tasks(w: World) -> Iterator[Step]:
+    """20 concurrent tasks in every state: armed, refused, disabled (launched with off), unmonitored, exited."""
+    for i in range(20):
+        name, kind = f"many{i:02d}-{i:06x}", i % 5
+        w.add_task(name, 300 + i, trigger=None if kind == 2 else TRIGGER, scope=kind != 3, refused=kind == 1,
+                   pids=0 if kind == 4 else 1)
+    for k in range(15):
+        for i in range(20):
+            if i % 5 in (0, 1):
+                w.stall(f"many{i:02d}-{i:06x}", 1_000 * (i + 1) * (k % 4), avg10=0.1 * i)
+        yield 2.0
+
+
+def unknown_status(w: World) -> Iterator[Step]:
+    """A status string this client does not know ("meltdown"), then a known one again: loud, never green."""
+    w.add_task("status-a9b0c1", 115)
+    for _ in range(3):
+        yield 2.0
+    w.status_override = "meltdown"
+    for _ in range(4):
+        yield 2.0
+    w.status_override = None
+    for _ in range(3):
+        yield 2.0
+
+
+def _stalls(w: World, name: str, n: int, step: float = 2.0) -> Iterator[Step]:
+    for _ in range(n):
+        w.stall(name, int(step * 5_000), avg10=0.5)
+        yield step
+
+
 SCENARIOS: Dict[str, Scenario] = {f.__name__: f for f in (steady, burst, refusal_recovery, blind_recovery, coarse_stretch,
                                                          mid_trip_start, unmonitored, exited_refused, breaker_rate_limit,
-                                                         ack_not_reflected)}
+                                                         ack_not_reflected, closed_connection, silence, garbage,
+                                                         split_frames, duplicate_frames, seq_regression, mono_regression,
+                                                         counter_reset, relaunch_new_cgroup, many_tasks, unknown_status)}
 
 
-def scenario_frames(name: str, world: Optional[World] = None) -> Iterator[Tuple[float, dict]]:
-    """(virtual seconds since the previous frame, frame), the first one at 0."""
+def scenario_frames(name: str, world: Optional[World] = None) -> Iterator[Tuple[float, Union[dict, Op]]]:
+    """(virtual seconds since the previous item, frame or Op), the first frame at 0. A "split" Op is followed by the
+    frame it splits; a "silence" Op advances the virtual clock by its seconds."""
     w = world or World()
     gen = SCENARIOS[name](w)
     seq = 0
@@ -273,6 +420,8 @@ def scenario_frames(name: str, world: Optional[World] = None) -> Iterator[Tuple[
     def emit(dt):
         nonlocal seq
         f = w.frame()
+        if w.next_seq is not None:
+            seq, w.next_seq = w.next_seq - 1, None
         seq += 1
         f["seq"] = seq
         return dt, f
@@ -282,9 +431,17 @@ def scenario_frames(name: str, world: Optional[World] = None) -> Iterator[Tuple[
         step = None
     yield emit(0.0)
     while step is not None:
-        with w.lock:
-            w.mono += step
-        yield emit(step)
+        if isinstance(step, Op):
+            if step.kind == "silence":
+                with w.lock:
+                    w.mono += float(step.arg)
+                yield float(step.arg), step
+            else:
+                yield 0.0, step                   # a "split" applies to the next frame the scenario makes
+        else:
+            with w.lock:
+                w.mono += step
+            yield emit(step)
         try:
             step = next(gen)
         except StopIteration:
@@ -348,11 +505,73 @@ def log_frames(path: str, loop: bool = False) -> Iterator[Tuple[float, dict]]:
         passes += 1
 
 
+def sanitize(frames: List[dict], keep: List[str], seq_range: Optional[Tuple[int, int]] = None) -> List[dict]:
+    """A capture made shareable: only tasks named with a kept prefix, session counters zeroed, ts on the daemon clock
+    from 2026-01-01. With seq_range (FIRST, LAST) only the frames from the LAST frame with seq FIRST to the next frame
+    with seq LAST are kept (a capture across a daemon restart repeats seq numbers)."""
+    lo, hi = 0, len(frames) - 1
+    if seq_range is not None:
+        starts = [i for i, f in enumerate(frames) if f.get("seq") == seq_range[0]
+                  and any(g.get("seq") == seq_range[1] for g in frames[i:])]
+        if not starts:
+            return []
+        lo = starts[-1]
+        hi = next(j for j in range(lo, len(frames)) if frames[j].get("seq") == seq_range[1])
+    out = []
+    for f in frames[lo:hi + 1]:
+        g = copy.deepcopy(f)
+        g["tasks"] = [t for t in g.get("tasks") or [] if isinstance(t, dict)
+                      and any(str(t.get("name", "")).startswith(k) for k in keep)]
+        if isinstance(g.get("session"), dict):
+            g["session"] = {k: (0 if isinstance(v, (int, float)) and not isinstance(v, bool) else None)
+                            for k, v in g["session"].items() if k != "started"}
+        if isinstance(g.get("mono"), (int, float)):
+            g["ts"] = (T0 + timedelta(seconds=g["mono"])).isoformat(timespec="seconds")
+        g.pop("replay", None)
+        out.append(g)
+    return out
+
+
+def fixture_path(name: str) -> str:
+    if not re.fullmatch(r"[a-z0-9_]+", name):
+        raise SystemExit(f"cora-replay: bad fixture name {name!r}")
+    return os.path.join(FIXTURES, f"{name}.ndjson")
+
+
+def fixtures() -> List[str]:
+    try:
+        return sorted(f[:-7] for f in os.listdir(FIXTURES) if f.endswith(".ndjson"))
+    except OSError:
+        return []
+
+
 # ---------------------------------------------------------------------------------------------- the socket
+def private_dir(base: Optional[str] = None) -> str:
+    """A directory only we can use, for the default socket: $XDG_RUNTIME_DIR/cora-replay, else a fresh mkdtemp."""
+    base = os.environ.get("XDG_RUNTIME_DIR") if base is None else base
+    if base and os.path.isdir(base):
+        d = os.path.join(base, "cora-replay")
+        try:
+            os.mkdir(d, 0o700)
+        except FileExistsError:
+            pass
+        st = os.lstat(d)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) != 0o700:
+            raise SystemExit(f"cora-replay: {d} is not a 0700 directory of ours: refusing to use it")
+        return d
+    return tempfile.mkdtemp(prefix="cora-replay-")
+
+
+def default_socket() -> str:
+    return os.path.join(private_dir(), "ui.sock")
+
+
+
 class ReplayServer:
-    def __init__(self, path: str = DEFAULT_SOCKET, world: Optional[World] = None,
-                 clock: Callable[[], float] = time.monotonic):
-        self.path, self.world, self.clock = path, world, clock
+    def __init__(self, path: str, world: Optional[World] = None, clock: Callable[[], float] = time.monotonic,
+                 source: str = "replay"):
+        self.path, self.world, self.clock, self.source = path, world, clock, source
+        self.inserted = 0                         # frames sent in reply to a breaker, between the scripted ones
         self.sock: Optional[socket.socket] = None
         self.clients: Dict[socket.socket, dict] = {}
         self.latest: Optional[dict] = None
@@ -396,12 +615,35 @@ class ReplayServer:
         with self.lock:
             return len(self.clients)
 
-    def broadcast(self, frame: dict) -> None:
-        line = (json.dumps(frame, separators=(",", ":")) + "\n").encode()
+    def _line(self, frame: dict) -> bytes:
+        return (json.dumps(dict(frame, replay={"source": self.source}), separators=(",", ":")) + "\n").encode()
+
+    def broadcast(self, frame: dict, pieces: int = 1, pause: float = 0.02) -> None:
+        line = self._line(frame)
         with self.lock:
             self.latest = frame
+        if pieces <= 1:
+            self.send_raw(line)
+            return
+        cuts = [len(line) * i // pieces for i in range(pieces)] + [len(line)]
+        for a, b in zip(cuts, cuts[1:]):
+            self.send_raw(line[a:b])
+            time.sleep(pause)
+
+    def send_raw(self, data: bytes) -> None:
+        with self.lock:
             for c in list(self.clients):
-                self._send(c, line)
+                self._send(c, data)
+
+    def drop_all(self) -> None:
+        """Close every client connection, and keep listening."""
+        with self.lock:
+            for c in list(self.clients):
+                try:
+                    c.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                self._drop(c)
 
     def _send(self, c: socket.socket, data: bytes) -> None:
         try:
@@ -426,7 +668,7 @@ class ReplayServer:
             with self.lock:
                 self.clients[c] = {"last_cmd": -1e9}
                 if self.latest is not None:
-                    self._send(c, (json.dumps(self.latest, separators=(",", ":")) + "\n").encode())
+                    self._send(c, self._line(self.latest))
             threading.Thread(target=self._read, args=(c,), name="replay-client", daemon=True).start()
 
     def _read(self, c: socket.socket) -> None:
@@ -490,22 +732,35 @@ class ReplayServer:
             w.breaker(cmd, task)
             frame = w.frame()
         frame["seq"] = (self.latest or {}).get("seq", 0) + 1
+        self.inserted += 1
         self.broadcast(frame)                     # the hub shows an accepted breaker at once
         verb = COMMANDS[cmd]
         return {"schema": SCHEMA, "type": "result", "id": tag, "ok": True,
                 "action": f"done:{verb}@cgroup:{task}[replay{'' if w.policy == 'accept' else ': acknowledged only'}]"}
 
 
-def run(server: ReplayServer, frames: Iterator[Tuple[float, dict]], speed: float = 1.0,
+def run(server: ReplayServer, frames: Iterator[Tuple[float, Union[dict, Op]]], speed: float = 1.0,
         sleep: Callable[[float], None] = time.sleep) -> int:
-    """Emit frames at their (scaled) pace. Frames generated while a breaker was answered keep seq increasing."""
-    n = 0
+    """Emit frames at their (scaled) pace, and carry out transport Ops. Every scripted seq is shifted up by the frames
+    a breaker reply inserted, so the feed stays in order and a scripted regression still regresses."""
+    n, pieces = 0, 1
     for dt, f in frames:
         if dt > 0:
             sleep(dt / speed)
-        if server.latest is not None and isinstance(f.get("seq"), int) and f["seq"] <= server.latest.get("seq", 0):
-            f = dict(f, seq=server.latest["seq"] + 1)
-        server.broadcast(f)
+        if isinstance(f, Op):
+            if f.kind == "close":
+                server.drop_all()
+            elif f.kind == "raw":
+                server.send_raw(f.arg)
+            elif f.kind == "dup" and server.latest is not None:
+                server.send_raw(server._line(server.latest))
+            elif f.kind == "split":
+                pieces = int(f.arg)
+            continue
+        if server.inserted and isinstance(f.get("seq"), int):
+            f = dict(f, seq=f["seq"] + server.inserted)
+        server.broadcast(f, pieces=pieces)
+        pieces = 1
         n += 1
     return n
 
@@ -513,24 +768,48 @@ def run(server: ReplayServer, frames: Iterator[Tuple[float, dict]], speed: float
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="cora-replay", description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="mode", required=True)
-    for mode in ("file", "scenario"):
+    for mode in ("file", "scenario", "fixture"):
         p = sub.add_parser(mode)
         p.add_argument("path" if mode == "file" else "name")
         p.add_argument("--speed", type=float, default=1.0)
         p.add_argument("--loop", action="store_true")
-        p.add_argument("--socket", default=DEFAULT_SOCKET)
+        p.add_argument("--socket", default=None, help="default: ui.sock in a private 0700 directory")
+    p = sub.add_parser("sanitize")
+    p.add_argument("capture")
+    p.add_argument("out")
+    p.add_argument("--keep", action="append", required=True, help="a task name prefix to keep (repeatable)")
+    p.add_argument("--seq", default=None, help="FIRST:LAST, the recorded seq of the first and last frame to keep")
     sub.add_parser("list")
     a = ap.parse_args(argv)
     if a.mode == "list":
         for name, f in SCENARIOS.items():
             print(f"{name:<20} {(f.__doc__ or '').strip().splitlines()[0]}")
+        for name in fixtures():
+            print(f"{name:<20} (fixture) a sanitized Dimgeon capture")
+        return 0
+    if a.mode == "sanitize":
+        rng = tuple(int(x) for x in a.seq.split(":")) if a.seq else None
+        out = sanitize([f for _, f in read_log(a.capture)], a.keep, rng)
+        if not out:
+            raise SystemExit("cora-replay: nothing left to write")
+        with open(a.out, "w", encoding="utf-8") as fh:
+            fh.writelines(json.dumps(f, separators=(",", ":")) + "\n" for f in out)
+        print(f"cora-replay: {len(out)} frames written to {a.out}", file=sys.stderr)
         return 0
     if a.speed <= 0:
         ap.error("--speed must be above 0")
     if a.mode == "scenario" and a.name not in SCENARIOS:
         ap.error(f"unknown scenario {a.name!r}: {', '.join(SCENARIOS)}")
+    if a.mode == "fixture":
+        if a.name not in fixtures():
+            ap.error(f"unknown fixture {a.name!r}: {', '.join(fixtures()) or 'none installed'}")
+        a.mode, a.path = "file", fixture_path(a.name)
+        source = f"fixture:{a.name}"
+    else:
+        source = f"{a.mode}:{getattr(a, 'path', None) or a.name}"
+    a.socket = a.socket or default_socket()
     world = World() if a.mode == "scenario" else None
-    server = ReplayServer(a.socket, world)
+    server = ReplayServer(a.socket, world, source=source)
     server.start()
     print(f"cora-replay: serving {a.mode} {getattr(a, 'path', None) or a.name} on {a.socket} (speed {a.speed:g}"
           f"{', looping' if a.loop else ''}); point a client at it with --socket {a.socket}", file=sys.stderr)

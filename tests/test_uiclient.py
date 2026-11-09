@@ -439,18 +439,23 @@ class _SendSock(_NoSock):
         self.sent.append(json.loads(data))
 
 
-def acked(now, ok=True, cmd="sever"):
+def acked(now, ok=True, cmd="sever", **at_press):
     c = StatusClient("/virtual", clock=lambda: now[0])
     c.sock, c.connected_at = _SendSock(), now[0]
-    c.ingest((json.dumps({**BASE, "status": "clear", "seq": 1, "tasks": [task(name="game", cgroup_id=9)]}) + "\n").encode())
+    c.ingest((json.dumps({**BASE, "status": "clear", "seq": 1, "mono": 50.0,
+                          "tasks": [task(name="game", cgroup_id=9, **at_press)]}) + "\n").encode())
     tag = c.send(cmd, "game", 9)
     assert c.sock.sent[-1] == {"cmd": cmd, "task": "game", "cgroup_id": 9, "id": tag}
     c.ingest((json.dumps({"schema": SCHEMA, "type": "result", "id": tag, "ok": ok}) + "\n").encode())
     return c
 
 
-def frame_with(c, seq, **kw):
-    c.ingest((json.dumps({**BASE, "status": kw.pop("status", "clear"), "seq": seq,
+CAPPED = {"source": "none", "cpu_max": "20000 100000", "memory_high": 64 << 20, "memory_max": None}
+UNCAPPED = {"source": "none", "cpu_max": None, "memory_high": None, "memory_max": None}
+
+
+def frame_with(c, seq, mono=None, **kw):
+    c.ingest((json.dumps({**BASE, "status": kw.pop("status", "clear"), "seq": seq, "mono": 50.0 + seq if mono is None else mono,
                           "tasks": [task(name="game", cgroup_id=9, **kw)]}) + "\n").encode())
 
 
@@ -469,7 +474,7 @@ def test_an_acknowledged_breaker_that_never_shows_up_is_loud():
 def test_a_breaker_that_shows_up_in_force_is_settled():
     now = [100.0]
     c = acked(now, cmd="cap")
-    frame_with(c, 2, status="contained", enforced=["THROTTLE"], contained=["THROTTLE"])
+    frame_with(c, 2, status="contained", enforced=["THROTTLE"], contained=["THROTTLE"], limits=CAPPED)
     now[0] += uiclient.ACK_TIMEOUT_S + 0.5                                # past the deadline, inside the 6 s staleness
     assert c.awaiting == {} and c.view()["status"] == "contained"
 
@@ -481,3 +486,132 @@ def test_a_refused_breaker_or_a_task_that_ended_is_not_awaited():
     c.ingest((json.dumps({**BASE, "status": "clear", "seq": 2, "tasks": []}) + "\n").encode())
     now[0] += uiclient.ACK_TIMEOUT_S + 1
     assert c.awaiting == {} and c.view()["status"] == "clear"
+
+
+def late(now):
+    now[0] += uiclient.ACK_TIMEOUT_S + 0.1
+
+
+def alerting(c):
+    return "ACK_NOT_REFLECTED" in c.view()["detail"]
+
+
+def test_a_sever_pressed_while_isolate_was_already_in_force_is_not_proven_by_it():
+    now = [100.0]
+    c = acked(now, enforced=["ISOLATE"], contained=["ISOLATE"])
+    late(now)
+    frame_with(c, 2, status="contained", enforced=["ISOLATE"], contained=["ISOLATE"])
+    assert alerting(c)
+
+
+def test_a_cap_is_proven_by_numbers_that_changed_not_by_throttle_alone():
+    now = [100.0]
+    c = acked(now, cmd="cap", enforced=["THROTTLE"], limits=CAPPED)
+    late(now)
+    frame_with(c, 2, status="contained", enforced=["THROTTLE"], limits=CAPPED)          # the same numbers: no proof
+    assert alerting(c)
+    c = acked(now, cmd="cap", limits=UNCAPPED)
+    frame_with(c, 2, status="contained", enforced=["THROTTLE"], limits=CAPPED)          # cpu.max and memory.high moved
+    late(now)
+    frame_with(c, 3, status="contained", enforced=["THROTTLE"], limits=CAPPED)
+    assert c.awaiting == {} and not alerting(c)
+    c = acked(now, cmd="cap", limits=UNCAPPED)
+    frame_with(c, 2, status="clear", enforced=[], limits=CAPPED)                         # numbers but no THROTTLE
+    late(now)
+    frame_with(c, 3, status="clear", enforced=[], limits=CAPPED)
+    assert alerting(c)
+
+
+def test_the_alert_unlatches_when_the_verb_shows_up_late():
+    now = [100.0]
+    c = acked(now)
+    late(now)
+    frame_with(c, 2)
+    assert alerting(c)
+    frame_with(c, 3, status="contained", enforced=["ISOLATE"], contained=["ISOLATE"])   # a slow kernel, then there
+    assert c.awaiting == {} and not alerting(c) and c.view()["status"] == "contained"
+
+
+def test_the_alert_unlatches_on_a_new_press_and_on_reconnect():
+    now = [100.0]
+    c = acked(now)
+    late(now)
+    frame_with(c, 2)
+    assert alerting(c)
+    c.send("cap", "game", 9)                                              # a new press supersedes the old check
+    assert c.awaiting == {} and not alerting(c) and len(c._sent) == 1
+    c = acked(now)
+    late(now)
+    frame_with(c, 2)
+    assert alerting(c)
+    c.close()                                                             # reconnect starts with close()
+    assert c.awaiting == {} and c._sent == {}
+
+
+@pytest.mark.parametrize("why", ["exited", "gone", "seq went back", "mono went back"])
+def test_a_pending_check_is_dropped_when_its_task_exits_or_the_daemon_restarts(why):
+    now = [100.0]
+    c = acked(now)
+    if why == "exited":
+        frame_with(c, 2, pids=0)
+    elif why == "gone":
+        c.ingest((json.dumps({**BASE, "status": "clear", "seq": 2, "mono": 52.0, "tasks": []}) + "\n").encode())
+    elif why == "seq went back":
+        frame_with(c, 0, mono=60.0)
+    else:
+        frame_with(c, 5, mono=10.0)
+    assert c.awaiting == {}
+    late(now)
+    frame_with(c, 9, mono=70.0)                                           # even with the task back, unchanged
+    assert not alerting(c)
+
+
+def test_an_unanswered_press_is_dropped_on_a_restart_too():
+    now = [100.0]
+    c = StatusClient("/virtual", clock=lambda: now[0])
+    c.sock, c.connected_at = _SendSock(), now[0]
+    frame_with(c, 5)
+    tag = c.send("sever", "game", 9)
+    frame_with(c, 1, mono=10.0)                                           # restarted before it answered
+    c.ingest((json.dumps({"schema": SCHEMA, "type": "result", "id": tag, "ok": True}) + "\n").encode())
+    assert c.awaiting == {}
+
+
+class _EOFSock(_SendSock):
+    def recv(self, n):
+        return b""
+
+
+def test_a_pending_check_is_dropped_when_the_link_drops():
+    now = [100.0]
+    c = acked(now)
+    c.sock = _EOFSock()
+    assert c.poll() is True and c.sock is None and c.awaiting == {}
+
+
+
+# ================================================================ what a HUD reads off the view
+def test_the_view_carries_the_replay_source_and_the_daemon_never_does():
+    assert view_of({**BASE, "status": "clear", "tasks": []})["replay"] is None
+    v = view_of({**BASE, "status": "clear", "tasks": [], "replay": {"source": "scenario:burst"}})
+    assert v["replay"] == "scenario:burst"
+    assert view_of({**BASE, "status": "clear", "tasks": [], "replay": True})["replay"] == "True"
+    assert StatusClient("/nonexistent").view()["replay"] is None
+
+
+def test_view_tasks_carry_mem_bytes_for_the_cap_confirmation():
+    v = view_of({**BASE, "status": "clear", "tasks": [task(mem_bytes=64 << 20), task(name="b", mem_bytes=None)]})
+    assert [t["mem_bytes"] for t in v["tasks"]] == [64 << 20, None]
+    head, body = uiclient.confirm_text("cap", "game", 64 << 20)
+    assert "memory.high = its memory.current at that moment (last seen 64.0 MiB)" in body
+    assert f"cpu.max = {uiclient.CAP_CPU_MAX} (20% of one CPU)" in body
+    assert "last seen ?" in uiclient.confirm_text("cap", "game")[1]
+    assert "memory.high" not in uiclient.confirm_text("sever", "game", 1)[1]
+
+
+def test_on_state_sees_every_frame_even_several_in_one_read():
+    seen = []
+    c = StatusClient("/virtual", clock=lambda: 0.0)
+    c.on_state = lambda f: seen.append(f["seq"])
+    c.ingest(b"".join((json.dumps({**BASE, "status": "clear", "seq": i, "tasks": []}) + "\n").encode() for i in (1, 2, 3)))
+    assert seen == [1, 2, 3] and c.state["seq"] == 3

@@ -360,6 +360,7 @@ CORRUPT = {
     "a list": b'[{"game-abcdef": {}}]',
     "a string": b'"scopes"',
     "not utf-8": b"\xff\xfe\x00junk",
+    "empty": b"",
 }
 
 

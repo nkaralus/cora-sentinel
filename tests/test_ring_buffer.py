@@ -42,7 +42,7 @@ def pts(seg):
 def test_a_sample_keeps_the_raw_counters_and_the_tripwire_facts():
     s = RingStore()
     s.feed(frame(1, 100.0, task(some=5, full=3, count=2)), 100.0)
-    assert samples(s.rings[7]) == [Sample(100.0, 5, 3, 1, "armed", ("some", 150000, 1000000), 2)]
+    assert samples(s.rings[7]) == [Sample(100.0, 5, 3, 1, "armed", ("some", 150000, 1000000), 2, 1.0, None)]
 
 
 def test_null_psi_is_none_never_zero():
@@ -456,3 +456,25 @@ def test_property_the_sample_cap_holds_over_10000_frames():
         s.feed(frame(i + 1, m, task(some=i * 1000, full=i * 500, thr=THRESHOLDS[(i // 1500) % 2])), m)
         assert len(s.rings[7].samples) <= rb.MAX_SAMPLES
     assert len(s.rings[7].samples) == rb.MAX_SAMPLES
+
+
+
+# ================================================================ the kernel's averages, a faint reference
+def test_avg_series_are_fractions_broken_where_the_curve_is():
+    s = RingStore()
+    for i, m in enumerate([100.0, 101.0, 102.0]):
+        t = task(some=i * 10, full=i * 5)
+        t["psi"].update(some_avg10=10.0 * i, some_avg60=150.0 if i == 2 else 5.0)
+        s.feed(frame(i + 1, m, t), m)
+    t = task(some=40, full=20, pids=0)                                      # exited: the line stops
+    t["psi"]["some_avg10"] = 50.0
+    s.feed(frame(4, 103.0, t), 103.0)
+    t = task(some=50, full=25)
+    t["psi"]["some_avg10"] = 60.0
+    s.feed(frame(5, 110.0, t), 110.0)                                       # after a 7 s hole
+    runs = rb.build_avg_series(s.rings[7].samples, "some_avg10")
+    assert runs == [[(100.0, 0.0), (101.0, 0.1), (102.0, 0.2)], [(110.0, 0.6)]]
+    assert rb.build_avg_series(s.rings[7].samples, "some_avg60")[0][-1] == (102.0, 1.0)      # clamped
+    with pytest.raises(ValueError):
+        rb.build_avg_series([], "full_avg10")
+    assert rb._num(float("nan")) is None and rb._num(True) is None and rb._num(3) == 3.0

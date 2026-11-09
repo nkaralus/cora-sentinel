@@ -761,11 +761,21 @@ def test_contained_outranks_psi_refused_and_alarm_outranks_blind_and_contained()
 
 import itertools
 
+from cora_sentinel.uiclient import RANK as _RANK
 
-@pytest.mark.parametrize("alarm, blind, contained, refused, pressure, evaluating, exited",
-                         list(itertools.product([False, True], repeat=7)))
-def test_the_hub_and_the_client_agree_on_the_status(alarm, blind, contained, refused, pressure, evaluating, exited):
-    """Every combination of the seven conditions: the status the hub computes is the status the client shows."""
+
+def uiclient_rank(status):
+    return _RANK[status]
+
+
+@pytest.mark.parametrize("alarm, blind, contained, refused, pressure, evaluating, exited, prov_unknown",
+                         list(itertools.product([False, True], repeat=8)))
+def test_the_hub_and_the_client_agree_on_the_status(alarm, blind, contained, refused, pressure, evaluating, exited,
+                                                    prov_unknown):
+    """Every combination of the eight conditions: the status the hub computes is the status the client shows, with
+    one intended exception. A task whose limits.source is "unknown" makes the CLIENT vote blind on its own, even in a
+    snapshot the hub calls clear (a hub only sends "unknown" with a registry truth error, but the client does not rely
+    on that): the client may be stricter than the hub, never greener."""
     tasks = _one_task(enforced=["ISOLATE"] if contained else [], errors=["firewall unreadable (X)"] if blind else [],
                       pids=0 if exited else 1)
     h = Hub("/nonexistent/ui.sock", tasks=lambda: tasks, evaluating=lambda: int(evaluating),
@@ -775,9 +785,14 @@ def test_the_hub_and_the_client_agree_on_the_status(alarm, blind, contained, ref
     if alarm:
         h.note_decision({"final": "DROPPED"})
     snap = h.snapshot()
+    if prov_unknown:
+        snap["tasks"][0]["limits"] = {"source": "unknown", "cpu_max": None, "memory_high": None, "memory_max": None}
     c = StatusClient("/x", clock=lambda: 0.0)
     c.sock, c.last_rx, c.connected_at, c.state = object(), 0.0, 0.0, snap
-    assert snap["status"] == c.view()["status"], (snap["status"], c.view()["status"], c.view()["detail"])
+    got = c.view()["status"]
+    want = max(snap["status"], "blind", key=uiclient_rank) if prov_unknown else snap["status"]
+    assert got == want, (snap["status"], got, c.view()["detail"])
+    assert uiclient_rank(got) >= uiclient_rank(snap["status"])            # never greener than the hub
 
 
 # ---------------------------------------------------------------- an unreadable scope registry blinds the feed, and heals

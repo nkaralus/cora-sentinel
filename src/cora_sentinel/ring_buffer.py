@@ -87,6 +87,8 @@ class Sample(NamedTuple):
     psi_state: str
     threshold: Optional[Threshold]
     pressure_count: Optional[int]
+    some_avg10: Optional[float] = None    # the kernel's own rolling averages (%), a faint reference beside the
+    some_avg60: Optional[float] = None    # exact curve; None when the frame does not carry them
 
 
 class Gap(NamedTuple):
@@ -248,7 +250,7 @@ class RingStore:
             state_ = t.get("psi_state") if isinstance(t.get("psi_state"), str) else "unknown"
             s = Sample(mono, _int(psi.get("some_total_us")), _int(psi.get("full_total_us")), pids,
                        state_, threshold_key(t.get("psi_threshold")) if state_ == "armed" else None,
-                       _int(pressure.get("count")))
+                       _int(pressure.get("count")), _num(psi.get("some_avg10")), _num(psi.get("some_avg60")))
             prev = ring.last()
             if prev is not None and (_went_down(prev.some_total_us, s.some_total_us)
                                      or _went_down(prev.full_total_us, s.full_total_us)):
@@ -298,6 +300,10 @@ class RingStore:
 
 def _int(v) -> Optional[int]:
     return v if type(v) is int else None
+
+
+def _num(v) -> Optional[float]:
+    return float(v) if type(v) in (int, float) and v == v else None
 
 
 def _went_down(a: Optional[int], b: Optional[int]) -> bool:
@@ -356,6 +362,23 @@ def build_stall_segments(samples: Iterable[Point], window_s: float, now_mono: Op
         if cur:
             segments.append(Segment(cur, band, thr, cur_coarse))
     return segments
+
+
+def build_avg_series(samples: Iterable[Point], key: str = "some_avg10", now_mono: Optional[float] = None,
+                     span_s: float = WINDOW_S) -> List[List[Tuple[float, float]]]:
+    """The kernel's avg10 / avg60 as fractions (0..1), in runs to draw as connected lines: broken, like the exact curve,
+    at a Gap, an Epoch, an exited sample and a sample without the value. Pure."""
+    if key not in ("some_avg10", "some_avg60"):
+        raise ValueError(key)
+    runs: List[List[Tuple[float, float]]] = [[]]
+    for p in samples:
+        v = getattr(p, key, None) if isinstance(p, Sample) and p.pids != 0 else None
+        if v is None or (now_mono is not None and p.mono < now_mono - span_s):
+            if runs[-1]:
+                runs.append([])
+            continue
+        runs[-1].append((p.mono, min(max(v / 100.0, 0.0), 1.0)))
+    return [r for r in runs if r]
 
 
 # ---------------------------------------------------------------------------------------------- cora-tray's meter
