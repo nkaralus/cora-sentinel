@@ -21,6 +21,13 @@ from cora_sentinel.sockdiag import (LIVE_MASK, NOCOOKIE, TCP_ESTABLISHED, TCP_LI
 needs_diag = pytest.mark.skipif(not available(), reason="sock_diag unavailable")
 
 
+def inodes(*socks):
+    """The kernel's inode of each socket: exactly what sock_diag and /proc/net/tcp report, so a filter on it selects
+    the test's own sockets and nothing else. Ports alone do not: any socket on the host that shares a port number with
+    ours (CI run #42: an unrelated socket made it 22, not 21) would be counted."""
+    return {os.fstat(x.fileno()).st_ino for x in socks}
+
+
 def pair(n=1):
     """n established loopback connections. Returns (listener, [(client, server)], port)."""
     lis = socket.socket(); lis.bind(("127.0.0.1", 0)); lis.listen(512)
@@ -44,17 +51,25 @@ def test_parse_rejects_garbage_without_crashing():
 @needs_diag
 def test_dump_agrees_with_proc_net_tcp():
     lis, conns, port = pair(10)
+    decoy = socket.socket()                                          # not ours, same port number: must not be counted
     try:
-        ports = {port} | {c.getsockname()[1] for c, _ in conns}
+        decoy.bind(("127.0.0.2", port)); decoy.listen(1)
+    except OSError:
+        decoy.close(); decoy = None
+    try:
+        ours = inodes(lis, *(x for c, s in conns for x in (c, s)))
         d = SockDiag()
-        diag = {(s.local_port, s.remote_port, s.state, s.inode) for s in d.dump()
-                if s.local_port in ports or s.remote_port in ports}
+        diag = {(s.local_port, s.remote_port, s.state, s.inode) for s in d.dump() if s.inode in ours}
         live = {TCP_ESTABLISHED, 2, TCP_LISTEN}                       # the states the dump asks the kernel for
         proc = {(r["local_port"], r["remote_port"], int(r["state"], 16), r["inode"]) for r in read_tcp_table()
-                if int(r["state"], 16) in live and (r["local_port"] in ports or r["remote_port"] in ports)}
+                if int(r["state"], 16) in live and r["inode"] in ours}
         assert diag == proc and len(diag) == 21                        # 10 pairs + the listener
+        assert {(p_, r_) for p_, r_, _, _ in diag} == {(port, 0)} | {(c.getsockname()[1], port) for c, _ in conns} \
+            | {(port, c.getsockname()[1]) for c, _ in conns}         # exactly the 4-tuples we made
     finally:
         [x.close() for c, s in conns for x in (c, s)]; lis.close()
+        if decoy:
+            decoy.close()
 
 
 @needs_diag
@@ -65,11 +80,13 @@ def test_ipv6_sockets_are_dumped():
         pytest.skip("no IPv6 loopback")
     port = lis.getsockname()[1]
     c = socket.create_connection(("::1", port))
+    srv = lis.accept()[0]
     try:
-        rows = [s for s in SockDiag().dump() if s.family == socket.AF_INET6 and port in (s.local_port, s.remote_port)]
-        assert {s.local_ip for s in rows} == {"::1"} and len(rows) == 3
+        ours = inodes(lis, c, srv)
+        rows = [s for s in SockDiag().dump() if s.inode in ours]
+        assert {s.family for s in rows} == {socket.AF_INET6} and {s.local_ip for s in rows} == {"::1"} and len(rows) == 3
     finally:
-        c.close(); lis.close()
+        c.close(); srv.close(); lis.close()
 
 
 @needs_diag
