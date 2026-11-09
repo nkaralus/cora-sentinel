@@ -554,3 +554,131 @@ def test_pressure_on_a_capped_task_stays_visible_on_its_line(scoped):
     s, _ = snap_task(h, name)
     _, v = can_cap(s, name)
     assert v["status"] == "contained" and "[PRESSURE some 42.0%]" in next(x["line"] for x in v["tasks"] if x["name"] == name)
+
+
+# ---------------------------------------------------------------- psi_state / psi_threshold: from what the kernel armed
+
+class _Poll:
+    def __init__(self):
+        self.fds = {}
+
+    def register(self, fd, ev):
+        self.fds[fd] = ev
+
+    def unregister(self, fd):
+        self.fds.pop(fd, None)
+
+    def poll(self, timeout=None):
+        return []
+
+
+@pytest.fixture
+def psi_world(tmp_path, monkeypatch):
+    from cora_sentinel.cgroup import CgroupRoot
+    from cora_sentinel.psi import PressureWatcher
+    from cora_sentinel.scope import Scopes
+    from cora_sentinel import psi as psimod
+    root = tmp_path / "cora"
+    root.mkdir()
+    cg = CgroupRoot(str(root))
+    scopes = Scopes(cg, state_path=str(tmp_path / "scopes.json"))
+    w = PressureWatcher(cg, on_trip=lambda n, s: None, log=lambda m: None, poller=_Poll)
+    refuse = set()
+    real = psimod.os.write
+
+    def write(fd, data):
+        if fd != w._wake_w and data.rstrip(b"\0").decode(errors="replace") in refuse:
+            raise OSError(22, "Invalid argument")
+        return real(fd, data)
+    monkeypatch.setattr(psimod.os, "write", write)
+
+    def make(trigger, app="game"):
+        name = scopes.create_scope(app, uid=1000, memory_max="512M", psi_memory=trigger)
+        d = root / name
+        for f, v in (("cgroup.procs", "4242"), ("cpu.max", "max 100000"), ("memory.current", "1"),
+                     ("cgroup.freeze", "0"), ("memory.high", "max"), ("memory.pressure", "")):
+            if not (d / f).exists() or f in ("cgroup.procs", "memory.current"):
+                (d / f).write_text(v + "\n")
+        if trigger:
+            try:
+                w.add(name, trigger)
+            except psimod.PsiError:
+                pass
+        return name
+
+    def hub(with_psi=True):
+        return Hub("/nonexistent/ui.sock", tasks=uihub.cgroup_tasks(cg, None), cgroup_id=cg.cgroup_id, scopes=scopes,
+                   psi=w if with_psi else None, log=lambda m: None)
+    yield make, hub, w, refuse, root
+    w.stop()
+
+
+def psi_of(h, name):
+    t = next(t for t in h.snapshot()["tasks"] if t["name"] == name)
+    return t["psi_state"], t["psi_threshold"]
+
+
+def test_an_armed_tripwire_is_armed_with_its_threshold(psi_world):
+    make, hub, w, refuse, root = psi_world
+    name = make("some 150000 1000000")
+    assert psi_of(hub(), name) == ("armed", {"kind": "some", "stall_us": 150000, "window_us": 1000000,
+                                             "fraction": 0.15, "trigger": "some 150000 1000000"})
+
+
+def test_a_kernel_refused_tripwire_is_refused_although_the_registry_keeps_it(psi_world):
+    make, hub, w, refuse, root = psi_world
+    refuse.add("some 150000 1000000")
+    name = make("some 150000 1000000")
+    h = hub()
+    assert h.scopes.describe(name)["psi_memory"] == "some 150000 1000000"   # what the registry would have claimed
+    assert psi_of(h, name) == ("refused", None)
+
+
+def test_off_is_disabled_and_a_plain_task_is_unmonitored(psi_world):
+    make, hub, w, refuse, root = psi_world
+    off = make(None)
+    plain = root / "agent"
+    plain.mkdir()
+    for f, v in (("cgroup.procs", "1"), ("cpu.max", "max 100000"), ("memory.current", "1"), ("cgroup.freeze", "0"),
+                 ("memory.high", "max"), ("memory.max", "max")):
+        (plain / f).write_text(v + "\n")
+    h = hub()
+    assert psi_of(h, off) == ("disabled", None) and psi_of(h, "agent") == ("unmonitored", None)
+
+
+def test_without_a_watcher_a_requested_tripwire_is_unmonitored_not_armed(psi_world):
+    make, hub, w, refuse, root = psi_world
+    name = make("some 150000 1000000")
+    assert psi_of(hub(with_psi=False), name) == ("unmonitored", None)
+
+
+def test_removal_cleans_the_entry_and_a_relaunch_gets_a_fresh_one(psi_world):
+    make, hub, w, refuse, root = psi_world
+    refuse.add("some 150000 1000000")
+    first = make("some 150000 1000000")
+    h = hub()
+    assert psi_of(h, first)[0] == "refused"
+    w.remove(first)
+    assert psi_of(h, first) == ("unmonitored", None)                      # nothing armed, nothing refused any more
+    refuse.clear()
+    second = make("some 150000 1000000")                                   # a relaunch: a new scope, a new cgroup
+    assert second != first and psi_of(h, second)[0] == "armed"
+    w.add(first, "some 300000 2000000")                                    # the same name re-armed
+    assert psi_of(h, first) == ("armed", {"kind": "some", "stall_us": 300000, "window_us": 2000000,
+                                          "fraction": 0.15, "trigger": "some 300000 2000000"})
+
+
+def test_the_client_passes_known_psi_states_and_calls_anything_else_unknown(psi_world):
+    make, hub, w, refuse, root = psi_world
+    name = make("some 150000 1000000")
+    snap = hub().snapshot()
+    c = StatusClient("/x", clock=lambda: 0.0)
+    c.sock, c.last_rx, c.connected_at, c.state = object(), 0.0, 0.0, snap
+    vt = next(t for t in c.view()["tasks"] if t["name"] == name)
+    assert vt["psi_state"] == "armed" and vt["psi_threshold"]["fraction"] == 0.15
+    for t in snap["tasks"]:
+        t.pop("psi_state"), t.pop("psi_threshold")                          # an older daemon
+    assert all(t["psi_state"] == "unknown" and t["psi_threshold"] is None for t in c.view()["tasks"])
+    for t in snap["tasks"]:
+        t["psi_state"], t["psi_threshold"] = "melting", {"fraction": 0.5}
+    assert all(t["psi_state"] == "unknown" and t["psi_threshold"] is None for t in c.view()["tasks"])

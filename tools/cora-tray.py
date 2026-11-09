@@ -28,7 +28,6 @@ With QT_QPA_PLATFORM=offscreen these run headless.
 from __future__ import annotations
 
 import argparse
-import collections
 import grp
 import os
 import sys
@@ -36,6 +35,7 @@ import time
 
 try:
     from cora_sentinel.uiclient import BREAKER_LABEL, DEFAULT_SOCKET, StatusClient, confirm_text, human_bytes
+    from cora_sentinel.ring_buffer import PALETTE as FALLBACK_RGB, STALL_WINDOW_S as WINDOW_S, StallMeter, fmt_pct as pct
 except ImportError:
     sys.exit("cora-tray: cannot import cora_sentinel (install it, or run with PYTHONPATH=/path/to/cora-sentinel/src)")
 
@@ -54,60 +54,11 @@ for candidate in ("/usr/share/cora-sentinel/cora-tray/icons", os.path.join(HERE,
     if os.path.isdir(candidate):
         ICONS = os.path.normpath(candidate)
         break
-FALLBACK_RGB = {"green": "#2e7d32", "amber": "#f9a825", "indigo": "#3949ab", "red": "#c62828", "grey": "#757575"}
 TICK_MS = 250
 RECONNECT_S = 2.0
-WINDOW_S = 10.0                       # the exact stall fraction is taken over (about) this much daemon time
 VERB = {"sever": "severed network for", "cap": "capped memory for"}
 COLUMNS = ["Task", "Memory", "Change", "some avg10", "full avg10", "some avg60", "full avg60",
            f"stall {WINDOW_S:.0f}s", "In force", "", ""]
-
-
-def pct(v) -> str:
-    return "-" if v is None else f"{v:.2f}%"
-
-
-class StallMeter:
-    """Exact stall fractions from the cumulative PSI counters. Keyed by (task, cgroup id): a relaunch starts over,
-    and so does a counter that went backwards (a new cgroup we were not told about)."""
-
-    def __init__(self, window: float = WINDOW_S):
-        self.window = window
-        self.samples: dict = {}                          # (name, cgroup_id) -> deque[(mono, some_us, full_us)]
-
-    def feed(self, state: dict) -> None:
-        mono = state.get("mono")
-        seen = set()
-        for t in state.get("tasks", []):
-            key = (t.get("name"), t.get("cgroup_id"))
-            seen.add(key)
-            psi = t.get("psi") or {}
-            some, full = psi.get("some_total_us"), psi.get("full_total_us")
-            if mono is None or some is None:
-                self.samples.pop(key, None)
-                continue
-            q = self.samples.setdefault(key, collections.deque())
-            if q and (mono <= q[-1][0] or some < q[-1][1]):
-                if mono == q[-1][0]:
-                    continue                             # the same update twice
-                q.clear()
-            q.append((mono, some, full))
-            while len(q) > 2 and mono - q[1][0] >= self.window:
-                q.popleft()
-        for key in list(self.samples):
-            if key not in seen:
-                del self.samples[key]
-
-    def fraction(self, name, cgroup_id) -> tuple:
-        """(some, full) as fractions of wall time, or (None, None) before there are two samples."""
-        q = self.samples.get((name, cgroup_id))
-        if not q or len(q) < 2:
-            return None, None
-        (m0, s0, f0), (m1, s1, f1) = q[0], q[-1]
-        dt = (m1 - m0) * 1e6
-        if dt <= 0:
-            return None, None
-        return (s1 - s0) / dt, (None if f0 is None or f1 is None else (f1 - f0) / dt)
 
 
 def icon_for(colour: str) -> "QIcon":

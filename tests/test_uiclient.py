@@ -243,7 +243,8 @@ def test_the_track_a_scenarios_end_to_end(tmp_path, label, msg, want_status, wan
 # ================================================================ several faults at once: the worst wins, all are listed
 def test_the_ranking_is_alarm_unknown_blind_contained_pressure_evaluating_clear():
     assert sorted(uiclient.RANK, key=uiclient.RANK.get, reverse=True) == \
-        ["alarm", "unknown", "blind", "contained", "pressure", "evaluating", "clear"]
+        ["alarm", "unknown", "blind", "contained", "psi_refused", "pressure", "evaluating", "clear"]
+    assert uiclient.RANK["psi_refused"] == uiclient.RANK["contained"]          # a tie: real containment wins it
 
 
 ERR = "firewall unreadable (PermissionError)"
@@ -336,3 +337,62 @@ def test_garbage_frames_do_not_count_as_data():
         conn.close()
     finally:
         srv.close()
+
+
+# ================================================================ ingest(): the parsing half of poll(), for replay and simulation
+class _NoSock:
+    def close(self):
+        pass
+
+
+def virtual(now):
+    c = StatusClient("/virtual", clock=lambda: now[0])
+    c.sock, c.connected_at = _NoSock(), now[0]
+    return c
+
+
+def test_ingest_takes_frames_in_any_split_with_virtual_time():
+    now = [1000.0]
+    c = virtual(now)
+    line = (json.dumps({**BASE, "status": "clear", "seq": 1}) + "\n").encode()
+    assert c.ingest(line[:20]) is False and c.state is None                # half a frame: nothing yet
+    now[0] = 1001.5
+    assert c.ingest(line[20:]) is True and c.state["seq"] == 1 and c.last_rx == 1001.5
+    two = (json.dumps({**BASE, "status": "clear", "seq": 2}) + "\n" + json.dumps({**BASE, "status": "alarm", "seq": 3})
+           + "\n").encode()
+    assert c.ingest(two) and c.state["seq"] == 3 and c.view()["status"] == "alarm"
+    now[0] += STALE_AFTER_S + 0.1                                         # virtual silence
+    assert c.view()["status"] == "unreachable"
+
+
+def test_ingest_keeps_the_old_rules_garbage_foreign_results_oversize():
+    now = [0.0]
+    c = virtual(now)
+    assert c.ingest(b'not json\n{"schema": "other/v1", "type": "state"}\n') is False and c.state is None
+    assert c.ingest((json.dumps({"schema": SCHEMA, "type": "result", "id": "t1", "ok": True}) + "\n").encode())
+    assert c.results["t1"]["ok"] is True
+    assert c.ingest(b"x" * (uiclient.MAX_LINE + 1)) is True and c.sock is None and "oversized" in c.error
+
+
+# ================================================================ a refused tripwire is elevated, never quiet
+def test_a_refused_tripwire_raises_the_view_to_containment_rank_and_names_the_task():
+    v = view_of({**BASE, "status": "clear", "tasks": [task(name="game-1a2b3c", psi_state="refused"), task(name="ok")]})
+    assert (v["status"], v["colour"]) == ("psi_refused", "amber")
+    assert uiclient.RANK["psi_refused"] == uiclient.RANK["contained"]
+    assert v["title"] == "cora: memory-pressure tripwire refused" and v["detail"].startswith("psi refused on game-1a2b3c")
+    assert "[PSI REFUSED]" in v["tasks"][0]["line"] and "[PSI REFUSED]" not in v["tasks"][1]["line"]
+
+
+@pytest.mark.parametrize("status, want", [("evaluating", "psi_refused"), ("pressure", "psi_refused"),
+                                          ("contained", "contained"), ("blind", "blind"), ("alarm", "alarm")])
+def test_refusal_outranks_quieter_states_and_yields_to_louder_ones(status, want):
+    tasks = [task(psi_state="refused", enforced=["ISOLATE"] if status == "contained" else [],
+                  contained=["ISOLATE"] if status == "contained" else [])]
+    extra = {"truth_errors": ["firewall unreadable (X)"]} if status == "blind" else {}
+    v = view_of({**BASE, "status": status, "tasks": tasks, **extra})
+    assert v["status"] == want and "psi refused on odd" in v["detail"]
+
+
+def test_an_exited_task_with_a_refused_tripwire_does_not_hold_the_light_up():
+    v = view_of({**BASE, "status": "clear", "tasks": [task(psi_state="refused", pids=0)]})
+    assert v["status"] == "clear"

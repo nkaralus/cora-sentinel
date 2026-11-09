@@ -391,3 +391,113 @@ def test_real_kernel_pressure_trips_the_wire():
             os.rmdir(root.root)
         except OSError:
             pass
+
+
+# ---------------------------------------------------------------- armed / refused: what the feed may claim
+def refuse_writes(monkeypatch, watcher, errno_=22):
+    real = psi.os.write
+
+    def write(fd, data):
+        if fd == watcher._wake_w:
+            return real(fd, data)
+        raise OSError(errno_, os.strerror(errno_))
+    monkeypatch.setattr(psi.os, "write", write)
+    return real
+
+
+def test_a_trigger_is_armed_only_once_the_kernel_accepted_it(watcher):
+    watcher.add("game-abcdef", DEFAULT_TRIGGER)
+    assert watcher.armed() == {"game-abcdef": DEFAULT_TRIGGER} and watcher.refused() == set()
+
+
+def test_a_trigger_the_kernel_refuses_is_refused_and_never_armed(watcher, monkeypatch):
+    """The mutant 'record the trigger before the kernel write' fails here."""
+    refuse_writes(monkeypatch, watcher)
+    with pytest.raises(PsiError):
+        watcher.add("game-abcdef", DEFAULT_TRIGGER)
+    assert watcher.armed() == {} and watcher.refused() == {"game-abcdef"}
+
+
+def test_a_missing_pressure_file_is_refused_too(watcher):
+    with pytest.raises(PsiError):
+        watcher.add("nosuch-abcdef", DEFAULT_TRIGGER)
+    assert watcher.refused() == {"nosuch-abcdef"} and watcher.armed() == {}
+
+
+def test_armed_and_refused_return_copies(watcher, monkeypatch):
+    watcher.add("game-abcdef", DEFAULT_TRIGGER)
+    a = watcher.armed()
+    a.clear()
+    a["evil"] = "some 1 500000"
+    assert watcher.armed() == {"game-abcdef": DEFAULT_TRIGGER}
+    refuse_writes(monkeypatch, watcher)
+    with pytest.raises(PsiError):
+        watcher.add("game-abcdef", DEFAULT_TRIGGER)
+    r = watcher.refused()
+    r.clear()
+    assert watcher.refused() == {"game-abcdef"}
+
+
+def test_remove_cleans_both(watcher, monkeypatch):
+    watcher.add("game-abcdef", DEFAULT_TRIGGER)
+    watcher.remove("game-abcdef")
+    assert watcher.armed() == {} and watcher.refused() == set()
+    refuse_writes(monkeypatch, watcher)
+    with pytest.raises(PsiError):
+        watcher.add("game-abcdef", DEFAULT_TRIGGER)
+    watcher.remove("game-abcdef")
+    assert watcher.refused() == set()
+
+
+def test_a_refused_re_add_does_not_leave_the_old_trigger_claimed_and_a_good_one_clears_the_refusal(watcher, monkeypatch):
+    watcher.add("game-abcdef", DEFAULT_TRIGGER)
+    real = refuse_writes(monkeypatch, watcher)
+    with pytest.raises(PsiError):
+        watcher.add("game-abcdef", "some 300000 2000000")
+    assert watcher.armed() == {} and watcher.refused() == {"game-abcdef"}
+    monkeypatch.setattr(psi.os, "write", real)
+    watcher.add("game-abcdef", "some 300000 2000000")
+    assert watcher.armed() == {"game-abcdef": "some 300000 2000000"} and watcher.refused() == set()
+
+
+def test_a_vanished_cgroup_is_no_longer_armed(watcher):
+    watcher.add("game-abcdef", DEFAULT_TRIGGER)
+    watcher.poll_once(0)
+    fd = watcher._names["game-abcdef"]
+    watcher.p.queue.append((fd, select.POLLERR))
+    watcher.poll_once(0)
+    assert watcher.armed() == {}
+
+
+@pytest.mark.parametrize("trigger, want", [
+    ("some 150000 1000000", {"kind": "some", "stall_us": 150000, "window_us": 1000000, "fraction": 0.15,
+                             "trigger": "some 150000 1000000"}),
+    ("full 300000 2000000", {"kind": "full", "stall_us": 300000, "window_us": 2000000, "fraction": 0.15,
+                             "trigger": "full 300000 2000000"}),
+    (None, None), ("", None), ("garbage", None),
+])
+def test_threshold(trigger, want):
+    assert psi.threshold(trigger) == want
+
+
+@pytest.mark.parametrize("kernel_says", ["yes", "no"])
+def test_a_snapshot_taken_while_the_kernel_decides_never_sees_the_trigger_armed(watcher, monkeypatch, kernel_says):
+    """The hub snapshots from another thread. Recording the trigger before the kernel write (then undoing it on a
+    refusal) would show a tripwire as armed that the kernel is about to refuse: observe armed() DURING the write."""
+    real = psi.os.write
+    seen = []
+
+    def write(fd, data):
+        if fd == watcher._wake_w:
+            return real(fd, data)
+        seen.append(dict(watcher.armed()))                       # what a concurrent snapshot would read right now
+        if kernel_says == "no":
+            raise OSError(22, "Invalid argument")
+        return real(fd, data)
+    monkeypatch.setattr(psi.os, "write", write)
+    try:
+        watcher.add("game-abcdef", DEFAULT_TRIGGER)
+    except PsiError:
+        pass
+    assert seen == [{}]
+    assert watcher.armed() == ({"game-abcdef": DEFAULT_TRIGGER} if kernel_says == "yes" else {})

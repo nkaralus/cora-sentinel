@@ -23,28 +23,20 @@ import time
 from typing import Callable, List, Optional
 
 from cora_sentinel.uihub import SCHEMA, STALE_AFTER_S
+from cora_sentinel.ring_buffer import human_bytes  # noqa: F401  (shared; uiclient.human_bytes still works)
 
 DEFAULT_SOCKET = "/run/cora-sentinel/ui.sock"
 COLOURS = {"clear": "green", "evaluating": "amber", "pressure": "amber", "contained": "indigo", "alarm": "red",
-           "blind": "red", "unknown": "red", "connecting": "grey", "unreachable": "grey"}
+           "blind": "red", "unknown": "red", "connecting": "grey", "unreachable": "grey", "psi_refused": "amber"}
 KNOWN_STATUS = frozenset({"clear", "evaluating", "pressure", "contained", "blind", "alarm"})   # what the daemon may send
 KNOWN_VERBS = frozenset({"ISOLATE", "THROTTLE", "SUSPEND"})                                       # what can be in force
+PSI_STATES = frozenset({"armed", "refused", "disabled", "unmonitored"})   # anything else, or nothing: "unknown"
 # worst wins when several faults are true at once; alarm outranks unknown (an unknown never hides a known alarm)
-RANK = {"clear": 0, "evaluating": 1, "pressure": 2, "contained": 3, "blind": 4, "unknown": 5, "alarm": 6}
+# psi_refused (client-side: a launch scope asked for a memory-pressure tripwire and the kernel refused it, so that
+# task is unwatched) ranks with contained; on a tie real containment wins, because it is listed first in the votes
+RANK = {"clear": 0, "evaluating": 1, "pressure": 2, "contained": 3, "psi_refused": 3, "blind": 4, "unknown": 5, "alarm": 6}
 _MISSING = object()
 MAX_LINE = 1024 * 1024
-
-
-def human_bytes(n: Optional[int], signed: bool = False) -> str:
-    if n is None:
-        return "?"
-    sign = ("+" if n >= 0 else "-") if signed else ("-" if n < 0 else "")
-    v = float(abs(n))
-    for unit in ("B", "KiB", "MiB", "GiB"):
-        if v < 1024 or unit == "GiB":
-            return f"{sign}{v:.0f} {unit}" if unit == "B" else f"{sign}{v:.1f} {unit}"
-        v /= 1024
-    return f"{sign}{v:.1f} GiB"
 
 
 class StatusClient:
@@ -85,25 +77,35 @@ class StatusClient:
         """Read whatever is waiting, never block. True if the state changed. Reconnect is the caller's timer."""
         if self.sock is None:
             return False
-        changed = False
+        data = b""
         while True:
             try:
-                data = self.sock.recv(65536)
+                chunk = self.sock.recv(65536)
             except BlockingIOError:
                 break
             except OSError as e:
                 self.error = f"connection lost ({e.strerror})"
                 self.close()
                 return True
-            if not data:
+            if not chunk:
                 self.error = "cora-sentinel closed the connection"
                 self.close()
                 return True
-            self.buf += data
-            if len(self.buf) > MAX_LINE:
-                self.error = "oversized message from the socket: disconnected"
-                self.close()
-                return True
+            data += chunk
+            if len(self.buf) + len(data) > MAX_LINE:
+                break                                    # ingest() appends it and reports the oversize
+        return self.ingest(data)
+
+    def ingest(self, data: bytes) -> bool:
+        """Take bytes as they came off the socket (any split: half a frame, several frames) and apply every complete
+        frame. True if the state or a result changed. poll() feeds it from the socket; a replay or a simulator can feed
+        it directly, with the virtual time in the clock this client was made with."""
+        changed = False
+        self.buf += data
+        if len(self.buf) > MAX_LINE:
+            self.error = "oversized message from the socket: disconnected"
+            self.close()
+            return True
         while b"\n" in self.buf:
             line, self.buf = self.buf.split(b"\n", 1)
             try:
@@ -197,14 +199,17 @@ class StatusClient:
         odd = list(dict.fromkeys(odd))               # the same verb in enforced and contained is one problem
         unproven = [t["name"] for t in raw_tasks if "THROTTLE" in self._enforced(t) and "THROTTLE" not in self._verbs(t, "enforced")]
         # every fault that is true votes; the worst wins, and the detail line lists them all
-        votes = [raw if status_ok else "unknown"] + ["blind"] * bool(truth) + ["unknown"] * bool(odd) + ["contained"] * bool(unproven)
+        refused = [t["name"] for t in raw_tasks if t.get("psi_state") == "refused" and t.get("pids") != 0]
+        votes = [raw if status_ok else "unknown"] + ["blind"] * bool(truth) + ["unknown"] * bool(odd) + \
+            ["contained"] * bool(unproven) + ["psi_refused"] * bool(refused)
         st = max(votes, key=RANK.__getitem__)
         hot = [t["name"] for t in raw_tasks if (t.get("pressure") or {}).get("active")]
         label = {"clear": "all clear", "evaluating": f"model evaluating ({s.get('evaluating', 0)})",
                  "pressure": f"memory pressure: {', '.join(hot)}",
                  "contained": "containment active", "alarm": "ALARM: check the decision log",
                  "blind": "BLIND: cannot read what is enforced",
-                 "unknown": "UNKNOWN status from cora-sentinel" if not status_ok else "UNKNOWN verb from cora-sentinel"}[st]
+                 "unknown": "UNKNOWN status from cora-sentinel" if not status_ok else "UNKNOWN verb from cora-sentinel",
+                 "psi_refused": "memory-pressure tripwire refused"}[st]
         enforced = any(self._enforced(t) for t in raw_tasks)
         if st == "contained" and not enforced and mode != "enforce":
             label = "WOULD contain (dry-run: nothing was done)"
@@ -222,8 +227,12 @@ class StatusClient:
                              if t.get("unknown") else "")
                           + (f" [PRESSURE some {(t.get('pressure') or {}).get('some_avg10', '?')}%]"
                              if (t.get("pressure") or {}).get("active") else "")
+                          + (" [PSI REFUSED]" if t.get("psi_state") == "refused" else "")
                           + (" \u2014 exited" if t.get("pids") == 0 else ""),
                   # offered only if the daemon has the breaker AND it is not already in force on this task
+                  "psi_state": t.get("psi_state") if t.get("psi_state") in PSI_STATES else "unknown",
+                  "psi_threshold": t.get("psi_threshold") if t.get("psi_state") == "armed"
+                                   and isinstance(t.get("psi_threshold"), dict) else None,
                   "can_sever": "sever" in breakers and "ISOLATE" not in self._enforced(t),
                   "can_cap": "cap" in breakers and "THROTTLE" not in self._enforced(t)}
                  for t in raw_tasks]
@@ -234,6 +243,8 @@ class StatusClient:
             detail = "; ".join(truth) + " | " + detail          # the exact error first: it is why the light is red
         if not (isinstance(raw, str) and raw in KNOWN_STATUS):
             detail = f"received status: {'<missing>' if raw is _MISSING else repr(raw)[:80]} | " + detail
+        if refused:
+            detail = "; ".join(f"psi refused on {n}" for n in refused[:3]) + " | " + detail
         if unproven:
             detail = "; ".join(f"limit without launch provenance on {n}: treated as THROTTLE" for n in unproven[:3]) + " | " + detail
         if odd:

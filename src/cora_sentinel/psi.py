@@ -19,7 +19,7 @@ import re
 import select
 import sys
 import threading
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 DEFAULT_TRIGGER = "some 150000 1000000"          # 150 ms of memory stall within any 1 s
 TRIGGER_RE = re.compile(r"(some|full) (\d+) (\d+)", re.ASCII)
@@ -48,6 +48,19 @@ def parse_trigger(v) -> Optional[str]:
     if not 0 < stall <= window:
         raise PsiError(f"pressure stall {stall} us must be above 0 and at most the window ({window} us)")
     return t
+
+
+def threshold(trigger: Optional[str]) -> Optional[Dict[str, object]]:
+    """The feed's psi_threshold for an ARMED trigger: kind, stall_us, window_us, fraction (stall / window: the share of
+    any one window that must be stalled to trip) and the trigger text. None for no trigger."""
+    if not trigger:
+        return None
+    m = TRIGGER_RE.fullmatch(trigger)
+    if not m:
+        return None
+    stall, window = int(m.group(2)), int(m.group(3))
+    return {"kind": m.group(1), "stall_us": stall, "window_us": window, "fraction": round(stall / window, 6),
+            "trigger": trigger}
 
 
 def read_pressure(text: str, totals: bool = False) -> Dict[str, float]:
@@ -79,6 +92,8 @@ class PressureWatcher:
         self._lock = threading.Lock()
         self._fds: Dict[int, str] = {}            # fd -> scope name (owned by the poll thread once applied)
         self._names: Dict[str, int] = {}
+        self._triggers: Dict[str, str] = {}       # name -> trigger, only once the kernel accepted it
+        self._refused: Dict[str, str] = {}        # name -> why the last attempt could not arm it
         self._pending: List[Tuple[str, str, Optional[int]]] = []   # ("add", name, fd) / ("remove", name, None)
         self._poll = poller()
         self._wake_r, self._wake_w = os.pipe()
@@ -94,18 +109,38 @@ class PressureWatcher:
         try:
             fd = os.open(path, os.O_RDWR | os.O_NONBLOCK | os.O_CLOEXEC)
         except OSError as e:
-            raise PsiError(f"cannot open {path}: {e.strerror} (is PSI enabled? psi=1 on the kernel command line)")
+            raise self._refuse(name, f"cannot open {path}: {e.strerror} (is PSI enabled? psi=1 on the kernel command line)")
         try:
             os.write(fd, trigger.encode() + b"\0")
         except OSError as e:
             os.close(fd)
-            raise PsiError(f"the kernel refused the pressure trigger {trigger!r} on {name}: {e.strerror}")
+            raise self._refuse(name, f"the kernel refused the pressure trigger {trigger!r} on {name}: {e.strerror}")
         with self._lock:
+            self._triggers[name] = trigger            # only now: the kernel took it
+            self._refused.pop(name, None)
             self._pending.append(("add", name, fd))
         self._kick()
 
+    def _refuse(self, name: str, why: str) -> PsiError:
+        with self._lock:
+            self._triggers.pop(name, None)            # a refused re-add does not leave the old trigger claimed
+            self._refused[name] = why
+        return PsiError(why)
+
+    def armed(self) -> Dict[str, str]:
+        """name -> trigger for every scope whose trigger the kernel accepted (a copy)."""
+        with self._lock:
+            return dict(self._triggers)
+
+    def refused(self) -> Set[str]:
+        """Scopes whose last trigger could not be armed (a copy)."""
+        with self._lock:
+            return set(self._refused)
+
     def remove(self, name: str) -> None:
         with self._lock:
+            self._triggers.pop(name, None)
+            self._refused.pop(name, None)
             self._pending.append(("remove", name, None))
         self._kick()
 
@@ -181,3 +216,4 @@ class PressureWatcher:
                 os.close(fd)
             self._fds.clear()
             self._names.clear()
+            self._triggers.clear()

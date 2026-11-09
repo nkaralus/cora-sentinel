@@ -18,6 +18,12 @@ launch value: what the Cap breaker writes) is "sentinel" and is THROTTLE. Tasks 
 launch limits, so any limit on them is "sentinel", as before. "none": nothing is limited. The hub never sends a null
 source; a client that meets one (or no source key) must treat any limit as the sentinel's, never as "launch".
 
+Each task carries "psi_state": "armed" | "refused" | "disabled" | "unmonitored" (its memory-pressure tripwire: armed
+by the kernel; asked for but refused; launched with --psi-memory off; or not a scope / no watcher) and "psi_threshold":
+for an armed one {"kind", "stall_us", "window_us", "fraction", "trigger"}, else null. Taken from the watcher's ARMED
+triggers, never from the scope registry (which also keeps a trigger the kernel refused). A client that finds neither
+field (an older daemon) must treat the state as "unknown".
+
 Each task carries "psi": {"some_avg10", "some_avg60", "full_avg10", "full_avg60", "some_total_us", "full_total_us"}
 read on every update (None without PSI). For an exact stall fraction over a window, take two updates:
 (total_us[b] - total_us[a]) / ((mono[b] - mono[a]) * 1e6). The avgs are the kernel's rolling averages.
@@ -229,6 +235,7 @@ class Hub:
     def snapshot(self) -> dict:
         live = self._tasks_fn()                          # {name: {"pids": n, "mem_bytes": b | None}}
         evaluating = int(self._eval_fn() or 0)
+        armed, refused = self._psi_view()                # the watcher's own lock: taken before ours, never inside it
         with self._lock:
             for name in list(self._contained):
                 # gone, or the same NAME on a NEW cgroup (a relaunch): what was done to the old one does not carry over
@@ -270,6 +277,8 @@ class Hub:
                 if pr is not None:
                     tasks[-1]["pressure"] = {"active": now_c - pr["last"] <= PRESSURE_HOLD_S, "count": pr["count"],
                                              "some_avg10": pr.get("some_avg10"), "full_avg10": pr.get("full_avg10")}
+                state, thr = psi_state_of(name, rec, armed, refused)
+                tasks[-1]["psi_state"], tasks[-1]["psi_threshold"] = state, thr
                 if rec:
                     tasks[-1]["scope"] = {"app": rec["app"], "uid": rec["uid"], "profile": rec.get("profile", "app"),
                                           "memory_max": rec.get("memory_max"), "memory_high": rec.get("memory_high")}
@@ -293,6 +302,15 @@ class Hub:
                     "status": status,
                     "mode": self.mode, "evaluating": evaluating, "tasks": tasks, "session": s,
                     "breakers": sorted(COMMANDS) if self._act else [], "truth_errors": sorted(truth_errors)}
+
+    def _psi_view(self):
+        """(armed name -> trigger, refused names) from the watcher; empty when there is none or it cannot say."""
+        try:
+            armed = dict(self.psi.armed()) if self.psi is not None and hasattr(self.psi, "armed") else {}
+            refused = set(self.psi.refused()) if self.psi is not None and hasattr(self.psi, "refused") else set()
+        except Exception:
+            return {}, set()
+        return armed, refused
 
     @staticmethod
     def _provenance(limits: Optional[dict], rec: Optional[dict], enforced: List[str]) -> Optional[dict]:
@@ -610,6 +628,18 @@ class Hub:
                 self.path.unlink()
             except OSError:
                 pass
+
+
+def psi_state_of(name: str, rec: Optional[dict], armed: Dict[str, str], refused) -> tuple:
+    """(psi_state, psi_threshold) for one task."""
+    if name in armed:
+        from cora_sentinel.psi import threshold
+        return "armed", threshold(armed[name])
+    if name in refused:
+        return "refused", None
+    if rec is not None and rec.get("psi_memory") is None:
+        return "disabled", None
+    return "unmonitored", None
 
 
 def _limited(text: str) -> bool:
