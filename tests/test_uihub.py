@@ -718,3 +718,63 @@ def test_psi_refused_sits_below_alarm_blind_and_contained_and_above_pressure(liv
     assert h.snapshot()["status"] == "blind"
     h.note_decision({"final": "DROPPED"})
     assert h.snapshot()["status"] == "alarm"
+
+
+# ---------------------------------------------------------------- Track A gaps 1-3: refused, hierarchy, cross-layer agreement
+
+class ScriptedPsi:
+    def __init__(self, armed=None, refused=()):
+        self._armed, self._refused = dict(armed or {}), set(refused)
+
+    def armed(self):
+        return dict(self._armed)
+
+    def refused(self):
+        return set(self._refused)
+
+
+def _one_task(enforced=(), errors=(), pids=1):
+    return {"t": {"pids": pids, "mem_bytes": 1, "id": 7, "enforced": list(enforced), "unknown": [], "errors": list(errors),
+                  "psi": None}}
+
+
+def test_snapshot_says_refused_when_the_watcher_reports_it():
+    h = Hub("/nonexistent/ui.sock", tasks=lambda: _one_task(), psi=ScriptedPsi(refused={"t"}), log=lambda m: None)
+    t = h.snapshot()["tasks"][0]
+    assert (t["psi_state"], t["psi_threshold"]) == ("refused", None)
+    h = Hub("/nonexistent/ui.sock", tasks=lambda: _one_task(), psi=ScriptedPsi(armed={"t": "some 150000 1000000"}),
+            log=lambda m: None)
+    assert h.snapshot()["tasks"][0]["psi_state"] == "armed"
+
+
+def test_contained_outranks_psi_refused_and_alarm_outranks_blind_and_contained():
+    h = Hub("/nonexistent/ui.sock", tasks=lambda: _one_task(enforced=["ISOLATE"]), psi=ScriptedPsi(refused={"t"}),
+            log=lambda m: None)
+    snap = h.snapshot()
+    assert snap["tasks"][0]["contained"] == ["ISOLATE"] and snap["tasks"][0]["psi_state"] == "refused"
+    assert snap["status"] == "contained"
+    h2 = Hub("/nonexistent/ui.sock", tasks=lambda: _one_task(enforced=["ISOLATE"], errors=["firewall unreadable (X)"]),
+             psi=ScriptedPsi(refused={"t"}), log=lambda m: None)
+    h2.note_decision({"final": "DROPPED"})
+    assert h2.snapshot()["status"] == "alarm"
+
+
+import itertools
+
+
+@pytest.mark.parametrize("alarm, blind, contained, refused, pressure, evaluating, exited",
+                         list(itertools.product([False, True], repeat=7)))
+def test_the_hub_and_the_client_agree_on_the_status(alarm, blind, contained, refused, pressure, evaluating, exited):
+    """Every combination of the seven conditions: the status the hub computes is the status the client shows."""
+    tasks = _one_task(enforced=["ISOLATE"] if contained else [], errors=["firewall unreadable (X)"] if blind else [],
+                      pids=0 if exited else 1)
+    h = Hub("/nonexistent/ui.sock", tasks=lambda: tasks, evaluating=lambda: int(evaluating),
+            psi=ScriptedPsi(refused={"t"} if refused else ()), log=lambda m: None)
+    if pressure:
+        h.note_pressure("t", {"some_avg10": 40.0})
+    if alarm:
+        h.note_decision({"final": "DROPPED"})
+    snap = h.snapshot()
+    c = StatusClient("/x", clock=lambda: 0.0)
+    c.sock, c.last_rx, c.connected_at, c.state = object(), 0.0, 0.0, snap
+    assert snap["status"] == c.view()["status"], (snap["status"], c.view()["status"], c.view()["detail"])
