@@ -10,12 +10,14 @@ lock for microseconds and return. Every client gets newline-delimited JSON:
      "status": "clear|evaluating|pressure|psi_refused|contained|blind|alarm",
      "mode": "enforce|dry-run|detect-only", "evaluating": K, "tasks": [...], "session": {...}, "mono": SECONDS}
 
-Each task carries "limits": {"source": "launch" | "sentinel" | "none", "cpu_max", "memory_high", "memory_max"}: the
+Each task carries "limits": {"source": "launch" | "sentinel" | "none" | "unknown", "cpu_max", "memory_high", "memory_max"}: the
 kernel's limits and who set them. A ceiling the operator asked for at launch (cora-run --app --memory-high: the
 scope's recorded memory_high, cpu.max untouched) is "launch" and is NOT a THROTTLE: it neither makes the task
 "contained" nor greys out the Cap breaker. A limit the scope did not ask for (cpu.max, or memory.high moved off the
 launch value: what the Cap breaker writes) is "sentinel" and is THROTTLE. Tasks that are not launch scopes have no
-launch limits, so any limit on them is "sentinel", as before. "none": nothing is limited. The hub never sends a null
+launch limits, so any limit on them is "sentinel", as before. "none": nothing is limited. "unknown": the scope
+registry (scopes.json) is unreadable, so a launch ceiling cannot be told from a sentinel cap; the feed is then blind
+("scope registry unreadable: <reason>" in truth_errors) until the file reads cleanly again. The hub never sends a null
 source; a client that meets one (or no source key) must treat any limit as the sentinel's, never as "launch".
 
 Each task carries "psi_state": "armed" | "refused" | "disabled" | "unmonitored" (its memory-pressure tripwire: armed
@@ -238,6 +240,7 @@ class Hub:
         live = self._tasks_fn()                          # {name: {"pids": n, "mem_bytes": b | None}}
         evaluating = int(self._eval_fn() or 0)
         armed, refused = self._psi_view()                # the watcher's own lock: taken before ours, never inside it
+        registry_error = self._registry_check()          # scopes.json: re-read when it changed, or while unreadable
         with self._lock:
             for name in list(self._contained):
                 # gone, or the same NAME on a NEW cgroup (a relaunch): what was done to the old one does not carry over
@@ -264,6 +267,10 @@ class Hub:
                     enforced = sorted(v for v, k in marks.items() if k == "done")
                 rec = self.scopes.describe(name) if self.scopes is not None else None
                 limits = self._provenance(info.get("limits"), rec, enforced)
+                if registry_error and limits is not None:
+                    # without the registry, a launch ceiling cannot be told from a sentinel cap: say so
+                    limits["source"] = "unknown" if any(limits.get(k) is not None for k in
+                                                        ("cpu_max", "memory_high", "memory_max")) else "none"
                 would = sorted(v for v, k in marks.items() if k == "dry-run")
                 tasks.append({"name": name, "cgroup_id": info.get("id"), "pids": info.get("pids", 0), "mem_bytes": mem,
                               "mem_delta_bytes": None if mem is None else mem - self._baseline[name],
@@ -285,6 +292,8 @@ class Hub:
                     tasks[-1]["scope"] = {"app": rec["app"], "uid": rec["uid"], "profile": rec.get("profile", "app"),
                                           "memory_max": rec.get("memory_max"), "memory_high": rec.get("memory_high")}
                 truth_errors.update(info.get("errors", []))
+            if registry_error:
+                truth_errors.add(f"scope registry unreadable: {registry_error}")
             s = dict(self.session)
             if s["dropped_uncontained"] or s["failed_actions"]:
                 status = "alarm"
@@ -306,6 +315,14 @@ class Hub:
                     "status": status,
                     "mode": self.mode, "evaluating": evaluating, "tasks": tasks, "session": s,
                     "breakers": sorted(COMMANDS) if self._act else [], "truth_errors": sorted(truth_errors)}
+
+    def _registry_check(self) -> Optional[str]:
+        if self.scopes is None or not hasattr(self.scopes, "check"):
+            return None
+        try:
+            return self.scopes.check()
+        except Exception as e:                           # a registry we cannot even check is unreadable too
+            return f"{e.__class__.__name__}: {e}"
 
     def _psi_view(self):
         """(armed name -> trigger, refused names) from the watcher; empty when there is none or it cannot say."""

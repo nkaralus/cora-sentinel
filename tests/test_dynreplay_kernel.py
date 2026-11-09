@@ -2,6 +2,7 @@
 and a throwaway table, the real nft state is cross-checked against the policy's ledger, and the host is never touched.
 Skips without root, nft and unshare. Run: sudo -E $(which python) -m pytest -q tests/test_dynreplay_kernel.py"""
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -25,8 +26,25 @@ def replay(dec, evp, *flags, stdin=None):
                           capture_output=True, text=True, input=stdin)
 
 
+def normalize_ruleset(text):
+    """The host ruleset without its live state. Other traffic on the machine moves counters while the test runs (CI
+    run #46: 'packets 521 bytes 231809' became 'packets 540 bytes 236688') and set timeouts count down; neither is a
+    change to the ruleset. A rule added or removed still differs."""
+    text = re.sub(r"packets \d+ bytes \d+", "packets N bytes N", text)
+    return re.sub(r"expires \S+", "expires T", text)
+
+
 def host_nft():
-    return subprocess.run(["nft", "list", "ruleset"], capture_output=True, text=True).stdout
+    return normalize_ruleset(subprocess.run(["nft", "-s", "list", "ruleset"], capture_output=True, text=True).stdout)
+
+
+def test_the_ruleset_comparison_ignores_live_counters_but_not_rules():
+    a = "table ip x {\n\tchain c {\n\t\tcounter packets 521 bytes 231809 accept\n\t}\n}\n"
+    b = a.replace("packets 521 bytes 231809", "packets 540 bytes 236688")
+    assert normalize_ruleset(a) == normalize_ruleset(b)
+    assert normalize_ruleset("elements = { 1.2.3.4 expires 59s }") == normalize_ruleset("elements = { 1.2.3.4 expires 3s }")
+    assert normalize_ruleset(a) != normalize_ruleset(a.replace("accept", "drop"))
+    assert normalize_ruleset(a) != normalize_ruleset(a.replace("}\n}", "}\n\tchain d {\n\t}\n}"))
 
 
 @kernel

@@ -25,12 +25,14 @@ Rules
     never drawn across one, and each segment carries the band of its epoch: "armed" (a threshold to draw against),
     "refused" (asked for, refused: no tripwire), "disabled" (launched with off), "unmonitored" (none configured),
     "unknown" (a feed that does not say).
-  * Coarse: a point whose interval (the samples it is computed from) is at least 2 x the window (the armed
+  * Coarse: a point whose interval (the samples it is computed from) is longer than 1.5 x the window (the armed
     threshold's window when there is one, else window_s) is coarse, and segments split where that changes. A coarse
-    stretch may hide a short peak: it must never be read as "under threshold".
+    stretch may hide a short peak: it must never be read as "under threshold". (1.5, not 2: a 2 s heartbeat that
+    arrives at 1.99 s on a 1 s window is still coarse; the margin absorbs frame jitter.)
   * Marks: a "trip" mark when pressure.count rises under the same cgroup id (a count that falls resets the baseline,
     without a mark; a count already above 0 when first seen is history we did not see, also without a mark); a
-    "breaker" mark when the client sends a breaker or gets its reply (mark_breaker).
+    "breaker" mark when the client sends a breaker or gets its reply (mark_breaker). ring.pressure_active is the
+    trip state of the latest frame, kept whether or not a mark was made (a HUD opened mid-trip still shows it).
   * Exited: a task with pids == 0, or missing from the frames, draws no more curve; it is kept for EXITED_HOLD_S
     (10 s of daemon time), then dropped, and a pids == 0 report after that does not bring it back.
   * Curves use the DAEMON's clock: stall fraction = d(total_us) / (d(mono) * 1e6), over the trailing window, or the
@@ -50,7 +52,7 @@ MAX_MARKS = 500
 GAP_S = 4.5
 EXITED_HOLD_S = 10.0
 ANOMALY_EPS = 0.02
-COARSE_FACTOR = 2.0
+COARSE_FACTOR = 1.5
 STALL_WINDOW_S = 10.0                     # cora-tray's "stall" column: the exact fraction over about this much time
 PALETTE = {"green": "#2e7d32", "amber": "#f9a825", "indigo": "#3949ab", "red": "#c62828", "grey": "#757575"}
 BANDS = ("armed", "refused", "disabled", "unmonitored")
@@ -134,6 +136,7 @@ class TaskRing:
         self.exited_at: Optional[float] = None    # daemon mono when it was first seen exited (pids 0, or missing)
         self.resets = 0
         self._count_base: Optional[int] = None    # the pressure.count the next trip mark is measured from
+        self.pressure_active = False              # the latest frame's pressure.active
 
     @property
     def state(self) -> str:
@@ -257,6 +260,7 @@ class RingStore:
                 if (prev.psi_state, prev.threshold) != (s.psi_state, s.threshold):
                     ring.samples.append(Epoch(mono, s.psi_state, s.threshold))
             self._trip_marks(ring, s)
+            ring.pressure_active = pressure.get("active") is True
             if pids == 0:
                 exited_now.add(cid)
                 if ring.exited_at is None:
@@ -276,6 +280,10 @@ class RingStore:
                     self._dropped.add(cid)
         self.last_seq, self.last_mono, self.last_recv = seq, mono, float(recv_time)
         return True
+
+    def feed_many(self, frames: Iterable[Tuple[dict, float]]) -> int:
+        """(frame, recv_time) pairs in order, e.g. a recorded feed replayed. Same result as feeding them one by one."""
+        return sum(self.feed(f, r) for f, r in frames)
 
     @staticmethod
     def _trip_marks(ring: TaskRing, s: Sample) -> None:
@@ -330,7 +338,7 @@ def build_stall_segments(samples: Iterable[Point], window_s: float, now_mono: Op
             frac, coarse = None, False
             if k >= 0:
                 d_mono = s.mono - run[k].mono
-                coarse = d_mono >= COARSE_FACTOR * coarse_window
+                coarse = d_mono > COARSE_FACTOR * coarse_window
                 if d_mono >= window_s / 2:
                     f = (getattr(s, key) - getattr(run[k], key)) / (d_mono * 1e6)
                     if 0 <= f <= 1 + ANOMALY_EPS:

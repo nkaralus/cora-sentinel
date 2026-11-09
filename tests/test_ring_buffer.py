@@ -146,10 +146,10 @@ def test_each_band_is_its_epochs_psi_state():
 
 
 # ================================================================ coarse spans
-def test_frames_two_windows_apart_or_more_are_coarse():
+def test_frames_more_than_one_and_a_half_windows_apart_are_coarse():
     s = RingStore()
     feed_steady(s, 8, step=0.25)                                           # fine: 0.25 s on a 1 s window
-    feed_steady(s, 4, step=2.5, seq0=9, mono0=101.75 + 2.5)                # coarse: 2.5 s apart (>= 2 x 1 s)
+    feed_steady(s, 4, step=2.5, seq0=9, mono0=101.75 + 2.5)                # coarse: 2.5 s apart (> 1.5 x 1 s)
     segs = build_stall_segments(s.rings[7].samples, window_s=1.0)
     assert [seg.coarse for seg in segs] == [False, True]
     assert all(f == pytest.approx(0.10) for seg in segs for _, f in seg.points)
@@ -326,3 +326,133 @@ def test_a_threshold_is_only_kept_for_an_armed_tripwire():
         s.feed(frame(i + 1, m, t), m)
     assert {x.threshold for x in samples(s.rings[7])} == {None}
     assert {seg.threshold for seg in build_stall_segments(s.rings[7].samples, window_s=1.0)} == {None}
+
+
+
+# ================================================================ jitter tolerance, mid-trip start
+def test_a_heartbeat_arriving_at_1_99_s_on_a_1_s_window_is_still_coarse():
+    s = RingStore()
+    feed_steady(s, 8, step=1.99)
+    segs = build_stall_segments(s.rings[7].samples, window_s=1.0)
+    assert segs and all(seg.coarse for seg in segs)
+
+
+def test_just_inside_one_and_a_half_windows_is_fine():
+    s = RingStore()
+    feed_steady(s, 12, step=1.5)
+    segs = build_stall_segments(s.rings[7].samples, window_s=1.0)
+    assert segs and not any(seg.coarse for seg in segs)
+
+
+def test_a_hud_opened_mid_trip_shows_the_trip_but_marks_no_history():
+    s = RingStore()
+    s.feed(frame(1, 100.0, task(count=3)), 100.0)                          # first sight: active, count 3
+    ring = s.rings[7]
+    assert list(ring.marks) == [] and ring.pressure_active is True and samples(ring)[-1].pressure_count == 3
+    s.feed(frame(2, 100.5, task(count=3)), 100.5)
+    assert list(ring.marks) == [] and ring.pressure_active is True
+    s.feed(frame(3, 101.0, task(count=4)), 101.0)
+    assert list(ring.marks) == [Mark(101.0, "trip", "+1")]
+    s.feed(frame(4, 101.5, task()), 101.5)                                  # the hub forgot the record: not active
+    assert ring.pressure_active is False
+
+
+# ================================================================ properties, over seeded random feeds
+import random  # noqa: E402
+
+THRESHOLDS = [ARMED_1S, ARMED_2S]
+STATES = ["armed", "armed", "armed", "refused", "disabled", "unmonitored"]
+
+
+def random_feed(seed, n=160):
+    """A list of events: ("frame", frame, recv_time) or ("lost",). Jitter, gaps, lost links, epoch changes, exits,
+    counter resets, a second cgroup that comes and goes."""
+    rng = random.Random(seed)
+    mono, seq, events = 100.0, 0, []
+    some = {7: 0, 8: 0}
+    state = {7: ("armed", 0), 8: ("unmonitored", 0)}
+    count = {7: 0, 8: 0}
+    for _ in range(n):
+        mono += rng.choice([0.25, 0.25, 0.5, 0.25, 1.99, 2.0, 2.5, 5.0, 0.1])
+        seq += 1
+        if rng.random() < 0.04:
+            events.append(("lost",))
+        tasks = []
+        for cid in (7, 8):
+            if cid == 8 and rng.random() < 0.3:
+                continue                                                  # missing from this frame
+            if rng.random() < 0.06:
+                state[cid] = (rng.choice(STATES), rng.randrange(2))
+            if rng.random() < 0.03:
+                some[cid] = 0                                             # a counter reset (a new cgroup)
+            some[cid] += int(rng.random() * 400_000)
+            if rng.random() < 0.1:
+                count[cid] += rng.randrange(1, 3)
+            st, ti = state[cid]
+            tasks.append(task(cid, f"t{cid}", some=some[cid], full=some[cid] // 2, pids=0 if rng.random() < 0.05 else 1,
+                              psi=rng.random() > 0.03, state=st, thr=THRESHOLDS[ti], count=count[cid] or None))
+        events.append(("frame", frame(seq, mono, *tasks), mono + rng.random() * 0.01))
+    return events
+
+
+def play(store, events):
+    for ev in events:
+        if ev[0] == "lost":
+            store.link_lost()
+        else:
+            store.feed(ev[1], ev[2])
+
+
+def all_segments(store, window_s=1.0):
+    return {cid: build_stall_segments(r.samples, window_s=window_s) for cid, r in store.rings.items()}
+
+
+@pytest.mark.parametrize("seed", range(200))
+def test_property_segments_never_overlap_and_never_cross_a_gap_or_an_epoch(seed):
+    s = RingStore()
+    play(s, random_feed(seed))
+    for cid, ring in s.rings.items():
+        segs = build_stall_segments(ring.samples, window_s=1.0)
+        spans = sorted((seg.points[0][0], seg.points[-1][0]) for seg in segs)
+        for seg in segs:
+            ms = [m for m, _ in seg.points]
+            assert ms == sorted(ms) and len(set(ms)) == len(ms)
+        for (a0, a1), (b0, b1) in zip(spans, spans[1:]):
+            assert a1 < b0, (seed, cid, (a0, a1), (b0, b1))               # P1: no overlap in time
+        bounds = [p.mono for p in ring.samples if not isinstance(p, Sample)]
+        for seg in segs:
+            ms = [m for m, _ in seg.points]
+            for b in bounds:
+                assert all(m < b for m in ms) or all(m >= b for m in ms), (seed, cid, b, ms)   # P2
+
+
+@pytest.mark.parametrize("seed", range(200))
+def test_property_batch_feeding_gives_the_same_result_as_streaming(seed):
+    events = random_feed(seed)
+    stream = RingStore()
+    for ev in events:                                                      # streamed, drawing after every frame
+        play(stream, [ev])
+        all_segments(stream)
+    batch, run = RingStore(), []
+    for ev in events + [("lost",)]:                                       # batched between link losses
+        if ev[0] == "lost":
+            batch.feed_many(run)
+            run = []
+            batch.link_lost()
+        else:
+            run.append((ev[1], ev[2]))
+    batch._link_gap = stream._link_gap
+    assert all_segments(batch) == all_segments(stream)
+    assert {c: list(r.samples) for c, r in batch.rings.items()} == {c: list(r.samples) for c, r in stream.rings.items()}
+    assert {c: list(r.marks) for c, r in batch.rings.items()} == {c: list(r.marks) for c, r in stream.rings.items()}
+
+
+def test_property_the_sample_cap_holds_over_10000_frames():
+    s = RingStore(window_s=10**9)
+    for i in range(10_000):
+        m = 100.0 + i * 0.1
+        if i % 997 == 0:
+            s.link_lost()
+        s.feed(frame(i + 1, m, task(some=i * 1000, full=i * 500, thr=THRESHOLDS[(i // 1500) % 2])), m)
+        assert len(s.rings[7].samples) <= rb.MAX_SAMPLES
+    assert len(s.rings[7].samples) == rb.MAX_SAMPLES

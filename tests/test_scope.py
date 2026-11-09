@@ -348,3 +348,128 @@ def test_real_kernel_scope_lifecycle():
             os.rmdir(root.root)
         except OSError:
             pass
+
+
+# ---------------------------------------------------------------- scopes.json: missing is clean, corrupt fails closed
+
+from cora_sentinel.scope import ScopeRegistryError  # noqa: E402
+
+CORRUPT = {
+    "truncated": b'{"game-abcdef": {"app": "game", "uid": 1000, "created": 1.0, "ent',
+    "bad json": b"not json at all",
+    "a list": b'[{"game-abcdef": {}}]',
+    "a string": b'"scopes"',
+    "not utf-8": b"\xff\xfe\x00junk",
+}
+
+
+def reg_path(tree):
+    return tree.root.parent / "scopes.json"
+
+
+def test_a_missing_registry_is_a_clean_start(tree, clock):
+    s = make(tree, clock)
+    assert (s.owned, s.registry_error, s.check()) == ({}, None, None)
+
+
+@pytest.mark.parametrize("kind", sorted(CORRUPT))
+def test_a_corrupt_registry_is_an_error_and_the_file_is_never_touched(tree, clock, kind):
+    p = reg_path(tree)
+    p.write_bytes(CORRUPT[kind])
+    s = make(tree, clock)
+    assert s.registry_error and str(p) in s.registry_error and s.check() == s.registry_error
+    with pytest.raises(ScopeRegistryError, match="scope registry unreadable"):
+        s.create_scope("game", uid=1000)
+    assert s.reap() == [] and s.describe("game-abcdef") is None
+    assert p.read_bytes() == CORRUPT[kind]                                 # never overwritten, never deleted
+    assert [x.name for x in p.parent.iterdir() if x.name.startswith(".scopes.json")] == []
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads files whatever their mode")
+def test_a_registry_that_cannot_be_read_is_an_error(tree, clock):
+    p = reg_path(tree)
+    p.write_text("{}")
+    p.chmod(0)
+    try:
+        s = make(tree, clock)
+        assert "Permission denied" in s.registry_error
+    finally:
+        p.chmod(0o600)
+
+
+def test_a_directory_in_its_place_is_an_error(tree, clock):
+    reg_path(tree).mkdir()
+    assert "is a directory" in make(tree, clock).registry_error
+
+
+def test_it_heals_in_process_once_the_file_reads_cleanly(tree, clock, monkeypatch):
+    p = reg_path(tree)
+    p.write_bytes(CORRUPT["truncated"])
+    s = make(tree, clock)
+    assert s.registry_error
+    (tree.root / "game-abcdef").mkdir()
+    events(tree, "game-abcdef", True)                                     # a live scope: create_scope's reap keeps it
+    p.write_text(json.dumps({"game-abcdef": {"app": "game", "uid": 1000, "created": clock.t, "entered": True,
+                                             "memory_max": None, "memory_high": None, "psi_memory": None}}))
+    assert s.check() is None and s.registry_error is None and list(s.owned) == ["game-abcdef"]
+    assert s.describe("game-abcdef")["app"] == "game"
+    name = s.create_scope("other", uid=1000)                              # writes work again
+    assert set(json.loads(p.read_text())) == {"game-abcdef", name}
+
+
+def test_the_reaper_is_suspended_while_unreadable_and_resumes_after(tree, clock, monkeypatch):
+    s = make(tree, clock)
+    monkeypatch.setattr(s, "token", tokens("aaaaaa"))
+    name = s.create_scope("game", uid=1000)
+    s.owned[name]["entered"] = True
+    s._save()
+    events(tree, name, populated=False)
+    good = reg_path(tree).read_bytes()
+    removed = []
+    monkeypatch.setattr(Scopes, "_rmtree_cgroup", staticmethod(lambda d: removed.append(d.name)))
+    reg_path(tree).write_bytes(CORRUPT["bad json"])
+    assert s.reap() == [] and removed == []                               # an empty scope, but nobody reaps blind
+    reg_path(tree).write_bytes(good)
+    assert s.reap() == [name] and removed == [name]
+
+
+def test_corruption_mid_run_keeps_the_last_good_registry_in_memory(tree, clock):
+    s = make(tree, clock)
+    name = s.create_scope("game", uid=1000)
+    reg_path(tree).write_bytes(CORRUPT["a list"])
+    assert s.check() and s.profile(name) == "app"                         # profiles stay right: not judged as agent
+    assert s.describe(name) is None                                       # but the hub is told nothing it cannot verify
+
+
+def test_a_save_never_replaces_a_file_corrupted_since_it_was_read(tree, clock):
+    s = make(tree, clock)
+    s.create_scope("game", uid=1000)
+    reg_path(tree).write_bytes(CORRUPT["truncated"])
+    with pytest.raises(ScopeRegistryError):
+        s._save()
+    assert reg_path(tree).read_bytes() == CORRUPT["truncated"]
+
+
+def test_one_immediate_re_read_rides_out_a_replace(tree, clock, monkeypatch):
+    reg_path(tree).write_text("{}")
+    real, calls = Scopes._read_once, []
+
+    def flaky(self):
+        calls.append(1)
+        if len(calls) == 1:
+            raise ScopeRegistryError("caught mid-replace")
+        return real(self)
+    monkeypatch.setattr(Scopes, "_read_once", flaky)
+    s = make(tree, clock)
+    assert (s.registry_error, len(calls)) == (None, 2)
+
+
+def test_the_writer_is_atomic_private_and_leaves_no_temp_files(tree, clock, monkeypatch):
+    s = make(tree, clock)
+    synced = []
+    real_fsync = os.fsync
+    monkeypatch.setattr(os, "fsync", lambda fd: (synced.append(fd), real_fsync(fd))[1])
+    s.create_scope("game", uid=1000)
+    p = reg_path(tree)
+    assert oct(p.stat().st_mode & 0o777) == "0o600" and len(synced) >= 2   # the file and its directory
+    assert [x.name for x in p.parent.iterdir() if x.name.startswith(".scopes.json")] == []

@@ -778,3 +778,42 @@ def test_the_hub_and_the_client_agree_on_the_status(alarm, blind, contained, ref
     c = StatusClient("/x", clock=lambda: 0.0)
     c.sock, c.last_rx, c.connected_at, c.state = object(), 0.0, 0.0, snap
     assert snap["status"] == c.view()["status"], (snap["status"], c.view()["status"], c.view()["detail"])
+
+
+# ---------------------------------------------------------------- an unreadable scope registry blinds the feed, and heals
+
+def test_an_unreadable_registry_blinds_the_hub_and_heals_without_a_restart(scoped, tmp_path):
+    h, cg, make = scoped
+    name, _ = make(memory_max="512M", memory_high="400M")
+    reg = tmp_path / "scopes.json"
+    good = reg.read_bytes()
+    s0, t0 = snap_task(h, name)
+    assert (s0["status"], t0["limits"]["source"], s0["truth_errors"]) == ("clear", "launch", [])
+    reg.write_bytes(b'{"truncated": ')
+    s1, t1 = snap_task(h, name)
+    assert s1["status"] == "blind"
+    assert len(s1["truth_errors"]) == 1 and s1["truth_errors"][0].startswith("scope registry unreadable: ")
+    assert "not valid JSON" in s1["truth_errors"][0]
+    assert t1["limits"]["source"] == "unknown" and "scope" not in t1         # no provenance it cannot read
+    c = StatusClient("/x", clock=lambda: 0.0)
+    c.sock, c.last_rx, c.connected_at, c.state = object(), 0.0, 0.0, s1
+    v = c.view()
+    assert (v["status"], v["colour"]) == ("blind", "red") and v["detail"].startswith("scope registry unreadable")
+    assert reg.read_bytes() == b'{"truncated": '                           # the hub never rewrites it
+    reg.write_bytes(good)
+    s2, t2 = snap_task(h, name)
+    assert (s2["status"], t2["limits"]["source"], s2["truth_errors"]) == ("clear", "launch", [])
+
+
+def test_while_unreadable_a_task_with_no_limits_is_none_not_unknown(scoped, tmp_path):
+    h, cg, make = scoped
+    name, d = make()
+    (tmp_path / "scopes.json").write_bytes(b"[]")
+    _, t = snap_task(h, name)
+    assert t["limits"]["source"] == "none"
+
+
+def test_the_daemon_suspends_the_reaper_and_rearms_when_the_registry_heals():
+    src = (__import__("pathlib").Path(uihub.__file__).parent / "daemon.py").read_text()
+    tick = src[src.index("reg_err = scopes.check()"):]
+    assert "reaper suspended" in tick[:400] and "reaper resumed" in tick[:900] and "psi.add(name, rec[\"psi_memory\"])" in tick[:1600]

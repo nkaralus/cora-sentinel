@@ -932,7 +932,11 @@ def main() -> int:
         try:
             os.makedirs(a.state_dir, exist_ok=True)
             scopes = Scopes(cg, state_path=os.path.join(a.state_dir, "scopes.json"))
-            gone = scopes.reap()                      # what a previous run left behind
+            if scopes.registry_error:
+                print(f"[cora-sentinel] scope registry unreadable: {scopes.registry_error}; launches refused, the "
+                      "reaper suspended and the feed blind until it reads cleanly (the file is left as it is)",
+                      file=sys.stderr, flush=True)
+            gone = scopes.reap()                      # what a previous run left behind (nothing while unreadable)
             if gone:
                 print(f"[cora-sentinel] reaped {len(gone)} empty launch scope(s) left from before", file=sys.stderr)
         except OSError as e:
@@ -1072,6 +1076,7 @@ def main() -> int:
           file=sys.stderr)
     n = 0
     next_reap = 0.0
+    reg_state = {"error": scopes.registry_error if scopes is not None else None}   # the last one reported
     while not stop["v"]:
         s.guarded_tick()
         n += 1
@@ -1082,6 +1087,22 @@ def main() -> int:
         if scopes is not None and time.monotonic() >= next_reap:
             next_reap = time.monotonic() + 5.0           # empty launch scopes go away within ~5 s
             try:
+                reg_err = scopes.check()
+                if reg_err != reg_state["error"]:
+                    if reg_err:
+                        print(f"[cora-sentinel] scope registry unreadable: {reg_err}; reaper suspended",
+                              file=sys.stderr, flush=True)
+                    else:
+                        print("[cora-sentinel] scope registry readable again; reaper resumed", file=sys.stderr,
+                              flush=True)
+                        if psi is not None:              # what could not be armed while it was unreadable
+                            for name, rec in sorted(scopes.owned.items()):
+                                if rec.get("psi_memory") and name not in psi.armed():
+                                    try:
+                                        psi.add(name, rec["psi_memory"])
+                                    except Exception as e:
+                                        print(f"[psi] could not re-arm {name}: {e}", file=sys.stderr)
+                    reg_state["error"] = reg_err
                 for name in scopes.reap():
                     if psi is not None:
                         psi.remove(name)

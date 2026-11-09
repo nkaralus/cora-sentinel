@@ -29,6 +29,7 @@ import json
 import os
 import re
 import secrets
+import tempfile
 import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
@@ -46,6 +47,10 @@ UNITS = {"": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
 
 class ScopeError(Exception):
     pass
+
+
+class ScopeRegistryError(ScopeError):
+    """scopes.json exists but cannot be read as a registry (bad JSON, not an object, permission denied, ...)."""
 
 
 def parse_size(v) -> Optional[int]:
@@ -72,27 +77,109 @@ class Scopes:
         self.cg, self.clock, self.token = cg, clock, token
         self.state = Path(state_path) if state_path else None
         self.owned: Dict[str, dict] = {}            # name -> {"app", "uid", "created", "entered"}
-        self._load()
+        self.registry_error: Optional[str] = None   # why scopes.json is unreadable right now, or None
+        self._stamp = None                          # (inode, size, mtime) of the file as last read or written
+        try:
+            self.owned = self._load()
+        except ScopeRegistryError as e:
+            self.registry_error = str(e)
 
     # ------------------------------------------------------------------ registry (survives a daemon restart)
-    def _load(self) -> None:
-        if not (self.state and self.state.is_file()):
-            return
+    # Missing is a clean start. Anything else that is not a readable JSON object is ScopeRegistryError: the daemon
+    # then shows the hub blind, suspends the reaper and refuses launches, and the file is never overwritten or
+    # deleted (a person may want what is in it). It heals by itself: check() re-reads it on every snapshot.
+    def _stat(self):
         try:
-            data = json.loads(self.state.read_text())
-            if isinstance(data, dict):
-                self.owned = {k: v for k, v in data.items() if isinstance(v, dict) and re.fullmatch(
-                    rf"{APP_RE.pattern}-[0-9a-f]{{6}}", k)}
-        except (OSError, ValueError):
-            self.owned = {}                          # unreadable: forget it (reap then only knows new scopes)
+            st = os.stat(self.state)
+        except FileNotFoundError:
+            return None
+        except OSError as e:
+            return ("unstat-able", e.errno)
+        return (st.st_ino, st.st_size, st.st_mtime_ns)
+
+    def _read_once(self) -> Optional[dict]:
+        try:
+            text = self.state.read_text()
+        except FileNotFoundError:
+            return None
+        except IsADirectoryError:
+            raise ScopeRegistryError(f"{self.state} is a directory") from None
+        except OSError as e:
+            raise ScopeRegistryError(f"{self.state}: {e.strerror or e}") from None
+        except UnicodeDecodeError:
+            raise ScopeRegistryError(f"{self.state}: not UTF-8 text") from None
+        try:
+            data = json.loads(text)
+        except ValueError as e:
+            raise ScopeRegistryError(f"{self.state}: not valid JSON ({getattr(e, 'msg', e)}"
+                                     f"{f' at line {e.lineno} column {e.colno}' if hasattr(e, 'lineno') else ''})") from None
+        if not isinstance(data, dict):
+            raise ScopeRegistryError(f"{self.state}: not a JSON object (a {type(data).__name__})")
+        return {k: v for k, v in data.items() if isinstance(v, dict) and re.fullmatch(rf"{APP_RE.pattern}-[0-9a-f]{{6}}", k)}
+
+    def _load(self) -> Dict[str, dict]:
+        if not self.state:
+            return {}
+        try:
+            data = self._read_once()
+        except ScopeRegistryError:
+            data = self._read_once()             # one immediate re-read: a writer may have just replaced it
+        self._stamp = self._stat()
+        return data or {}
+
+    def check(self) -> Optional[str]:
+        """Re-read scopes.json if it changed since it was last read or written, or while it is unreadable. Returns
+        why it is unreadable, or None. A valid change made by someone else is adopted; while it is unreadable, the
+        last good registry stays in memory (so profiles stay right) but nothing is written over the file."""
+        if not self.state:
+            return None
+        if self.registry_error is None and self._stat() == self._stamp:
+            return None
+        try:
+            data = self._load()
+        except ScopeRegistryError as e:
+            self.registry_error = str(e)
+            return self.registry_error
+        self.owned, self.registry_error = data, None
+        return None
+
+    def _require_registry(self) -> None:
+        err = self.check()
+        if err:
+            raise ScopeRegistryError(f"scope registry unreadable: {err}")
 
     def _save(self) -> None:
+        """Atomic: a temp file in the same directory, fsync, rename, fsync the directory. Refuses to replace a file
+        that changed since it was last read and is not a readable registry now."""
         if not self.state:
             return
-        tmp = self.state.with_name(self.state.name + ".tmp")
-        tmp.write_text(json.dumps(self.owned, sort_keys=True))
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, self.state)
+        if self._stat() != self._stamp:
+            try:
+                self._read_once()
+            except ScopeRegistryError as e:
+                self.registry_error = str(e)
+                raise
+        d = self.state.parent
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=f".{self.state.name}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(json.dumps(self.owned, sort_keys=True))
+                f.flush()
+                os.fchmod(f.fileno(), 0o600)
+                os.fsync(f.fileno())
+            os.replace(tmp, self.state)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        dfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+        self._stamp = self._stat()
 
     # ------------------------------------------------------------------ create
     def create_scope(self, app: str, uid: int, memory_max=None, memory_high=None, psi_memory: Optional[str] = None,
@@ -103,6 +190,7 @@ class Scopes:
             raise ScopeError("uid must come from SO_PEERCRED")
         if profile not in PROFILES:
             raise ScopeError(f"unknown profile {profile!r}: {', '.join(PROFILES)}")
+        self._require_registry()
         mx, hi = parse_size(memory_max), parse_size(memory_high)
         if mx is not None and hi is not None and hi > mx:
             raise ScopeError(f"memory_high ({hi}) above memory_max ({mx}): the soft limit must not exceed the hard one")
@@ -143,6 +231,7 @@ class Scopes:
 
     # ------------------------------------------------------------------ enter
     def enter(self, name: str, pid: int, uid: int) -> None:
+        self._require_registry()
         rec = self.owned.get(name)
         if rec is None:
             raise ScopeError(f"{name!r} is not a scope this daemon created")
@@ -189,6 +278,8 @@ class Scopes:
             p.rmdir()
 
     def reap(self) -> List[str]:
+        if self.check():
+            return []                                # suspended: never reap from a registry we cannot read
         gone = []
         now = self.clock()
         for name, rec in list(self.owned.items()):
@@ -224,5 +315,7 @@ class Scopes:
         return "agent" if rec is None else rec.get("profile", "app")
 
     def describe(self, name: str) -> Optional[dict]:
+        if self.registry_error is not None:
+            return None                              # the hub must not claim launch provenance it cannot read
         rec = self.owned.get(name)
         return dict(rec, name=name) if rec else None
