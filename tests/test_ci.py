@@ -48,7 +48,19 @@ def test_the_original_job_names_are_kept_and_the_experimental_root_job_cannot_bl
     for name in ("unprivileged", "package", "privileged"):             # the names the repository's CI has always had
         job(name)
     priv = job("privileged")
-    assert "continue-on-error: true" in priv and "sudo ./venv/bin/python -m pytest" in priv
+    assert "continue-on-error: true" in priv
+    assert "sudo bash -c 'ulimit -n 65536 && exec ./venv/bin/python -m pytest -q'" in priv
+
+
+def test_the_root_job_raises_the_fd_limit_inside_sudo_not_before_it():
+    """sudo's PAM session resets RLIMIT_NOFILE: a `ulimit` before sudo never reaches the tests (run #49, [Errno 24])."""
+    runs = [l.strip() for l in job("privileged").splitlines() if l.strip().startswith("- run:") and "pytest" in l]
+    assert len(runs) == 1 and runs[0].index("sudo") < runs[0].index("ulimit -n")
+
+
+def test_the_unprivileged_job_runs_the_hud_qt_tests_instead_of_skipping_them():
+    j = job("unprivileged")
+    assert '".[dev,hud]"' in j and 'CORA_REQUIRE_QT: "1"' in j and "QT_QPA_PLATFORM: offscreen" in j
 
 
 def test_the_package_job_installs_the_wheel_clean_and_runs_selfcheck_strictly():

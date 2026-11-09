@@ -166,6 +166,8 @@ class PressureWatcher:
             return sorted(self._names)
 
     def _kick(self) -> None:
+        if self._wake_w is None:
+            return                                # stopped: the pipe is closed
         try:
             os.write(self._wake_w, b"x")
         except OSError:
@@ -220,6 +222,11 @@ class PressureWatcher:
                 self.log(f"poll failed: {e!r}")
 
     def start(self) -> None:
+        if self._wake_r is None:                  # stopped earlier: stop() closed the wake pipe
+            self._wake_r, self._wake_w = os.pipe()
+            os.set_blocking(self._wake_r, False)
+            self._poll.register(self._wake_r, select.POLLIN)
+        self._stop.clear()
         self._thread = threading.Thread(target=self._loop, name="psi-watcher", daemon=True)
         self._thread.start()
 
@@ -232,5 +239,17 @@ class PressureWatcher:
             for fd in list(self._fds):
                 os.close(fd)
             self._fds.clear()
+            for op, name, fd in self._pending:    # opened, but never handed to the poll thread
+                if fd is not None and fd not in self._fds:
+                    os.close(fd)
+            self._pending.clear()
             self._names.clear()
             self._triggers.clear()
+            for fd in (self._wake_r, self._wake_w):  # the wake pipe goes too: stop() leaves no descriptor behind
+                if fd is not None:
+                    try:
+                        self._poll.unregister(fd)
+                    except (KeyError, ValueError, OSError):
+                        pass
+                    os.close(fd)
+            self._wake_r = self._wake_w = None

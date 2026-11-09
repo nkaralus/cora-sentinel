@@ -3,11 +3,12 @@
 cora-hud - a desktop window over cora-sentinel's status feed: each task's memory-stall curve, the tripwire it is judged
 against, its trips, and the two breakers. For desktops without a tray: it assumes there is none.
 
-    python3 tools/cora-hud.py [--socket /run/cora-sentinel/ui.sock] [--scale sqrt|symlog] [--backend auto|qt|tk]
+    python3 tools/cora-hud.py [--socket /run/cora-sentinel/ui.sock] [--scale sqrt|symlog]
 
-Needs cora_sentinel importable (installed, or PYTHONPATH=src), and PySide6 (pip install PySide6) or, failing that,
-Tk (python3-tk). There is no layer-shell overlay: neither binding offers one here, so it is an ordinary top-level
-window on every desktop.
+Needs cora_sentinel importable (installed, or PYTHONPATH=src) and PySide6 (pip install "cora-sentinel[hud]", or
+pip install PySide6-Essentials). Qt only: one toolkit, one set of dialogs to get right. There is no layer-shell overlay
+(PySide6 has no binding for it), so it is an ordinary top-level window; on Wayland it opens through Qt's wayland
+platform plugin, elsewhere through xcb.
 
 A thin shell, like cora-tray. It decides nothing:
   * the banner text, detail line, colour, which breakers are offered and the confirmation text are
@@ -37,8 +38,9 @@ Banners: REPLAY, as long as this window has seen a frame stamped by tools/cora-r
 Repaints at most 10 times a second, and only when the picture changed: the time axis moves in whole-pixel steps of
 at least 0.5 s, and a scene is rebuilt only when a frame, the view, the axis step, the size or the scale changed.
 
-Testing aid: --snapshot FILE [--after SECONDS] reads the feed for that long, writes one frame of the window (PNG with
-Qt, else PPM) and exits; with QT_QPA_PLATFORM=offscreen it runs headless.
+Testing aids: --snapshot FILE [--after SECONDS] reads the feed for that long, writes one frame of the window as PNG
+and exits (QT_QPA_PLATFORM=offscreen runs it headless); --frame-times SECONDS opens the real window and prints how long
+each scene took to build and paint, then exits.
 """
 from __future__ import annotations
 
@@ -455,7 +457,7 @@ def _rgb(c: str) -> bytes:
 
 class Raster:
     """The scene in pixels without any GUI library: rectangles, hatching, lines, and text as solid blocks. What the
-    pixel tests read (and --snapshot writes, as PPM, when there is no Qt)."""
+    pixel tests read where Qt is not installed; never shown to anyone."""
 
     def __init__(self, scene: Scene):
         self.w, self.h = scene.width, scene.height
@@ -502,9 +504,6 @@ class Raster:
     def px(self, x: int, y: int) -> str:
         i = (y * self.w + x) * 3
         return "#%02x%02x%02x" % tuple(self.buf[i:i + 3])
-
-    def ppm(self) -> bytes:
-        return b"P6\n%d %d\n255\n" % (self.w, self.h) + bytes(self.buf)
 
 
 def _bresenham(x0: int, y0: int, x1: int, y1: int):
@@ -563,7 +562,16 @@ def render_qt_image(scene: Scene):
     return img
 
 
-def run_qt(model: HudModel, size: Tuple[int, int]) -> int:
+def frame_report(build_ms: List[float], paint_ms: List[float], tasks: int, seconds: float) -> str:
+    def q(v: List[float], f: float) -> float:
+        return sorted(v)[min(len(v) - 1, int(f * len(v)))] if v else float("nan")
+    return (f"cora-hud frame times over {seconds:.0f} s, {tasks} task(s): {len(paint_ms)} repaints "
+            f"({len(paint_ms) / seconds:.1f}/s); build ms median {q(build_ms, .5):.2f} p95 {q(build_ms, .95):.2f} "
+            f"max {max(build_ms, default=float('nan')):.2f}; paint ms median {q(paint_ms, .5):.2f} "
+            f"p95 {q(paint_ms, .95):.2f} max {max(paint_ms, default=float('nan')):.2f}")
+
+
+def run_qt(model: HudModel, size: Tuple[int, int], frame_times: Optional[float] = None) -> int:
     from PySide6.QtCore import QTimer
     from PySide6.QtGui import QPainter
     from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
@@ -580,15 +588,19 @@ def run_qt(model: HudModel, size: Tuple[int, int]) -> int:
 
         def tick(self):
             model.tick()
+            t0 = time.perf_counter()
             s = model.scene(self.width(), self.height())
             if s != self.scene_:
+                build_ms.append((time.perf_counter() - t0) * 1e3)
                 self.scene_ = s
                 self.update()
 
         def paintEvent(self, e):
+            t0 = time.perf_counter()
             p = QPainter(self)
             paint_qt(self.scene_, p)
             p.end()
+            paint_ms.append((time.perf_counter() - t0) * 1e3)
 
         def keyPressEvent(self, e):
             if e.text() == "s":
@@ -609,76 +621,17 @@ def run_qt(model: HudModel, size: Tuple[int, int]) -> int:
             if box.clickedButton() is ok:
                 model.press(b.cmd, b.task, b.cgroup_id)
 
+    build_ms: List[float] = []
+    paint_ms: List[float] = []
     app = QApplication.instance() or QApplication(sys.argv[:1])
     w = Window()
     w.show()
+    if frame_times:
+        def report():
+            print(frame_report(build_ms, paint_ms, len(w.scene_.panels), frame_times), flush=True)
+            app.quit()
+        QTimer.singleShot(int(frame_times * 1000), report)
     return app.exec()
-
-
-# ---------------------------------------------------------------------------------------------- Tk (the fallback)
-def run_tk(model: HudModel, size: Tuple[int, int]) -> int:
-    import tkinter as tk
-    root = tk.Tk()
-    root.title("cora-hud")
-    canvas = tk.Canvas(root, width=size[0], height=size[1], bg=INK["bg"], highlightthickness=0)
-    canvas.pack(fill="both", expand=True)
-    state = {"scene": None}
-
-    def draw(scene: Scene) -> None:
-        canvas.delete("all")
-        for it in scene.items:
-            if isinstance(it, Rect):
-                canvas.create_rectangle(it.x, it.y, it.x + it.w, it.y + it.h, fill=it.fill, outline="")
-            elif isinstance(it, Hatch):
-                canvas.create_rectangle(it.x, it.y, it.x + it.w, it.y + it.h, fill=it.colour, outline="", stipple="gray12")
-            elif isinstance(it, Line):
-                canvas.create_line(*[c for p in it.pts for c in p], fill=it.colour, width=it.width,
-                                   dash=(4, 3) if it.dash else None)
-            elif isinstance(it, Text):
-                canvas.create_text(it.x, it.y, text=it.text, fill=it.colour, anchor="nw",
-                                   font=("TkDefaultFont", -it.size, "bold" if it.bold else "normal"))
-            elif isinstance(it, Button):
-                canvas.create_rectangle(it.x, it.y, it.x + it.w, it.y + it.h, outline="",
-                                        fill=INK["button"] if it.enabled else INK["button_off"])
-                canvas.create_text(it.x + it.w // 2, it.y + it.h // 2, text=it.label,
-                                   fill=INK["text"] if it.enabled else INK["dim"])
-
-    def tick() -> None:
-        model.tick()
-        s = model.scene(max(canvas.winfo_width(), 200), max(canvas.winfo_height(), 200))
-        if s != state["scene"]:
-            state["scene"] = s
-            draw(s)
-        root.after(1000 // MAX_HZ, tick)
-
-    def confirm(b: Button) -> None:
-        head, body = model.confirm(b.cmd, b.task, b.cgroup_id)
-        d = tk.Toplevel(root)
-        d.title("cora-hud")
-        d.transient(root)
-        tk.Label(d, text=head, font=("TkDefaultFont", 11, "bold"), justify="left").pack(padx=12, pady=(12, 4), anchor="w")
-        tk.Label(d, text=body, justify="left").pack(padx=12, pady=4, anchor="w")
-        row = tk.Frame(d)
-        row.pack(padx=12, pady=12, anchor="e")
-        go = lambda: (d.destroy(), model.press(b.cmd, b.task, b.cgroup_id))
-        tk.Button(row, text={"sever": "Sever network", "cap": "Cap memory"}[b.cmd], command=go).pack(side="left", padx=4)
-        cancel = tk.Button(row, text="Cancel", command=d.destroy, default="active")
-        cancel.pack(side="left", padx=4)
-        d.bind("<Escape>", lambda e: d.destroy())
-        d.bind("<Return>", lambda e: d.focus_get().invoke() if hasattr(d.focus_get(), "invoke") else d.destroy())
-        cancel.focus_set()                               # Enter cancels unless the other button was chosen
-        d.grab_set()
-
-    def click(e) -> None:
-        b = hit(state["scene"], e.x, e.y) if state["scene"] else None
-        if b is not None and b.enabled:
-            confirm(b)
-
-    canvas.bind("<Button-1>", click)
-    root.bind("s", lambda e: model.toggle_scale())
-    tick()
-    root.mainloop()
-    return 0
 
 
 # ---------------------------------------------------------------------------------------------- main
@@ -699,14 +652,11 @@ def snapshot(model: HudModel, size: Tuple[int, int], after: float, path: str) ->
         time.sleep(1.0 / MAX_HZ)
     model.tick()
     scene = model.scene(*size)
-    if have_qt():
-        from PySide6.QtWidgets import QApplication
-        global _APP
-        _APP = QApplication.instance() or QApplication(sys.argv[:1])
-        render_qt_image(scene).save(path)
-    else:
-        with open(path, "wb") as fh:
-            fh.write(Raster(scene).ppm())
+    from PySide6.QtWidgets import QApplication
+    global _APP
+    _APP = QApplication.instance() or QApplication(sys.argv[:1])
+    if not render_qt_image(scene).save(path):
+        sys.exit(f"cora-hud: could not write {path}")
     print(f"cora-hud: {model.view['title']} | {len(scene.panels)} task(s) | {scene.history}"
           + "".join(f" | {b}" for b in scene.banners) + f" -> {path}")
     return 0
@@ -716,26 +666,23 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="cora-hud", description="memory-stall curves and breakers for cora-sentinel")
     ap.add_argument("--socket", default=DEFAULT_SOCKET)
     ap.add_argument("--scale", choices=("sqrt", "symlog"), default="sqrt")
-    ap.add_argument("--backend", choices=("auto", "qt", "tk"), default="auto")
     ap.add_argument("--size", default="960x640", help="WIDTHxHEIGHT")
     ap.add_argument("--snapshot", metavar="FILE", help="write one frame of the window after --after seconds, and exit")
     ap.add_argument("--after", type=float, default=5.0)
+    ap.add_argument("--frame-times", type=float, metavar="SECONDS", default=None,
+                    help="open the window, print build and paint times per scene for SECONDS, then exit")
     a = ap.parse_args(argv)
     try:
         size = tuple(int(v) for v in a.size.lower().split("x"))
         assert len(size) == 2 and min(size) >= 200
     except (ValueError, AssertionError):
         ap.error("--size must be WIDTHxHEIGHT, each at least 200")
+    if not have_qt():
+        sys.exit('cora-hud: needs PySide6: pip install "cora-sentinel[hud]" (or pip install PySide6-Essentials)')
     model = HudModel(a.socket, scale=a.scale)
     if a.snapshot:
         return snapshot(model, size, a.after, a.snapshot)
-    if a.backend in ("auto", "qt") and have_qt():
-        return run_qt(model, size)
-    if a.backend == "qt":
-        sys.exit("cora-hud: PySide6 is not installed (pip install PySide6), or try --backend tk")
-    if importlib.util.find_spec("tkinter") is None:
-        sys.exit("cora-hud: needs PySide6 (pip install PySide6) or Tk (python3-tk)")
-    return run_tk(model, size)
+    return run_qt(model, size, frame_times=a.frame_times)
 
 
 if __name__ == "__main__":

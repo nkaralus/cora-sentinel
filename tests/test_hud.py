@@ -57,6 +57,7 @@ class Rig:
                               scale=scale)
         self.m.client.sock, self.m.client.connected_at = FakeSock(), 0.0
         self.m._linked = True
+        self.m._next_try = float("inf")           # never dial a real socket (the default one is the live daemon's)
 
     def feed(self, frame, dt=0.0):
         self.t[0] += dt
@@ -165,7 +166,7 @@ def test_replay_banner_is_shown_and_stays_for_the_life_of_the_window():
     r.wait(30.0)                                                          # nor does silence
     r.m.client.close()
     r.m.tick()
-    assert r.scene().banners[0].startswith("REPLAY")
+    assert r.m.client.sock is None and r.scene().banners[0].startswith("REPLAY")
 
 
 def test_a_non_default_socket_is_flagged_loudly():
@@ -337,8 +338,17 @@ def test_the_cap_confirmation_names_its_target_values():
 def test_the_dialogs_default_to_cancel_and_escape_closes_them():
     src = (ROOT / "tools" / "cora-hud.py").read_text()
     assert src.count("box.setDefaultButton(cancel)") == 1 and src.count("box.setEscapeButton(cancel)") == 1
-    assert 'd.bind("<Escape>", lambda e: d.destroy())' in src and "cancel.focus_set()" in src
-    assert 'default="active"' in src
+
+
+def test_qt_is_the_only_toolkit():
+    src = (ROOT / "tools" / "cora-hud.py").read_text()
+    assert "tkinter" not in src and "run_tk" not in src and "--backend" not in src
+
+
+def test_without_pyside6_it_says_how_to_install_it(monkeypatch):
+    monkeypatch.setattr(hud, "have_qt", lambda: False)
+    with pytest.raises(SystemExit, match=r'pip install "cora-sentinel\[hud\]"'):
+        hud.main(["--socket", "/nonexistent/ui.sock"])
 
 
 def test_the_hud_sends_nothing_but_breakers_and_runs_nothing():
@@ -440,13 +450,18 @@ def test_the_raster_is_not_blank_and_shows_the_status_colour():
     assert any(px.px(x, y) == hud.INK["curve"] for c in p.curves for x, y in c)
 
 
-def test_snapshot_writes_a_ppm_without_qt(tmp_path, monkeypatch):
-    monkeypatch.setattr(hud, "have_qt", lambda: False)
+def test_snapshot_writes_a_png(tmp_path):
+    _qt()
     m = hud.HudModel("/nonexistent/ui.sock")
-    out = tmp_path / "hud.ppm"
+    out = tmp_path / "hud.png"
     assert hud.snapshot(m, (400, 300), 0.0, str(out)) == 0
-    data = out.read_bytes()
-    assert data.startswith(b"P6\n400 300\n255\n") and len(data) == len(b"P6\n400 300\n255\n") + 400 * 300 * 3
+    assert out.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_the_frame_report_reads_well():
+    r = hud.frame_report([1.0, 2.0, 3.0, 10.0], [0.5, 0.6, 0.7, 4.0], 20, 10.0)
+    assert r.startswith("cora-hud frame times over 10 s, 20 task(s): 4 repaints (0.4/s);")
+    assert "build ms median 3.00 p95 10.00 max 10.00" in r and "paint ms median 0.70 p95 4.00 max 4.00" in r
 
 
 _QAPP = []                                                                # the QApplication, kept alive
@@ -457,6 +472,8 @@ def _qt():
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         from PySide6.QtWidgets import QApplication
     except ImportError:
+        if os.environ.get("CORA_REQUIRE_QT"):
+            pytest.fail("CORA_REQUIRE_QT is set but PySide6 is not importable")
         pytest.skip("PySide6 is not installed")
     if not _QAPP:
         _QAPP.append(QApplication.instance() or QApplication([]))
@@ -491,3 +508,31 @@ def test_qt_offscreen_snapshot_of_every_scenario_is_not_blank(tmp_path):
     for name in replay.SCENARIOS:
         img = hud.render_qt_image(play(name).scene())
         assert len({qt_px(img, x, y) for x in range(0, W, 13) for y in range(0, H, 11)}) >= 4, name
+
+
+def test_a_fixture_replayed_over_a_real_socket_shows_the_replay_banner(tmp_path):
+    import threading
+    import time
+    path = str(tmp_path / "ui.sock")
+    srv = replay.ReplayServer(path, None, source="fixture:psiw_trip")
+    srv.start()
+    m = hud.HudModel(path)
+    try:
+        m.tick()                                                          # connects
+        assert m.client.sock is not None
+        th = threading.Thread(target=replay.run, args=(srv, replay.log_frames(replay.fixture_path("psiw_trip"))),
+                              kwargs={"sleep": lambda d: time.sleep(0.002)})
+        th.start()
+        end = time.monotonic() + 5
+        while (th.is_alive() or m._frames < 33) and time.monotonic() < end:
+            m.tick()
+            time.sleep(0.002)
+        th.join()
+        s = m.scene(W, H)
+        assert m._frames == 33
+        assert s.banners[0] == "REPLAY — not the live daemon (fixture:psiw_trip)"
+        assert s.banners[1].startswith("NON-DEFAULT SOCKET: ")
+        assert any(p.name.startswith("psiw-") and p.badge for p in s.panels)
+    finally:
+        m.client.close()
+        srv.stop()

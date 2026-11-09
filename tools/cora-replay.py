@@ -587,12 +587,16 @@ class ReplayServer:
         except FileNotFoundError:
             pass
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        old = os.umask(0o177)
         try:
-            s.bind(self.path)
-        finally:
-            os.umask(old)
-        s.listen(16)
+            old = os.umask(0o177)
+            try:
+                s.bind(self.path)
+            finally:
+                os.umask(old)
+            s.listen(16)
+        except BaseException:
+            s.close()
+            raise
         self.sock = s
         threading.Thread(target=self._accept, name="replay-accept", daemon=True).start()
 
@@ -603,13 +607,21 @@ class ReplayServer:
                 self._drop(c)
         if self.sock is not None:
             try:
+                self.sock.shutdown(socket.SHUT_RDWR)   # wakes the accept thread (a bare close may not)
+            except OSError:
+                pass
+            try:
                 self.sock.close()
             except OSError:
                 pass
+            self.sock = None
             try:
                 os.unlink(self.path)
             except OSError:
                 pass
+
+    def close(self) -> None:
+        self.stop()
 
     def connected(self) -> int:
         with self.lock:
@@ -659,9 +671,10 @@ class ReplayServer:
             pass
 
     def _accept(self) -> None:
+        sock = self.sock                          # stop() clears self.sock; this thread keeps its own reference
         while not self._stop.is_set():
             try:
-                c, _ = self.sock.accept()
+                c, _ = sock.accept()
             except OSError:
                 return
             c.settimeout(2.0)

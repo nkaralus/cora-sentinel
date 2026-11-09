@@ -170,10 +170,12 @@ class Hub:
         self._seq = 0
         self._sock: Optional[socket.socket] = None
         self._clients: Dict[socket.socket, dict] = {}
-        self._sel = selectors.DefaultSelector()
+        self._sel: Optional[selectors.BaseSelector] = None   # made by _bind, closed by stop(): a hub only asked for
+        # snapshots (tests, a replay harness) holds no file descriptors at all
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._wake_r, self._wake_w = os.pipe()
+        self._wake_r: Optional[int] = None
+        self._wake_w: Optional[int] = None
 
     # ------------------------------------------------------------------ fed by the daemon (cheap, never block)
     def note_event(self, ev: dict) -> None:
@@ -353,6 +355,7 @@ class Hub:
     # ------------------------------------------------------------------ socket
     def start(self) -> None:
         self._bind()
+        self._stop.clear()                               # a hub stopped earlier serves again
         self._thread = threading.Thread(target=self._loop, name="ui-hub", daemon=True)
         self._thread.start()
 
@@ -375,23 +378,31 @@ class Hub:
             except KeyError:
                 raise OSError(f"--ui-group {self.group!r}: no such group (groupadd {self.group}; usermod -aG {self.group} YOU)")
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        old = os.umask(0o177)                            # born 0600: never briefly open to everyone
         try:
-            s.bind(str(self.path))
-        finally:
-            os.umask(old)
-        self._gid = gid
-        if gid is not None:
-            os.chown(self.path, -1, gid)
-            os.chmod(self.path, 0o660)
-        s.listen(MAX_CLIENTS)
-        s.setblocking(False)
+            old = os.umask(0o177)                        # born 0600: never briefly open to everyone
+            try:
+                s.bind(str(self.path))
+            finally:
+                os.umask(old)
+            self._gid = gid
+            if gid is not None:
+                os.chown(self.path, -1, gid)
+                os.chmod(self.path, 0o660)
+            s.listen(MAX_CLIENTS)
+            s.setblocking(False)
+        except BaseException:
+            s.close()
+            raise
         self._sock = s
+        self._sel = selectors.DefaultSelector()
+        self._wake_r, self._wake_w = os.pipe()
         self._sel.register(s, selectors.EVENT_READ, "accept")
         self._sel.register(self._wake_r, selectors.EVENT_READ, "wake")
         self.log(f"status feed on {self.path} ({'group ' + self.group + ', 0660' if gid is not None else 'root only, 0600'})")
 
     def _wake(self) -> None:
+        if self._wake_w is None:
+            return                                       # not serving: nothing is waiting to be woken
         try:
             os.write(self._wake_w, b"x")
         except (BlockingIOError, OSError):
@@ -645,10 +656,18 @@ class Hub:
             self._drop(conn, "daemon stopping")
         if self._sock:
             self._sock.close()
+            self._sock = None
             try:
                 self.path.unlink()
             except OSError:
                 pass
+        if self._sel is not None:
+            self._sel.close()
+            self._sel = None
+        for fd in (self._wake_r, self._wake_w):
+            if fd is not None:
+                os.close(fd)
+        self._wake_r = self._wake_w = None
 
 
 def psi_state_of(name: str, rec: Optional[dict], armed: Dict[str, str], refused) -> tuple:

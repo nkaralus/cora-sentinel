@@ -155,9 +155,23 @@ def served(tmp_path):
         s.stop()
 
 
+OPEN = []                                                                 # every test socket, closed at teardown
+
+
+@pytest.fixture(autouse=True)
+def _close_test_sockets():
+    yield
+    while OPEN:
+        try:
+            OPEN.pop().close()
+        except OSError:
+            pass
+
+
 class Conn:
     def __init__(self, path):
         self.s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        OPEN.append(self.s)
         self.s.settimeout(3)
         self.s.connect(path)
         self.buf = b""
@@ -221,6 +235,7 @@ def test_it_replaces_a_stale_socket_but_never_a_regular_file(tmp_path):
     srv = replay.ReplayServer(str(p))
     srv.start()
     srv.stop()
+    assert srv.connected() == 0 and not p.exists()
 
 
 def test_breakers_take_effect_in_the_next_frame(served, tmp_path):
@@ -284,6 +299,7 @@ def test_ack_not_reflected_acknowledges_changes_nothing_and_the_real_client_says
     srv, w = served("ack_not_reflected")
     now = [0.0]
     c = uiclient.StatusClient(str(tmp_path / "ui.sock"), clock=lambda: now[0])
+    OPEN.append(c)
     assert c.connect()
     assert wait_for(lambda: c.poll() or c.state is not None)
     t = c.state["tasks"][0]
@@ -346,7 +362,9 @@ def play_to_client(tmp_path, name, reconnect=True):
     w = replay.World()
     srv = replay.ReplayServer(str(tmp_path / "ui.sock"), w, clock=lambda: vt[0], source=f"scenario:{name}")
     srv.start()
+    OPEN.append(srv)                                                      # stopped at teardown even if this fails
     c = uiclient.StatusClient(str(tmp_path / "ui.sock"), clock=lambda: vt[0])
+    OPEN.append(c)
     assert c.connect()
     assert wait_for(lambda: srv.connected() == 1)                         # registered before the first frame
     store, states, views, done = RingStore(), [], [], []
@@ -377,6 +395,7 @@ def play_to_client(tmp_path, name, reconnect=True):
     take()
     views.append(c.view())
     th.join()
+    c.close()
     srv.stop()
     return states, views, store, c
 
@@ -555,3 +574,57 @@ def test_fixture_psir_is_refused_after_the_restart_and_heals_without_another():
     healed = next(i for i in range(restart, len(fs)) if psir[i][2] == "armed")
     assert psir[healed][1] == "clear" and all(fs[i]["seq"] > fs[i - 1]["seq"] for i in range(restart + 1, len(fs)))
     assert client_view(fs[: restart + 1])["status"] == "psi_refused" and client_view(fs)["status"] == "clear"
+
+
+PRIVATE_IP = __import__("re").compile(r"\b(10\.\d+|172\.(1[6-9]|2\d|3[01])|192\.168|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7]))\.\d+\.\d+\b"
+                                      r"|\b(fe80|fc[0-9a-f]{2}|fd[0-9a-f]{2}):", __import__("re").I)
+
+
+def test_the_fixtures_carry_no_user_host_path_or_private_address():
+    for name in replay.fixtures():
+        text = Path(replay.fixture_path(name)).read_text()
+        for leak in ("nick", "dimgeon", "/media/", "/home/"):
+            assert leak not in text.lower(), (name, leak)
+        assert not PRIVATE_IP.search(text), (name, PRIVATE_IP.search(text).group(0))
+
+
+def test_sanitize_changes_only_the_allowlisted_fields():
+    t = lambda n: {"name": n, "cgroup_id": 9, "pids": 1, "psi": {"some_avg10": 1.5, "some_total_us": 123},
+                   "limits": {"source": "launch", "memory_max": 1 << 29}, "pressure": {"active": True, "count": 19},
+                   "scope": {"app": n.split("-")[0], "uid": 1000}}
+    raw = [{"schema": SCHEMA, "type": "state", "seq": i, "mono": 50.0 + i, "ts": "2026-11-09T01:00:00+00:00",
+            "status": "clear", "mode": "enforce", "session": {"community_blocked": 7, "started": "x"},
+            "tasks": [t("psiq-1"), t("firefox-2")], "replay": {"source": "x"}} for i in (1, 2)]
+    out = replay.sanitize(raw, ["psi"])
+    for r, o in zip(raw, out):
+        changed = {k for k in set(r) | set(o) if r.get(k) != o.get(k)}
+        assert changed <= {"ts", "session", "tasks", "replay"}, changed
+        assert json.dumps(o["tasks"], sort_keys=True) == json.dumps([r["tasks"][0]], sort_keys=True)   # kept tasks: byte for byte
+
+
+def test_the_psiw_fixture_reaches_count_19_on_its_last_frame():
+    lines = Path(replay.fixture_path("psiw_trip")).read_text().splitlines()
+    f = json.loads(lines[32])
+    t = next(t for t in f["tasks"] if t["name"].startswith("psiw-"))
+    assert (len(lines), f["seq"], t["pressure"]["count"], t["pressure"]["active"]) == (33, 159, 19, True)
+
+
+CAPTURES = Path("/media/nick/UE5_Storage/cora_scratch/psilive")
+
+
+@pytest.mark.parametrize("fixture, capture", [("psiw_trip", "raw.log"), ("psir_refused_healed", "raw2.log")])
+def test_the_fixtures_differ_from_their_raw_captures_only_where_allowed(fixture, capture):
+    """Author's machine only (the raw captures never leave it): each fixture frame against the frame it came from."""
+    if not (CAPTURES / capture).exists():
+        pytest.skip("the raw capture is not on this machine")
+    raw = {(f["seq"], f["mono"]): f for _, f in replay.read_log(str(CAPTURES / capture))}
+    out = fixture_frames(fixture)
+    assert out
+    for o in out:
+        r = raw[(o["seq"], o["mono"])]
+        changed = {k for k in set(r) | set(o) if r.get(k) != o.get(k)}
+        assert changed <= {"ts", "session", "tasks"}, changed
+        by_name = {t["name"]: t for t in r["tasks"]}
+        for t in o["tasks"]:
+            assert json.dumps(t, sort_keys=True) == json.dumps(by_name[t["name"]], sort_keys=True)   # byte for byte
+        assert [t["name"] for t in o["tasks"]] == [t["name"] for t in r["tasks"] if t["name"].startswith("psi")]

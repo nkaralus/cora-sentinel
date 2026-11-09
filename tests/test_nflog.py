@@ -1242,7 +1242,7 @@ def _threaded_monitor(tmp_path, sync=lambda cur: (list(cur), []), timing=None):
         listener = tapq
         last_timing = timing or {}
         def sync(self, cur): return sync(cur)
-        def close(self): pass
+        def close(self): tapq.close()             # NetMonitor.stop() closes the tap, and with it its listener
 
     class FakeDiag:
         def dump(self, **kw): return []
@@ -1901,6 +1901,8 @@ def test_the_baseline_comes_from_earlier_syncs_not_from_the_one_being_judged(tmp
     from cora_sentinel import netmon
     monkeypatch.setattr(netmon, "_cpu_stall_ms", lambda: None)
     nm, _, _ = _threaded_monitor(tmp_path)
+    for q in (nm.listener, nm.tap.listener):               # never started, so never stopped: close its fake sockets
+        q.close()
     nm._record_sync(900.0, 1.0, {"lock_ms": 850.0, "nft_ms": 40.0})
     assert nm.worst_sync["total_base"] is None                              # the first sync has no history
     nm._record_sync(950.0, 1.0, {"lock_ms": 900.0, "nft_ms": 40.0})

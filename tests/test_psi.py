@@ -535,3 +535,61 @@ def test_retry_skips_a_live_scope_that_no_longer_wants_a_trigger(watcher, monkey
     monkeypatch.setattr(psi.os, "write", real)
     assert psi.retry_refused(watcher, lambda n: None) == []               # no crash, nothing armed
     assert watcher.armed() == {} and watcher.refused() == {"game-abcdef"}
+
+
+# ================================================================ lifecycle: no descriptor survives stop(), in any order
+import resource as _resource
+import select as _select
+
+
+def _fds():
+    return len(os.listdir("/proc/self/fd"))
+
+
+def test_stop_before_start_closes_the_wake_pipe_and_a_second_stop_closes_nothing_else(tree):
+    before = _fds()
+    w = PressureWatcher(tree, on_trip=lambda n, s: None, log=lambda m: None, poller=_select.poll)
+    assert _fds() == before + 2                           # the wake pipe: all a watcher holds before it watches
+    w.stop()
+    assert _fds() == before and w._wake_r is None
+    r, x = os.pipe()                                      # likely reuses the numbers just given back
+    try:
+        w.stop()
+        os.fstat(r)
+        os.fstat(x)
+    finally:
+        os.close(r)
+        os.close(x)
+
+
+def test_a_watcher_watches_again_after_start_stop_start(tree):
+    trips = []
+    w = PressureWatcher(tree, on_trip=lambda n, s: trips.append(n), log=lambda m: None, poller=_select.poll)
+    for _ in range(2):
+        w.start()
+        assert w._wake_r is not None and w._thread.is_alive()
+        w.add("game-abcdef", "some 150000 1000000")
+        end = time.monotonic() + 2
+        while "game-abcdef" not in w.armed() and time.monotonic() < end:
+            time.sleep(0.01)
+        assert "game-abcdef" in w.armed()
+        w.stop()
+        assert not w._thread.is_alive() and w.armed() == {}
+
+
+def test_200_watcher_lifecycles_under_a_tight_fd_limit_end_exactly_at_baseline(tree):
+    soft, hard = _resource.getrlimit(_resource.RLIMIT_NOFILE)
+    base = _fds()
+    _resource.setrlimit(_resource.RLIMIT_NOFILE, (min(base + 32, hard), hard))
+    try:
+        for i in range(200):
+            w = PressureWatcher(tree, on_trip=lambda n, s: None, log=lambda m: None, poller=_select.poll)
+            w.add("game-abcdef", "some 150000 1000000")          # an fd queued for a thread that may never run
+            if i % 2:
+                w.start()
+            w.stop()
+            if i % 3 == 0:
+                w.stop()
+        assert _fds() == base
+    finally:
+        _resource.setrlimit(_resource.RLIMIT_NOFILE, (soft, hard))

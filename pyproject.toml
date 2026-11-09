@@ -30,6 +30,7 @@ dependencies = []
 [project.optional-dependencies]
 model = ["llama-cpp-python"]          # the local GGUF supervisor; everything else runs without it
 dev = ["pytest>=7", "jsonschema>=4"]
+hud = ["PySide6-Essentials"]           # tools/cora-hud.py and tools/cora-tray.py (Qt); nothing in the daemon needs it
 
 [project.scripts]
 cora-sentinel = "cora_sentinel.daemon:main"

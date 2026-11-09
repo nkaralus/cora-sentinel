@@ -232,9 +232,12 @@ def test_the_track_a_scenarios_end_to_end(tmp_path, label, msg, want_status, wan
     path = str(tmp_path / "fake.sock")
     fake_server(path, msg)
     c = StatusClient(path)
-    assert c.connect()
-    poll_until(c, lambda: c.state is not None)
-    v = c.view()
+    try:
+        assert c.connect()
+        poll_until(c, lambda: c.state is not None)
+        v = c.view()
+    finally:
+        c.close()
     loud(v)
     assert v["status"] == want_status and want_in_detail in v["detail"]
     assert want_in_detail in uiclient.render_line(v)          # the HUD and the tooltip carry it too

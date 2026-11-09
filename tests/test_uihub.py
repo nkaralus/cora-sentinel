@@ -832,3 +832,75 @@ def test_the_daemon_suspends_the_reaper_and_rearms_when_the_registry_heals():
     src = (__import__("pathlib").Path(uihub.__file__).parent / "daemon.py").read_text()
     tick = src[src.index("reg_err = scopes.check()"):]
     assert "reaper suspended" in tick[:400] and "reaper resumed" in tick[:900] and "psi.add(name, rec[\"psi_memory\"])" in tick[:1600]
+
+
+# ---------------------------------------------------------------- lifecycle: no descriptor survives stop(), in any order
+import os as _os
+import resource as _resource
+
+
+def _fds():
+    return len(_os.listdir("/proc/self/fd"))
+
+
+def _serving_hub(tmp_path, name="ui.sock"):
+    return Hub(str(tmp_path / name), log=lambda m: None)
+
+
+def test_a_hub_holds_no_descriptor_until_it_serves_and_stop_before_start_is_a_no_op(tmp_path):
+    before = _fds()
+    h = _serving_hub(tmp_path)
+    assert _fds() == before and h._sel is None and h._wake_r is None
+    h.stop()
+    h.stop()
+    assert _fds() == before
+
+
+def test_stopping_a_hub_twice_never_closes_a_descriptor_it_no_longer_owns(tmp_path):
+    h = _serving_hub(tmp_path)
+    h.start()
+    h.stop()
+    r, w = _os.pipe()                                      # likely reuses the numbers the hub just gave back
+    try:
+        h.stop()
+        _os.fstat(r)                                       # still open: the second stop() left them alone
+        _os.fstat(w)
+    finally:
+        _os.close(r)
+        _os.close(w)
+
+
+def test_a_hub_serves_again_after_start_stop_start(tmp_path):
+    h = _serving_hub(tmp_path)
+    for _ in range(2):
+        h.start()
+        c = StatusClient(str(tmp_path / "ui.sock"))
+        try:
+            assert c.connect()
+            end = time.monotonic() + 3
+            while c.state is None and time.monotonic() < end:
+                c.poll()
+                time.sleep(0.01)
+            assert c.state is not None and c.state["schema"] == uihub.SCHEMA
+        finally:
+            c.close()
+            h.stop()
+    assert not (tmp_path / "ui.sock").exists()
+
+
+def test_200_hub_lifecycles_under_a_tight_fd_limit_end_exactly_at_baseline(tmp_path):
+    soft, hard = _resource.getrlimit(_resource.RLIMIT_NOFILE)
+    base = _fds()
+    _resource.setrlimit(_resource.RLIMIT_NOFILE, (min(base + 32, hard), hard))   # 200 leaks of 3 could never fit
+    try:
+        for i in range(200):
+            h = _serving_hub(tmp_path)
+            h.snapshot()
+            if i % 2:
+                h.start()
+            h.stop()
+            if i % 3 == 0:
+                h.stop()
+        assert _fds() == base
+    finally:
+        _resource.setrlimit(_resource.RLIMIT_NOFILE, (soft, hard))
