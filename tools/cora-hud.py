@@ -146,6 +146,7 @@ class Scene(NamedTuple):
     buttons: Tuple[Button, ...]
     hidden: int
     footer: Optional[str] = None
+    order: Tuple[Tuple[Optional[str], Optional[int]], ...] = ()   # every row, shown or hidden, top to bottom
 
 
 def axis_step(width: int) -> float:
@@ -203,7 +204,7 @@ def _holes(ring, right: float, step: float = 0.0) -> List[Tuple[float, float]]:
 
 def build_scene(view: dict, store: RingStore, client_now: float, wall_now: float, width: int, height: int,
                 scale: str = "sqrt", socket_path: str = DEFAULT_SOCKET, replay: Optional[str] = None,
-                notice: Optional[str] = None) -> Scene:
+                notice: Optional[str] = None, order: Optional[Tuple[tuple, ...]] = None) -> Scene:
     """The whole window as drawing primitives. Pure: same inputs, same picture."""
     items: List[object] = []
     banners: List[str] = []
@@ -236,6 +237,9 @@ def build_scene(view: dict, store: RingStore, client_now: float, wall_now: float
     seen = {t.get("cgroup_id") for t in vtasks}
     entries += [(r.name, cid, None, r) for cid, r in store.rings.items() if cid not in seen]
     entries.sort(key=severity_key)                    # the worst rows first: never below the fold
+    if order:                                         # a dialog is open: no row moves under it (new rows go last)
+        pos = {k: i for i, k in enumerate(order)}
+        entries.sort(key=lambda e: pos.get((e[0], e[1]), len(pos)))
     avail = height - y - 4
     n = len(entries)
     ph = max(PANEL_MIN, min(PANEL_MAX, avail // n)) if n else 0
@@ -269,7 +273,7 @@ def build_scene(view: dict, store: RingStore, client_now: float, wall_now: float
         if exited:
             items.append(Text(8, top + 35, "exited", INK["dim"], 10, True))
         if vt is not None and vt.get("pending"):
-            items.append(Text(8, top + 35 + 12 * exited, f"{vt.get('pending_cmd')}: timed out (unconfirmed)",
+            items.append(Text(8, top + 35 + 12 * exited, f"{vt.get('pending_cmd')}: {vt['pending']}",
                               rb.PALETTE["red"], 10, True))
         items.append(Rect(x0, y0, pw, h, INK["plot"]))
         runs, curves, coarse, gaps, marks = [], [], [], [], []
@@ -358,7 +362,8 @@ def build_scene(view: dict, store: RingStore, client_now: float, wall_now: float
         items.append(Text(8, y + 2, footer, worst_ink if task_state(vt) != "clear" else INK["dim"], 10, True))
     if not entries and view["status"] not in ("unreachable", "connecting"):
         items.append(Text(8, y + 4, "no sandboxed tasks running", INK["dim"], 11))
-    return Scene(width, height, tuple(items), tuple(banners), header, hist, tuple(panels), tuple(buttons), hidden, footer)
+    return Scene(width, height, tuple(items), tuple(banners), header, hist, tuple(panels), tuple(buttons), hidden, footer,
+                 tuple((e[0], e[1]) for e in entries))
 
 
 def task_state(vt: Optional[dict]) -> str:
@@ -412,6 +417,8 @@ class HudModel:
         self.store = RingStore()
         self.client.on_state = self._on_state
         self._frames = 0
+        self._frozen: Optional[tuple] = None         # the row order while a confirm dialog is open
+        self._reconciled_seen = 0
         self._cache: Optional[tuple] = None          # (key, view, scene) of the last scene built
         self.replay: Optional[str] = None        # latched: once a replay, always flagged in this window
         self.pending: dict = {}                  # tag -> (cmd, task, cgroup_id)
@@ -443,6 +450,10 @@ class HudModel:
             self.store.mark_breaker(cid, cmd, "ok" if ok else "failed", now)
             self.notice = f"{cmd} on {task}: " + (str(r.get("action", "done")) if ok else f"refused: {r.get('error')}")
             del self.pending[tag]
+        for late in self.client.reconciled[self._reconciled_seen:]:
+            self.store.mark_breaker(late["cgroup_id"], late["cmd"], "late", now)
+            self.notice = f"{late['cmd']} on {late['task']}: applied late, {late['delay_s']:.0f} s after it was sent"
+        self._reconciled_seen = len(self.client.reconciled)
         self.view = self.client.view()
         if self.view.get("replay"):
             self.replay = self.view["replay"]
@@ -451,13 +462,20 @@ class HudModel:
         """build_scene(), reused while nothing it draws can have changed: no frame, the same view, the same axis step."""
         right = self.store.right_edge(self.clock())
         key = (self._frames, None if right is None else math.ceil(right / axis_step(width)), width, height, self.scale,
-               self.replay, self.notice)
+               self.replay, self.notice, self._frozen)
         if self._cache is not None and self._cache[0] == key and self._cache[1] == self.view:
             return self._cache[2]
         scene = build_scene(self.view, self.store, self.clock(), self.wall(), width, height, self.scale,
-                            self.socket_path, self.replay, self.notice)
+                            self.socket_path, self.replay, self.notice, self._frozen)
         self._cache = (key, self.view, scene)
         return scene
+
+    def freeze(self, order: tuple) -> None:
+        """Hold the rows where they are (a confirm dialog is open over them)."""
+        self._frozen = tuple(order)
+
+    def unfreeze(self) -> None:
+        self._frozen = None
 
     def toggle_scale(self) -> None:
         self.scale = "symlog" if self.scale == "sqrt" else "sqrt"
@@ -632,7 +650,24 @@ def confirmed(box, ok) -> bool:
     return box.clickedButton() is ok
 
 
-def run_qt(model: HudModel, size: Tuple[int, int], frame_times: Optional[float] = None) -> int:
+def click(model: HudModel, scene: Scene, x: float, y: float, ask: Callable[[str, str, str], bool]) -> Optional[str]:
+    """A click on the window. On an offered breaker: ask (the modal confirm dialog) with the rows frozen in place, then
+    press. Bound to (task, cgroup id) as clicked, never to a row: the press goes to exactly that task, or nowhere if it
+    was relaunched or stopped being offered while the dialog was open (press() checks again)."""
+    b = hit(scene, x, y)
+    if b is None or not b.enabled:
+        return None
+    head, body = model.confirm(b.cmd, b.task, b.cgroup_id)
+    model.freeze(scene.order)
+    try:
+        yes = ask(b.cmd, head, body)
+    finally:
+        model.unfreeze()
+    return model.press(b.cmd, b.task, b.cgroup_id) if yes else None
+
+
+def make_window(model: HudModel, size: Tuple[int, int], frame_times: Optional[float] = None):
+    """(app, window, build_ms, paint_ms): the HUD window, shown and ticking, its event loop not yet run."""
     from PySide6.QtCore import QTimer
     from PySide6.QtGui import QPainter
     from PySide6.QtWidgets import QApplication, QWidget
@@ -672,20 +707,23 @@ def run_qt(model: HudModel, size: Tuple[int, int], frame_times: Optional[float] 
                 model.toggle_scale()
 
         def mousePressEvent(self, e):
-            b = hit(self.scene_, e.position().x(), e.position().y())
-            if b is None or not b.enabled:
-                return
-            head, body = model.confirm(b.cmd, b.task, b.cgroup_id)
-            box, ok = confirm_box(b.cmd, head, body, self)
-            box.exec()
-            if confirmed(box, ok):
-                model.press(b.cmd, b.task, b.cgroup_id)
+            def ask(cmd, head, body):
+                box, ok = confirm_box(cmd, head, body, self)
+                box.exec()                               # modal; the HUD keeps ticking (and painting) underneath
+                return confirmed(box, ok)
+            click(model, self.scene_, e.position().x(), e.position().y(), ask)
 
     build_ms: List[float] = []
     paint_ms: List[float] = []
     app = QApplication.instance() or QApplication(sys.argv[:1])
     w = Window()
     w.show()
+    return app, w, build_ms, paint_ms
+
+
+def run_qt(model: HudModel, size: Tuple[int, int], frame_times: Optional[float] = None) -> int:
+    from PySide6.QtCore import QTimer
+    app, w, build_ms, paint_ms = make_window(model, size, frame_times)
     if frame_times:
         def report():
             print(frame_report(build_ms, paint_ms, len(w.scene_.panels), frame_times), flush=True)

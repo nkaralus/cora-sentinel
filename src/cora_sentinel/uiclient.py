@@ -39,7 +39,7 @@ _MISSING = object()
 MAX_LINE = 1024 * 1024
 BREAKER_VERB = {"sever": "ISOLATE", "cap": "THROTTLE"}
 SEND_TIMEOUT_S = 2.0                    # a socket nobody reads cannot hold a send() longer than this
-TIMED_OUT = "timed out (daemon unresponsive)"
+TIMED_OUT = "unconfirmed, may still apply"   # no reply in time: it may have been applied, it may not (kill -STOP)
 CAP_CPU_MAX = "20000 100000"            # what "cap" writes to cpu.max (20 %); memory.high gets memory.current
 ACK_TIMEOUT_S = 2 * HEARTBEAT_S + 0.5   # an acknowledged breaker must be in force by then (the feed shows it at once)
 
@@ -59,6 +59,7 @@ class StatusClient:
         self.awaiting: dict = {}                    # tag -> an acknowledged breaker not yet seen in force
         self._sent_at: dict = {}                    # tag -> when it was sent (this client's clock)
         self.timed_out: dict = {}                   # tag -> a breaker the daemon never answered within ACK_TIMEOUT_S
+        self.reconciled: list = []                  # breakers seen in force only after their deadline: cmd, task, delay_s
         self.on_state: Optional[Callable[[dict], None]] = None   # called with EVERY state frame (a poll may read several)
 
     def connect(self) -> bool:
@@ -148,7 +149,8 @@ class StatusClient:
                 if sent is not None and msg.get("ok") is True:
                     cmd, task, cid, before = sent
                     self.awaiting[str(msg["id"])] = {"cmd": cmd, "task": task, "cgroup_id": cid,
-                                                     "verb": BREAKER_VERB[cmd], "before": before, "since": self.clock()}
+                                                     "verb": BREAKER_VERB[cmd], "before": before, "since": self.clock(),
+                                                     "sent_at": late["since"] if late else None}
                 changed = True
         return changed
 
@@ -182,18 +184,29 @@ class StatusClient:
             if now - at > ACK_TIMEOUT_S:
                 sent = self._sent.pop(tag)
                 del self._sent_at[tag]
-                self.timed_out[tag] = {"cmd": sent[0], "task": sent[1], "cgroup_id": sent[2], "since": at, "sent": sent}
+                self.timed_out[tag] = {"cmd": sent[0], "task": sent[1], "cgroup_id": sent[2], "since": at, "sent": sent,
+                                       "verb": BREAKER_VERB[sent[0]], "before": sent[3]}
 
     def _reflect(self, state: dict) -> None:
         """An acknowledged breaker is settled when the feed shows a CHANGE it made: sever, ISOLATE in force that was not
         at press time; cap, THROTTLE in force with cpu.max or memory.high different from press time. A verb that was
-        already there proves nothing. It is dropped, not settled, when its task is gone or has exited (pids 0)."""
+        already there proves nothing. It is dropped, not settled, when its task is gone or has exited (pids 0).
+        A breaker that timed out unanswered is settled the same way: a daemon thawed after kill -STOP applies what it
+        had queued, and the feed shows it before (or without) any reply. Either late settlement is recorded with its delay."""
         tasks = state.get("tasks") if isinstance(state.get("tasks"), list) else []
-        for tag, a in list(self.awaiting.items()):
-            t = next((t for t in tasks if isinstance(t, dict) and t.get("name") == a["task"]
-                      and t.get("cgroup_id") == a["cgroup_id"]), None)
-            if t is None or t.get("pids") == 0 or _reflected(a, t):
-                del self.awaiting[tag]
+        now = self.clock()
+        for pending in (self.awaiting, self.timed_out):
+            for tag, a in list(pending.items()):
+                t = next((t for t in tasks if isinstance(t, dict) and t.get("name") == a["task"]
+                          and t.get("cgroup_id") == a["cgroup_id"]), None)
+                if t is None or t.get("pids") == 0:
+                    del pending[tag]
+                elif _reflected(a, t):
+                    del pending[tag]
+                    sent_at = a["since"] if pending is self.timed_out else a.get("sent_at")
+                    if sent_at is not None:
+                        self.reconciled = (self.reconciled + [{"cmd": a["cmd"], "task": a["task"], "cgroup_id": a["cgroup_id"],
+                                                               "delay_s": round(now - sent_at, 1)}])[-20:]
 
     def reachable(self) -> bool:
         return (self.sock is not None and self.state is not None and self.last_rx is not None
@@ -352,7 +365,7 @@ class StatusClient:
             detail = "; ".join(f"unknown verb {v!r} on {n}" for n, v in odd[:3]) + " | " + detail
         if unanswered:
             detail = "; ".join(f"COMMAND_TIMEOUT: {a['cmd']} on {a['task']} sent {now - a['since']:.0f} s ago, no reply "
-                               f"(unconfirmed)" for a in unanswered[:3]) + " | " + detail
+                               f"({TIMED_OUT})" for a in unanswered[:3]) + " | " + detail
         if unreflected:
             detail = "; ".join(f"ACK_NOT_REFLECTED: {a['cmd']} on {a['task']} acknowledged {now - a['since']:.0f} s ago, "
                                f"{a['verb']} not in force" for a in unreflected[:3]) + " | " + detail

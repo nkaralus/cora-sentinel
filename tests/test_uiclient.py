@@ -642,9 +642,9 @@ def test_a_breaker_sent_to_a_frozen_daemon_times_out_instead_of_waiting_forever(
         c.last_rx = now[0]                                                 # the feed itself still looks alive
         v = c.view()
         assert c._sent == {} and tag in c.timed_out
-        assert v["tasks"][0]["pending"] == "timed out (daemon unresponsive)" and v["tasks"][0]["pending_cmd"] == "sever"
+        assert v["tasks"][0]["pending"] == "unconfirmed, may still apply" and v["tasks"][0]["pending_cmd"] == "sever"
         assert (v["status"], v["title"]) == ("unknown", "cora: breaker unanswered: daemon unresponsive")
-        assert "COMMAND_TIMEOUT: sever on game sent 5 s ago, no reply (unconfirmed)" in v["detail"]
+        assert "COMMAND_TIMEOUT: sever on game sent 5 s ago, no reply (unconfirmed, may still apply)" in v["detail"]
         c.ingest((json.dumps({"schema": SCHEMA, "type": "result", "id": tag, "ok": True}) + "\n").encode())
         assert c.timed_out == {} and tag in c.awaiting                     # a late answer un-latches, then is checked
     finally:

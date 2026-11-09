@@ -586,7 +586,7 @@ def test_an_unanswered_breaker_times_out_and_says_so_on_its_row():
     r.wait(uiclient.ACK_TIMEOUT_S + 0.1)
     r.feed(base(2, 105.0, [task()]))
     s = r.scene()
-    assert "cap: timed out (unconfirmed)" in texts(s)
+    assert "cap: unconfirmed, may still apply" in texts(s)
     assert r.m.view["status"] == "unknown" and "COMMAND_TIMEOUT: cap on game-1a2b3c" in r.m.view["detail"]
 
 
@@ -646,3 +646,124 @@ def test_the_real_benchmark_window_grows_to_show_all_twenty(capsys):
     assert hud.run_qt(r.m, (800, 400), frame_times=0.5) == 0            # opens too short for 20 rows
     out = capsys.readouterr().out
     assert "cora-hud frame times over 0 s, 20 task(s):" in out or "cora-hud frame times over 1 s, 20 task(s):" in out, out
+
+
+
+# ================================================================ Track A safety invariants
+def test_a_confirm_dialog_stays_bound_to_its_cgroup_while_rows_re_sort_under_it():
+    r = Rig()
+    r.feed(base(1, 100.0, [_named(1), _named(2)]))
+    s = r.scene()
+    b = next(x for x in s.buttons if x.task == "t01-000001" and x.cmd == "sever")
+    assert [p.name for p in s.panels] == ["t01-000001", "t02-000002"]
+    seen = {}
+
+    def ask(cmd, head, body):                                             # the modal dialog, while the feed goes on
+        t2 = _named(2)
+        t2["alarm"] = "action failed: x"
+        r.feed(base(2, 101.0, [_named(1), t2, _named(3)], status="alarm"), 1.0)   # t02 alarms, t03 appears
+        seen["rows"] = [p.name for p in r.scene().panels]
+        seen["head"] = head
+        return True
+    tag = hud.click(r.m, s, b.x + 1, b.y + 1, ask)
+    assert seen["rows"] == ["t01-000001", "t02-000002", "t03-000003"]     # nothing moved under it; the new row went last
+    assert seen["head"] == uiclient.confirm_text("sever", "t01-000001")[0]
+    assert r.m.client.sock.sent[-1] == {"cmd": "sever", "task": "t01-000001", "cgroup_id": 101, "id": tag}
+    assert [p.name for p in r.scene().panels][0] == "t02-000002"          # closed: severity order, with no new frame
+    assert hud.click(r.m, r.scene(), 1, 1, ask) is None                   # not on a button: nothing asked, nothing sent
+    r.feed(base(3, 102.0, [_named(1), _named(2), _named(3)]), 1.0)        # all clear again: t01 first by name
+    s = r.scene()
+    b = next(x for x in s.buttons if x.task == "t03-000003")
+    def cancel(cmd, head, body):
+        t3 = _named(3)
+        t3["alarm"] = "action failed: y"
+        r.feed(base(4, 103.0, [_named(1), _named(2), t3], status="alarm"), 1.0)
+        assert r.scene().panels[0].name == "t01-000001"                   # frozen (and now the cached scene)
+        return False                                                      # cancelled: no press, the notice unchanged
+    assert hud.click(r.m, s, b.x + 1, b.y + 1, cancel) is None
+    assert r.scene().panels[0].name == "t03-000003"                       # unfrozen at once, with no new frame
+
+
+def test_the_real_window_freezes_rows_and_binds_the_press_while_its_dialog_is_open(monkeypatch):
+    _qt()
+    from PySide6.QtCore import QPointF, Qt, QEvent
+    from PySide6.QtGui import QMouseEvent
+    from PySide6.QtWidgets import QApplication
+    r = Rig()
+    r.feed(base(1, 100.0, [_named(1), _named(2)]))
+    app, w, _, _ = hud.make_window(r.m, (W, H))
+    seen = {}
+
+    class Box:                                                            # stands in for the modal QMessageBox
+        def exec(self):
+            t2 = _named(2)
+            t2["alarm"] = "action failed: x"
+            r.feed(base(2, 101.0, [_named(1), t2], status="alarm"), 1.0)
+            w.tick()                                                      # the HUD ticks under a modal dialog
+            seen["rows"] = [p.name for p in w.scene_.panels]
+        def clickedButton(self):
+            return "ok"
+    monkeypatch.setattr(hud, "confirm_box", lambda cmd, head, body, parent=None: (Box(), "ok"))
+    w.tick()
+    b = next(x for x in w.scene_.buttons if x.task == "t01-000001" and x.cmd == "sever")
+    pos = QPointF(b.x + 2, b.y + 2)
+    QApplication.sendEvent(w, QMouseEvent(QEvent.MouseButtonPress, pos, pos, Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
+    assert seen["rows"] == ["t01-000001", "t02-000002"]
+    assert r.m.client.sock.sent[-1]["cgroup_id"] == 101 and r.m._frozen is None
+    w.close()
+
+
+def test_a_dialog_for_a_task_relaunched_meanwhile_sends_nothing():
+    r = Rig()
+    r.feed(base(1, 100.0, [_named(2)]))
+    s = r.scene()
+    b = next(x for x in s.buttons if x.cmd == "cap")
+    relaunch = lambda cmd, head, body: r.feed(base(2, 101.0, [task(cid=202, name="t02-000002")]), 1.0) or True
+    assert hud.click(r.m, s, b.x + 1, b.y + 1, relaunch) is None          # same name, new cgroup, while it was open
+    assert r.m.client.sock.sent == [] and r.m.notice == "cap on t02-000002: not offered right now"
+
+
+def test_a_task_below_the_fold_entering_alarm_turns_the_header_red():
+    tasks = [_named(i) for i in range(1, 16)]
+    r = Rig()
+    r.feed(base(1, 100.0, tasks))
+    s = r.scene(W, 300)
+    hidden = s.order[len(s.panels):]
+    assert ("t15-00000f", 115) in hidden and s.header_colour == rb.PALETTE["green"]
+    tasks[-1] = dict(tasks[-1], alarm="action failed: failed:FirewallError@cgroup:t15-00000f")
+    r.feed(base(2, 101.0, tasks, status="alarm"), 1.0)
+    s = r.scene(W, 300)
+    assert s.header_colour == rb.PALETTE["red"] and s.panels[0].name == "t15-00000f"
+    r.feed(base(3, 102.0, [_named(i) for i in range(1, 16)], status="alarm"), 1.0)   # a session alarm naming no task
+    s = r.scene(W, 300)
+    assert s.header_colour == rb.PALETTE["red"]                           # still red, wherever the rows are
+
+
+def test_a_frozen_daemon_shows_unconfirmed_and_reconciles_when_the_feed_shows_it_applied():
+    r = Rig()
+    r.feed(base(1, 100.0, [task()]))
+    tag = r.m.press("sever", "game-1a2b3c", 7)                            # then kill -STOP: no reply, no frames
+    r.wait(uiclient.ACK_TIMEOUT_S + 0.5)
+    r.feed(base(2, 105.0, [task()]))                                      # a frame (or the next after the stall)
+    assert "sever: unconfirmed, may still apply" in texts(r.scene())
+    assert tag in r.m.client.timed_out
+    r.feed(base(3, 106.0, [task(enforced=["ISOLATE"])], status="contained"), 1.0)   # kill -CONT: it was applied
+    s = r.scene()
+    assert not any("unconfirmed" in t for t in texts(s)) and r.m.client.timed_out == {}
+    assert r.m.view["status"] == "contained" and "COMMAND_TIMEOUT" not in r.m.view["detail"]
+    assert r.m.client.reconciled == [{"cmd": "sever", "task": "game-1a2b3c", "cgroup_id": 7, "delay_s": 6.0}]
+    assert r.m.notice == "sever on game-1a2b3c: applied late, 6 s after it was sent" and r.m.notice in texts(s)
+    assert [m.detail for m in r.m.store.rings[7].marks] == ["sever:sent", "sever:late"]
+
+
+def test_a_late_reply_then_enforcement_is_also_recorded_with_its_delay():
+    r = Rig()
+    r.feed(base(1, 100.0, [task()]))
+    tag = r.m.press("cap", "game-1a2b3c", 7)
+    r.wait(uiclient.ACK_TIMEOUT_S + 1.0)
+    r.feed(base(2, 105.0, [task()]))
+    r.m.client.ingest((json.dumps({"schema": SCHEMA, "type": "result", "id": tag, "ok": True}) + "\n").encode())
+    r.feed(base(3, 106.0, [task(enforced=["THROTTLE"], limits={"source": "sentinel", "cpu_max": "20000 100000",
+                                                              "memory_high": 1, "memory_max": None})], status="contained"), 1.0)
+    assert r.m.client.reconciled[-1]["cmd"] == "cap" and r.m.client.reconciled[-1]["delay_s"] == 6.5
+    assert r.m.client.awaiting == {} and r.m.client.timed_out == {}
