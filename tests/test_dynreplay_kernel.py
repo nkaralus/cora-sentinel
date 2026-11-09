@@ -47,6 +47,20 @@ def test_the_ruleset_comparison_ignores_live_counters_but_not_rules():
     assert normalize_ruleset(a) != normalize_ruleset(a.replace("}\n}", "}\n\tchain d {\n\t}\n}"))
 
 
+def test_the_normalizer_keeps_set_elements_and_everything_but_counters_and_timers():
+    base = ("table inet cora {\n\tset floor4 {\n\t\ttype ipv4_addr\n\t\tflags timeout\n\t\ttimeout 30s\n"
+            "\t\telements = { 1.2.3.4 timeout 30s expires 12s, 5.6.7.8 timeout 30s expires 3s }\n\t}\n"
+            "\tchain out {\n\t\ttype filter hook output priority 0; policy accept;\n"
+            "\t\tip daddr @floor4 tcp dport 443 counter packets 9 bytes 540 drop\n\t}\n}\n")
+    n = normalize_ruleset(base)
+    assert n != normalize_ruleset(base.replace(", 5.6.7.8 timeout 30s expires 3s", ""))          # an element removed
+    assert n != normalize_ruleset(base.replace("5.6.7.8", "5.6.7.8, 9.9.9.9"))                    # an element added
+    assert n != normalize_ruleset(base.replace("counter packets 9 bytes 540 drop", "counter packets 9 bytes 540 accept"))
+    for kept in ("timeout 30s", "dport 443", "priority 0", "1.2.3.4", "5.6.7.8", "counter", "@floor4", "policy accept"):
+        assert kept in n, kept                                                                     # only state goes
+    assert "expires 12s" not in n and "packets 9" not in n and n.count("expires T") == 2
+
+
 @kernel
 @needs_unshare
 def test_kernel_mode_writes_to_a_private_namespace_and_agrees_with_the_ledger(tmp_path):

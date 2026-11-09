@@ -396,3 +396,88 @@ def test_refusal_outranks_quieter_states_and_yields_to_louder_ones(status, want)
 def test_an_exited_task_with_a_refused_tripwire_does_not_hold_the_light_up():
     v = view_of({**BASE, "status": "clear", "tasks": [task(psi_state="refused", pids=0)]})
     assert v["status"] == "clear"
+
+
+# ================================================================ limits.source "unknown": the registry is unreadable
+def test_unknown_provenance_keeps_cap_offered_and_does_not_claim_containment():
+    t = task(name="game-1a2b3c", contained=["THROTTLE"], enforced=["THROTTLE"],
+             limits={"source": "unknown", "cpu_max": None, "memory_high": 400 << 20, "memory_max": 512 << 20})
+    v = view_of({**BASE, "status": "blind", "truth_errors": ["scope registry unreadable: x"], "tasks": [t]})
+    vt = v["tasks"][0]
+    assert vt["can_cap"] is True and vt["can_sever"] is True
+    assert "[THROTTLE]" not in vt["line"] and "[limit provenance unknown]" in vt["line"]
+    assert "limit provenance unknown (registry unreadable) on game-1a2b3c" in v["detail"]
+    assert (v["status"], v["colour"]) == ("blind", "red")
+
+
+def test_unknown_provenance_is_loud_even_without_truth_errors():
+    t = task(limits={"source": "unknown", "cpu_max": None, "memory_high": 1 << 20, "memory_max": None},
+             enforced=["THROTTLE"], contained=["THROTTLE"])
+    v = view_of({**BASE, "status": "clear", "tasks": [t]})
+    assert v["status"] == "blind" and v["tasks"][0]["can_cap"] is True
+
+
+def test_unknown_provenance_does_not_hide_a_real_isolation():
+    t = task(limits={"source": "unknown", "cpu_max": "20000 100000", "memory_high": 1 << 20, "memory_max": None},
+             enforced=["ISOLATE", "THROTTLE"], contained=["ISOLATE", "THROTTLE"])
+    vt = view_of({**BASE, "status": "blind", "truth_errors": ["scope registry unreadable: x"], "tasks": [t]})["tasks"][0]
+    assert vt["can_sever"] is False and vt["can_cap"] is True and "[ISOLATE]" in vt["line"]
+
+
+# ================================================================ ACK_NOT_REFLECTED: an acknowledged breaker must show up in force
+class _SendSock(_NoSock):
+    def __init__(self):
+        self.sent = []
+
+    def setblocking(self, v):
+        pass
+
+    def settimeout(self, v):
+        pass
+
+    def sendall(self, data):
+        self.sent.append(json.loads(data))
+
+
+def acked(now, ok=True, cmd="sever"):
+    c = StatusClient("/virtual", clock=lambda: now[0])
+    c.sock, c.connected_at = _SendSock(), now[0]
+    c.ingest((json.dumps({**BASE, "status": "clear", "seq": 1, "tasks": [task(name="game", cgroup_id=9)]}) + "\n").encode())
+    tag = c.send(cmd, "game", 9)
+    assert c.sock.sent[-1] == {"cmd": cmd, "task": "game", "cgroup_id": 9, "id": tag}
+    c.ingest((json.dumps({"schema": SCHEMA, "type": "result", "id": tag, "ok": ok}) + "\n").encode())
+    return c
+
+
+def frame_with(c, seq, **kw):
+    c.ingest((json.dumps({**BASE, "status": kw.pop("status", "clear"), "seq": seq,
+                          "tasks": [task(name="game", cgroup_id=9, **kw)]}) + "\n").encode())
+
+
+def test_an_acknowledged_breaker_that_never_shows_up_is_loud():
+    now = [100.0]
+    c = acked(now)
+    frame_with(c, 2)
+    assert c.view()["status"] == "clear"                                  # still within the grace period
+    now[0] += uiclient.ACK_TIMEOUT_S + 0.1
+    frame_with(c, 3)
+    v = c.view()
+    assert (v["status"], v["colour"], v["title"]) == ("unknown", "red", "cora: breaker acknowledged but not in force")
+    assert "ACK_NOT_REFLECTED: sever on game acknowledged 5 s ago, ISOLATE not in force" in v["detail"]
+
+
+def test_a_breaker_that_shows_up_in_force_is_settled():
+    now = [100.0]
+    c = acked(now, cmd="cap")
+    frame_with(c, 2, status="contained", enforced=["THROTTLE"], contained=["THROTTLE"])
+    now[0] += uiclient.ACK_TIMEOUT_S + 0.5                                # past the deadline, inside the 6 s staleness
+    assert c.awaiting == {} and c.view()["status"] == "contained"
+
+
+def test_a_refused_breaker_or_a_task_that_ended_is_not_awaited():
+    now = [100.0]
+    assert acked(now, ok=False).awaiting == {}
+    c = acked(now)
+    c.ingest((json.dumps({**BASE, "status": "clear", "seq": 2, "tasks": []}) + "\n").encode())
+    now[0] += uiclient.ACK_TIMEOUT_S + 1
+    assert c.awaiting == {} and c.view()["status"] == "clear"

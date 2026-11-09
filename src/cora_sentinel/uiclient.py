@@ -22,7 +22,7 @@ import itertools
 import time
 from typing import Callable, List, Optional
 
-from cora_sentinel.uihub import SCHEMA, STALE_AFTER_S
+from cora_sentinel.uihub import HEARTBEAT_S, SCHEMA, STALE_AFTER_S
 from cora_sentinel.ring_buffer import human_bytes  # noqa: F401  (shared; uiclient.human_bytes still works)
 
 DEFAULT_SOCKET = "/run/cora-sentinel/ui.sock"
@@ -37,6 +37,8 @@ PSI_STATES = frozenset({"armed", "refused", "disabled", "unmonitored"})   # anyt
 RANK = {"clear": 0, "evaluating": 1, "pressure": 2, "contained": 3, "psi_refused": 3, "blind": 4, "unknown": 5, "alarm": 6}
 _MISSING = object()
 MAX_LINE = 1024 * 1024
+BREAKER_VERB = {"sever": "ISOLATE", "cap": "THROTTLE"}
+ACK_TIMEOUT_S = 2 * HEARTBEAT_S + 0.5   # an acknowledged breaker must be in force by then (the feed shows it at once)
 
 
 class StatusClient:
@@ -50,6 +52,8 @@ class StatusClient:
         self.error: Optional[str] = "not connected yet"
         self.results: dict = {}                     # tag -> the daemon's {"type": "result", ...} reply
         self._tags = itertools.count(1)
+        self._sent: dict = {}                       # tag -> (cmd, task, cgroup_id) of a breaker not yet answered
+        self.awaiting: dict = {}                    # tag -> an acknowledged breaker not yet seen in force
 
     def connect(self) -> bool:
         self.close()
@@ -116,8 +120,14 @@ class StatusClient:
                 continue
             if msg.get("type") == "state":
                 self.state, self.last_rx, changed = msg, self.clock(), True
+                self._reflect(msg)
             elif msg.get("type") == "result" and msg.get("id") is not None:
                 self.results[str(msg["id"])] = msg
+                sent = self._sent.pop(str(msg["id"]), None)
+                if sent is not None and msg.get("ok") is True:
+                    cmd, task, cid = sent
+                    self.awaiting[str(msg["id"])] = {"cmd": cmd, "task": task, "cgroup_id": cid,
+                                                     "verb": BREAKER_VERB[cmd], "since": self.clock()}
                 changed = True
         return changed
 
@@ -127,6 +137,7 @@ class StatusClient:
         if self.sock is None or cmd not in ("sever", "cap"):
             return None
         tag = f"t{next(self._tags)}"
+        self._sent[tag] = (cmd, task, cgroup_id)
         line = json.dumps({"cmd": cmd, "task": task, "cgroup_id": cgroup_id, "id": tag}) + "\n"
         try:
             self.sock.setblocking(True)
@@ -140,6 +151,15 @@ class StatusClient:
             if self.sock:
                 self.sock.setblocking(False)
         return tag
+
+    def _reflect(self, state: dict) -> None:
+        """An acknowledged breaker is settled when its task shows the verb in force, or when the task is gone."""
+        tasks = state.get("tasks") if isinstance(state.get("tasks"), list) else []
+        for tag, a in list(self.awaiting.items()):
+            t = next((t for t in tasks if isinstance(t, dict) and t.get("name") == a["task"]
+                      and t.get("cgroup_id") == a["cgroup_id"]), None)
+            if t is None or a["verb"] in (t.get("enforced") or []):
+                del self.awaiting[tag]
 
     def reachable(self) -> bool:
         return (self.sock is not None and self.state is not None and self.last_rx is not None
@@ -178,10 +198,20 @@ class StatusClient:
         "launch" is the sentinel's, whatever `enforced` says: missing or null provenance never downgrades a limit."""
         e = list(self._verbs(t, "enforced"))
         lim = t.get("limits")
+        if isinstance(lim, dict) and lim.get("source") == "unknown":
+            # the registry is unreadable: a THROTTLE read off memory.high may be nothing but the launch ceiling, so it
+            # is not claimed as containment, and Cap stays offered (a tightening: harmless if a cap is already set)
+            return [v for v in e if v != "THROTTLE"]
         if isinstance(lim, dict) and "THROTTLE" not in e:
             if lim.get("cpu_max") is not None or (lim.get("memory_high") is not None and lim.get("source") != "launch"):
                 e.append("THROTTLE")
         return e
+
+    def _shown_contained(self, t: dict) -> List[str]:
+        v = self._verbs(t, "contained")
+        if (t.get("limits") or {}).get("source") == "unknown":
+            v = [x for x in v if x != "THROTTLE"]       # shown as "limit provenance unknown" instead
+        return v
 
     def _view(self, s: dict) -> dict:
         mode = s.get("mode")
@@ -200,8 +230,13 @@ class StatusClient:
         unproven = [t["name"] for t in raw_tasks if "THROTTLE" in self._enforced(t) and "THROTTLE" not in self._verbs(t, "enforced")]
         # every fault that is true votes; the worst wins, and the detail line lists them all
         refused = [t["name"] for t in raw_tasks if t.get("psi_state") == "refused" and t.get("pids") != 0]
+        prov_unknown = [t["name"] for t in raw_tasks if isinstance(t.get("limits"), dict)
+                        and t["limits"].get("source") == "unknown"]
+        now = self.clock()
+        unreflected = [a for a in self.awaiting.values() if now - a["since"] > ACK_TIMEOUT_S]
         votes = [raw if status_ok else "unknown"] + ["blind"] * bool(truth) + ["unknown"] * bool(odd) + \
-            ["contained"] * bool(unproven) + ["psi_refused"] * bool(refused)
+            ["contained"] * bool(unproven) + ["psi_refused"] * bool(refused) + ["blind"] * bool(prov_unknown) + \
+            ["unknown"] * bool(unreflected)
         st = max(votes, key=RANK.__getitem__)
         hot = [t["name"] for t in raw_tasks if (t.get("pressure") or {}).get("active")]
         label = {"clear": "all clear", "evaluating": f"model evaluating ({s.get('evaluating', 0)})",
@@ -210,6 +245,8 @@ class StatusClient:
                  "blind": "BLIND: cannot read what is enforced",
                  "unknown": "UNKNOWN status from cora-sentinel" if not status_ok else "UNKNOWN verb from cora-sentinel",
                  "psi_refused": "memory-pressure tripwire refused"}[st]
+        if st == "unknown" and status_ok and not odd and unreflected:
+            label = "breaker acknowledged but not in force"
         enforced = any(self._enforced(t) for t in raw_tasks)
         if st == "contained" and not enforced and mode != "enforce":
             label = "WOULD contain (dry-run: nothing was done)"
@@ -222,7 +259,8 @@ class StatusClient:
                           + (f" / {human_bytes((t.get('scope') or {}).get('memory_max'))}"
                              if (t.get("scope") or {}).get("memory_max") else "")
                           + f" ({human_bytes(t.get('mem_delta_bytes'), True)})"
-                          + (f" [{', '.join(map(unknown_verb, self._verbs(t, 'contained')))}]" if t.get("contained") else "")
+                          + (f" [{', '.join(map(unknown_verb, shown))}]" if (shown := self._shown_contained(t)) else "")
+                          + (" [limit provenance unknown]" if (t.get("limits") or {}).get("source") == "unknown" else "")
                           + (f" [{', '.join(unknown_verb(u) + '?' for u in self._verbs(t, 'unknown'))}]"
                              if t.get("unknown") else "")
                           + (f" [PRESSURE some {(t.get('pressure') or {}).get('some_avg10', '?')}%]"
@@ -239,6 +277,9 @@ class StatusClient:
         alarm_bits = [f"{sess.get(k)} {w}" for k, w in (("dropped_uncontained", "dropped uncontained"),
                                                           ("failed_actions", "failed actions")) if sess.get(k)]
         detail = ", ".join(alarm_bits) or f"{sess.get('community_blocked', 0)} community trackers blocked"
+        if prov_unknown:                                 # a consequence: it goes after its cause (the truth error)
+            detail = "; ".join(f"limit provenance unknown (registry unreadable) on {n}" for n in prov_unknown[:3]) \
+                + " | " + detail
         if truth:
             detail = "; ".join(truth) + " | " + detail          # the exact error first: it is why the light is red
         if not (isinstance(raw, str) and raw in KNOWN_STATUS):
@@ -249,6 +290,9 @@ class StatusClient:
             detail = "; ".join(f"limit without launch provenance on {n}: treated as THROTTLE" for n in unproven[:3]) + " | " + detail
         if odd:
             detail = "; ".join(f"unknown verb {v!r} on {n}" for n, v in odd[:3]) + " | " + detail
+        if unreflected:
+            detail = "; ".join(f"ACK_NOT_REFLECTED: {a['cmd']} on {a['task']} acknowledged {now - a['since']:.0f} s ago, "
+                               f"{a['verb']} not in force" for a in unreflected[:3]) + " | " + detail
         return {"status": st, "colour": COLOURS[st], "title": f"cora: {label}",
                 "detail": detail,
                 "mode": mode, "tasks": tasks, "session": sess}
