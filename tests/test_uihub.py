@@ -904,3 +904,26 @@ def test_200_hub_lifecycles_under_a_tight_fd_limit_end_exactly_at_baseline(tmp_p
         assert _fds() == base
     finally:
         _resource.setrlimit(_resource.RLIMIT_NOFILE, (soft, hard))
+
+
+# ---------------------------------------------------------------- per-task facts: its own errors, and the alarm it caused
+def test_a_failed_automatic_action_marks_its_task_and_the_session():
+    tasks = {"game": {"pids": 1, "mem_bytes": 1, "id": 7, "enforced": [], "unknown": [], "errors": []},
+             "other": {"pids": 1, "mem_bytes": 1, "id": 8, "enforced": [], "unknown": [], "errors": ["firewall unreadable (X)"]}}
+    h = Hub("/nonexistent/ui.sock", tasks=lambda: tasks, log=lambda m: None)
+    h.note_decision({"final": "ISOLATE", "action": "failed:FirewallError@cgroup:game"})
+    snap = h.snapshot()
+    by = {t["name"]: t for t in snap["tasks"]}
+    assert snap["status"] == "alarm" and by["game"]["alarm"] == "action failed: failed:FirewallError@cgroup:game"
+    assert "alarm" not in by["other"] and by["other"]["errors"] == ["firewall unreadable (X)"] and by["game"]["errors"] == []
+    c = StatusClient("/x")
+    assert c.task_status(by["game"]) == "alarm" and c.task_status(by["other"]) == "blind"
+
+
+def test_a_failed_breaker_from_the_tray_alarms_no_task_and_a_drop_names_none():
+    tasks = {"game": {"pids": 1, "mem_bytes": 1, "id": 7, "enforced": [], "unknown": [], "errors": []}}
+    h = Hub("/nonexistent/ui.sock", tasks=lambda: tasks, log=lambda m: None)
+    h.note_decision({"final": "ISOLATE", "policy": uihub.MANUAL_POLICY, "action": "failed:FirewallError@cgroup:game"})
+    h.note_decision({"final": "DROPPED", "action": "dropped:queue-full"})
+    snap = h.snapshot()
+    assert snap["status"] == "alarm" and "alarm" not in snap["tasks"][0]     # the session alarms; no task to pin it on

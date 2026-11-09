@@ -54,7 +54,7 @@ from typing import Callable, List, NamedTuple, Optional, Tuple
 try:
     from cora_sentinel import ring_buffer as rb
     from cora_sentinel.ring_buffer import Epoch, Gap, RingStore, Sample, band_of, build_avg_series, build_stall_segments
-    from cora_sentinel.uiclient import BREAKER_LABEL, DEFAULT_SOCKET, StatusClient, confirm_text
+    from cora_sentinel.uiclient import BREAKER_LABEL, DEFAULT_SOCKET, RANK, StatusClient, confirm_text
 except ImportError:
     sys.exit("cora-hud: cannot import cora_sentinel (install it, or run with PYTHONPATH=/path/to/cora-sentinel/src)")
 
@@ -145,6 +145,7 @@ class Scene(NamedTuple):
     panels: Tuple[Panel, ...]
     buttons: Tuple[Button, ...]
     hidden: int
+    footer: Optional[str] = None
 
 
 def axis_step(width: int) -> float:
@@ -234,6 +235,7 @@ def build_scene(view: dict, store: RingStore, client_now: float, wall_now: float
     entries = [(t["name"], t.get("cgroup_id"), t, store.rings.get(t.get("cgroup_id"))) for t in vtasks]
     seen = {t.get("cgroup_id") for t in vtasks}
     entries += [(r.name, cid, None, r) for cid, r in store.rings.items() if cid not in seen]
+    entries.sort(key=severity_key)                    # the worst rows first: never below the fold
     avail = height - y - 4
     n = len(entries)
     ph = max(PANEL_MIN, min(PANEL_MAX, avail // n)) if n else 0
@@ -266,6 +268,9 @@ def build_scene(view: dict, store: RingStore, client_now: float, wall_now: float
             items.append(Text(8, top + 21, "no longer in the feed", INK["dim"], 10))
         if exited:
             items.append(Text(8, top + 35, "exited", INK["dim"], 10, True))
+        if vt is not None and vt.get("pending"):
+            items.append(Text(8, top + 35 + 12 * exited, f"{vt.get('pending_cmd')}: timed out (unconfirmed)",
+                              rb.PALETTE["red"], 10, True))
         items.append(Rect(x0, y0, pw, h, INK["plot"]))
         runs, curves, coarse, gaps, marks = [], [], [], [], []
         badge = None
@@ -345,11 +350,43 @@ def build_scene(view: dict, store: RingStore, client_now: float, wall_now: float
         panels.append(Panel(name, cid, (x0, y0, pw, h), tuple(runs), tuple(curves), tuple(coarse), tuple(gaps),
                             tuple(marks), badge, exited, tuple(mine)))
         y += ph
+    footer = None
     if hidden:
-        items.append(Text(8, y + 2, f"+{hidden} more task{'s' * (hidden > 1)} (enlarge the window)", INK["dim"], 10))
+        name, _, vt, _ = max(entries[fit:], key=lambda e: RANK.get(task_state(e[2]), 0))
+        footer = f"+{hidden} more task{'s' * (hidden > 1)} (worst: {task_state(vt)} on {name})"
+        worst_ink = rb.PALETTE[uiclient_colour(task_state(vt))]
+        items.append(Text(8, y + 2, footer, worst_ink if task_state(vt) != "clear" else INK["dim"], 10, True))
     if not entries and view["status"] not in ("unreachable", "connecting"):
         items.append(Text(8, y + 4, "no sandboxed tasks running", INK["dim"], 11))
-    return Scene(width, height, tuple(items), tuple(banners), header, hist, tuple(panels), tuple(buttons), hidden)
+    return Scene(width, height, tuple(items), tuple(banners), header, hist, tuple(panels), tuple(buttons), hidden, footer)
+
+
+def task_state(vt: Optional[dict]) -> str:
+    """The client's own per-task status (uiclient.task_status); a ring no longer in the feed has none: "gone"."""
+    return vt.get("status", "clear") if vt is not None else "gone"
+
+
+def severity_key(entry) -> tuple:
+    name, _, vt, _ = entry
+    return (-RANK.get(task_state(vt), 0), vt is None, name or "")
+
+
+def uiclient_colour(state: str) -> str:
+    from cora_sentinel.uiclient import COLOURS
+    return COLOURS.get(state, "grey")
+
+
+def fit_height(n_tasks: int, banners: int = 2, notice: bool = True) -> int:
+    """The window height that shows n tasks without hiding any (each row at its smallest)."""
+    top = 24 * banners + 30 + 20 + 18 * notice + 20
+    return top + 4 + n_tasks * PANEL_MIN
+
+
+def grow_to_fit(scene: Scene) -> Optional[int]:
+    """The height a benchmark window (--frame-times) must grow to so no task is hidden, or None if none is."""
+    if not scene.hidden:
+        return None
+    return max(scene.height + 1, fit_height(len(scene.panels) + scene.hidden, len(scene.banners)))
 
 
 def _hole_between(ring, a: float, b: float) -> bool:
@@ -571,10 +608,34 @@ def frame_report(build_ms: List[float], paint_ms: List[float], tasks: int, secon
             f"p95 {q(paint_ms, .95):.2f} max {max(paint_ms, default=float('nan')):.2f}")
 
 
+def confirm_box(cmd: str, head: str, body: str, parent=None):
+    """(dialog, its confirm button). Cancel is the default (Enter cancels) and the escape button; closing the window
+    from the title bar ([X], on Wayland drawn by the compositor) rejects exactly as Escape does."""
+    from PySide6.QtWidgets import QMessageBox
+
+    class ConfirmBox(QMessageBox):
+        def closeEvent(self, e):
+            self.reject()
+            e.accept()
+
+    box = ConfirmBox(QMessageBox.Warning, "cora-hud", head, parent=parent)
+    box.setInformativeText(body)
+    cancel = box.addButton(QMessageBox.Cancel)
+    ok = box.addButton({"sever": "Sever network", "cap": "Cap memory"}[cmd], QMessageBox.DestructiveRole)
+    box.setDefaultButton(cancel)                     # Enter must not sever by accident
+    box.setEscapeButton(cancel)
+    return box, ok
+
+
+def confirmed(box, ok) -> bool:
+    """Only a click on the confirm button confirms: Cancel, Escape, Enter (Cancel is the default) and [X] do not."""
+    return box.clickedButton() is ok
+
+
 def run_qt(model: HudModel, size: Tuple[int, int], frame_times: Optional[float] = None) -> int:
     from PySide6.QtCore import QTimer
     from PySide6.QtGui import QPainter
-    from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
+    from PySide6.QtWidgets import QApplication, QWidget
 
     class Window(QWidget):
         def __init__(self):
@@ -588,6 +649,10 @@ def run_qt(model: HudModel, size: Tuple[int, int], frame_times: Optional[float] 
 
         def tick(self):
             model.tick()
+            if frame_times:                              # a benchmark window shows every task: grow until none is hidden
+                h = grow_to_fit(model.scene(self.width(), self.height()))
+                if h is not None:
+                    self.resize(self.width(), h)
             t0 = time.perf_counter()
             s = model.scene(self.width(), self.height())
             if s != self.scene_:
@@ -611,14 +676,9 @@ def run_qt(model: HudModel, size: Tuple[int, int], frame_times: Optional[float] 
             if b is None or not b.enabled:
                 return
             head, body = model.confirm(b.cmd, b.task, b.cgroup_id)
-            box = QMessageBox(QMessageBox.Warning, "cora-hud", head, parent=self)
-            box.setInformativeText(body)
-            cancel = box.addButton(QMessageBox.Cancel)
-            ok = box.addButton({"sever": "Sever network", "cap": "Cap memory"}[b.cmd], QMessageBox.DestructiveRole)
-            box.setDefaultButton(cancel)                 # Enter must not sever by accident
-            box.setEscapeButton(cancel)
+            box, ok = confirm_box(b.cmd, head, body, self)
             box.exec()
-            if box.clickedButton() is ok:
+            if confirmed(box, ok):
                 model.press(b.cmd, b.task, b.cgroup_id)
 
     build_ms: List[float] = []
@@ -667,6 +727,8 @@ def main(argv=None) -> int:
     ap.add_argument("--socket", default=DEFAULT_SOCKET)
     ap.add_argument("--scale", choices=("sqrt", "symlog"), default="sqrt")
     ap.add_argument("--size", default="960x640", help="WIDTHxHEIGHT")
+    ap.add_argument("--height", type=int, default=None, help="the window height (overrides --size's); with "
+                    "--frame-times the window also grows by itself until every task fits")
     ap.add_argument("--snapshot", metavar="FILE", help="write one frame of the window after --after seconds, and exit")
     ap.add_argument("--after", type=float, default=5.0)
     ap.add_argument("--frame-times", type=float, metavar="SECONDS", default=None,
@@ -677,6 +739,10 @@ def main(argv=None) -> int:
         assert len(size) == 2 and min(size) >= 200
     except (ValueError, AssertionError):
         ap.error("--size must be WIDTHxHEIGHT, each at least 200")
+    if a.height is not None:
+        if a.height < 200:
+            ap.error("--height must be at least 200")
+        size = (size[0], a.height)
     if not have_qt():
         sys.exit('cora-hud: needs PySide6: pip install "cora-sentinel[hud]" (or pip install PySide6-Essentials)')
     model = HudModel(a.socket, scale=a.scale)

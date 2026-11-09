@@ -394,7 +394,7 @@ def test_too_many_tasks_say_how_many_are_hidden():
     r = play("many_tasks")
     s = r.scene(W, 480)
     assert s.hidden == 20 - len(s.panels) > 0
-    assert f"+{s.hidden} more tasks (enlarge the window)" in texts(s)
+    assert s.footer == f"+{s.hidden} more tasks (worst: clear on many04-000004)" and s.footer in texts(s)
 
 
 def test_an_exited_task_says_so_and_a_task_gone_from_the_feed_is_kept_without_buttons():
@@ -536,3 +536,113 @@ def test_a_fixture_replayed_over_a_real_socket_shows_the_replay_banner(tmp_path)
     finally:
         m.client.close()
         srv.stop()
+
+
+
+# ================================================================ severity first: the worst rows are never below the fold
+def _named(i, **kw):
+    return task(cid=100 + i, name=f"t{i:02d}-{i:06x}", **kw)
+
+
+def test_an_alarmed_task_is_row_one_even_when_it_is_listed_last():
+    tasks = [_named(i) for i in range(1, 15)] + [_named(15)]
+    tasks[-1]["alarm"] = "action failed: failed:FirewallError@cgroup:t15-00000f"
+    r = Rig()
+    r.feed(base(1, 100.0, tasks, status="alarm"))
+    for height in (H, 300, 220):
+        s = r.scene(W, height)
+        assert s.panels[0].name == "t15-00000f", height
+        assert s.hidden == 15 - len(s.panels)
+    s = r.scene(W, 300)
+    assert s.footer == f"+{s.hidden} more tasks (worst: clear on {sorted(t['name'] for t in tasks[:14])[len(s.panels) - 1]})"
+
+
+def test_rows_go_by_the_clients_per_task_status_then_name():
+    tasks = [_named(1), _named(2, count=1, active=True), _named(3, enforced=["ISOLATE"]), _named(4, psi_state="refused"),
+             _named(5, limits={"source": "unknown", "cpu_max": None, "memory_high": None, "memory_max": None}), _named(6)]
+    tasks[5]["alarm"] = "action failed: x"
+    r = Rig()
+    r.feed(base(1, 100.0, tasks, status="alarm"))
+    s = r.scene(W, 2000)
+    states = {t["name"]: t["status"] for t in r.m.view["tasks"]}
+    assert [states[p.name] for p in s.panels] == ["alarm", "blind", "contained", "psi_refused", "pressure", "clear"]
+    s = r.scene(W, 260)
+    assert s.panels[0].name == "t06-000006"
+    hidden_worst = [p.name for p in r.scene(W, 2000).panels][len(s.panels)]
+    assert s.footer.startswith(f"+{s.hidden} more task") and f"worst: {states[hidden_worst]} on {hidden_worst}" in s.footer
+
+
+def test_a_task_gone_from_the_feed_sorts_after_live_ones():
+    r = play("relaunch_new_cgroup")
+    assert [p.cgroup_id for p in r.scene().panels] == [214, 101]
+
+
+# ================================================================ a breaker the daemon never answers
+def test_an_unanswered_breaker_times_out_and_says_so_on_its_row():
+    r = Rig()
+    r.feed(base(1, 100.0, [task()]))
+    tag = r.m.press("cap", "game-1a2b3c", 7)
+    assert tag and not any("timed out" in t for t in texts(r.scene()))
+    r.wait(uiclient.ACK_TIMEOUT_S + 0.1)
+    r.feed(base(2, 105.0, [task()]))
+    s = r.scene()
+    assert "cap: timed out (unconfirmed)" in texts(s)
+    assert r.m.view["status"] == "unknown" and "COMMAND_TIMEOUT: cap on game-1a2b3c" in r.m.view["detail"]
+
+
+# ================================================================ window size, and the dialog's [X]
+def test_fit_height_shows_twenty_tasks_without_hiding_any():
+    r = Rig("/tmp/x/ui.sock")
+    r.feed(base(1, 100.0, [_named(i) for i in range(1, 21)]))
+    exact = hud.fit_height(20, banners=1, notice=False)
+    s = r.scene(800, exact)
+    assert s.hidden == 0 and len(s.panels) == 20 and len(s.banners) == 1
+    assert r.scene(800, exact - 1).hidden > 0                             # the exact fit: one pixel less hides a row
+    assert hud.fit_height(20) == 1060 <= 1150                             # both banners and a notice line: still fits
+
+
+def test_height_overrides_the_size(monkeypatch):
+    got = {}
+    monkeypatch.setattr(hud, "have_qt", lambda: True)
+    monkeypatch.setattr(hud, "run_qt", lambda model, size, frame_times=None: got.update(size=size, ft=frame_times) or 0)
+    assert hud.main(["--socket", "/nonexistent/ui.sock", "--size", "800x600", "--height", "1150", "--frame-times", "60"]) == 0
+    assert got == {"size": (800, 1150), "ft": 60.0}
+    with pytest.raises(SystemExit):
+        hud.main(["--socket", "/nonexistent/ui.sock", "--height", "50"])
+
+
+def test_closing_the_confirm_dialog_from_its_title_bar_cancels():
+    _qt()
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QKeyEvent
+    from PySide6.QtWidgets import QApplication, QDialog
+    box, ok = hud.confirm_box("sever", "Cut it?", "body")
+    assert box.defaultButton() is box.escapeButton() and box.defaultButton() is not ok
+    box.show()
+    box.close()                                                          # what the compositor's [X] asks for
+    assert not hud.confirmed(box, ok) and box.result() == QDialog.Rejected and not box.isVisible()
+    box, ok = hud.confirm_box("cap", "Cap it?", "body")
+    box.show()
+    QApplication.sendEvent(box, QKeyEvent(QEvent.KeyPress, Qt.Key_Escape, Qt.NoModifier))
+    assert not hud.confirmed(box, ok) and not box.isVisible()
+    box, ok = hud.confirm_box("cap", "Cap it?", "body")
+    box.show()
+    ok.click()
+    assert hud.confirmed(box, ok)
+
+
+def test_a_benchmark_window_grows_until_every_task_fits():
+    r = Rig()
+    r.feed(base(1, 100.0, [_named(i) for i in range(1, 21)]))
+    s = r.scene(800, 640)
+    assert s.hidden and hud.grow_to_fit(s) == hud.fit_height(20, 0)
+    assert r.scene(800, hud.grow_to_fit(s)).hidden == 0 and hud.grow_to_fit(r.scene(800, hud.grow_to_fit(s))) is None
+
+
+def test_the_real_benchmark_window_grows_to_show_all_twenty(capsys):
+    _qt()
+    r = Rig()
+    r.feed(base(1, 100.0, [_named(i) for i in range(1, 21)]))
+    assert hud.run_qt(r.m, (800, 400), frame_times=0.5) == 0            # opens too short for 20 rows
+    out = capsys.readouterr().out
+    assert "cora-hud frame times over 0 s, 20 task(s):" in out or "cora-hud frame times over 1 s, 20 task(s):" in out, out

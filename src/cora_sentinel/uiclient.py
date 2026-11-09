@@ -38,6 +38,8 @@ RANK = {"clear": 0, "evaluating": 1, "pressure": 2, "contained": 3, "psi_refused
 _MISSING = object()
 MAX_LINE = 1024 * 1024
 BREAKER_VERB = {"sever": "ISOLATE", "cap": "THROTTLE"}
+SEND_TIMEOUT_S = 2.0                    # a socket nobody reads cannot hold a send() longer than this
+TIMED_OUT = "timed out (daemon unresponsive)"
 CAP_CPU_MAX = "20000 100000"            # what "cap" writes to cpu.max (20 %); memory.high gets memory.current
 ACK_TIMEOUT_S = 2 * HEARTBEAT_S + 0.5   # an acknowledged breaker must be in force by then (the feed shows it at once)
 
@@ -55,6 +57,8 @@ class StatusClient:
         self._tags = itertools.count(1)
         self._sent: dict = {}                       # tag -> the press (cmd, task, cgroup_id, before) not yet answered
         self.awaiting: dict = {}                    # tag -> an acknowledged breaker not yet seen in force
+        self._sent_at: dict = {}                    # tag -> when it was sent (this client's clock)
+        self.timed_out: dict = {}                   # tag -> a breaker the daemon never answered within ACK_TIMEOUT_S
         self.on_state: Optional[Callable[[dict], None]] = None   # called with EVERY state frame (a poll may read several)
 
     def connect(self) -> bool:
@@ -83,7 +87,9 @@ class StatusClient:
     def _forget_breakers(self) -> None:
         """Pending breaker checks are only meaningful against the feed they were pressed on."""
         self._sent.clear()
+        self._sent_at.clear()
         self.awaiting.clear()
+        self.timed_out.clear()
 
     def poll(self) -> bool:
         """Read whatever is waiting, never block. True if the state changed. Reconnect is the caller's timer."""
@@ -135,7 +141,10 @@ class StatusClient:
                     self.on_state(msg)
             elif msg.get("type") == "result" and msg.get("id") is not None:
                 self.results[str(msg["id"])] = msg
-                sent = self._sent.pop(str(msg["id"]), None)
+                tag = str(msg["id"])
+                self._sent_at.pop(tag, None)
+                late = self.timed_out.pop(tag, None)     # an answer after the timeout still counts, and un-latches
+                sent = self._sent.pop(tag, None) or (late and late["sent"])
                 if sent is not None and msg.get("ok") is True:
                     cmd, task, cid, before = sent
                     self.awaiting[str(msg["id"])] = {"cmd": cmd, "task": task, "cgroup_id": cid,
@@ -151,10 +160,11 @@ class StatusClient:
         tag = f"t{next(self._tags)}"
         self._forget_breakers()                     # a new press supersedes the old checks (and their alert)
         self._sent[tag] = (cmd, task, cgroup_id, _press_state(self.state, task, cgroup_id))
+        self._sent_at[tag] = self.clock()
         line = json.dumps({"cmd": cmd, "task": task, "cgroup_id": cgroup_id, "id": tag}) + "\n"
         try:
             self.sock.setblocking(True)
-            self.sock.settimeout(2)
+            self.sock.settimeout(SEND_TIMEOUT_S)
             self.sock.sendall(line.encode())
         except OSError as e:
             self.error = f"could not send ({e.strerror or e})"
@@ -164,6 +174,15 @@ class StatusClient:
             if self.sock:
                 self.sock.setblocking(False)
         return tag
+
+    def expire(self) -> None:
+        """A breaker the daemon has not answered within ACK_TIMEOUT_S is timed out: shown, never waited on forever."""
+        now = self.clock()
+        for tag, at in list(self._sent_at.items()):
+            if now - at > ACK_TIMEOUT_S:
+                sent = self._sent.pop(tag)
+                del self._sent_at[tag]
+                self.timed_out[tag] = {"cmd": sent[0], "task": sent[1], "cgroup_id": sent[2], "since": at, "sent": sent}
 
     def _reflect(self, state: dict) -> None:
         """An acknowledged breaker is settled when the feed shows a CHANGE it made: sever, ISOLATE in force that was not
@@ -185,6 +204,7 @@ class StatusClient:
         def quiet(status: str, title: str, detail: str) -> dict:
             return {"status": status, "colour": COLOURS[status], "title": title, "detail": detail, "mode": None,
                     "tasks": [], "session": None, "replay": None}
+        self.expire()
         if self.sock is None:
             return quiet("unreachable", "cora: unreachable", self.error or "not connected")
         if self.state is None:
@@ -228,6 +248,24 @@ class StatusClient:
             v = [x for x in v if x != "THROTTLE"]       # shown as "limit provenance unknown" instead
         return v
 
+    def task_status(self, t: dict) -> str:
+        """One task's own status, by the same ranks as the whole view's: what the HUD sorts its rows by. Only what the
+        feed says about THIS task votes (a session-wide alarm names no task; the daemon puts it on the task it can)."""
+        votes = ["clear"]
+        if t.get("alarm"):
+            votes.append("alarm")
+        if t.get("errors") or (isinstance(t.get("limits"), dict) and t["limits"].get("source") == "unknown"):
+            votes.append("blind")
+        if any(v not in KNOWN_VERBS for key in ("enforced", "contained", "unknown") for v in self._verbs(t, key)):
+            votes.append("unknown")
+        if self._enforced(t):
+            votes.append("contained")
+        if t.get("psi_state") == "refused" and t.get("pids") != 0:
+            votes.append("psi_refused")
+        if (t.get("pressure") or {}).get("active"):
+            votes.append("pressure")
+        return max(votes, key=RANK.__getitem__)
+
     def _view(self, s: dict) -> dict:
         mode = s.get("mode")
         raw = s.get("status", _MISSING)
@@ -249,9 +287,10 @@ class StatusClient:
                         and t["limits"].get("source") == "unknown"]
         now = self.clock()
         unreflected = [a for a in self.awaiting.values() if now - a["since"] > ACK_TIMEOUT_S]
+        unanswered = list(self.timed_out.values())
         votes = [raw if status_ok else "unknown"] + ["blind"] * bool(truth) + ["unknown"] * bool(odd) + \
             ["contained"] * bool(unproven) + ["psi_refused"] * bool(refused) + ["blind"] * bool(prov_unknown) + \
-            ["unknown"] * bool(unreflected)
+            ["unknown"] * bool(unreflected) + ["unknown"] * bool(unanswered)
         st = max(votes, key=RANK.__getitem__)
         hot = [t["name"] for t in raw_tasks if (t.get("pressure") or {}).get("active")]
         label = {"clear": "all clear", "evaluating": f"model evaluating ({s.get('evaluating', 0)})",
@@ -262,6 +301,8 @@ class StatusClient:
                  "psi_refused": "memory-pressure tripwire refused"}[st]
         if st == "unknown" and status_ok and not odd and unreflected:
             label = "breaker acknowledged but not in force"
+        elif st == "unknown" and status_ok and not odd and unanswered:
+            label = "breaker unanswered: daemon unresponsive"
         enforced = any(self._enforced(t) for t in raw_tasks)
         if st == "contained" and not enforced and mode != "enforce":
             label = "WOULD contain (dry-run: nothing was done)"
@@ -287,6 +328,9 @@ class StatusClient:
                   "psi_threshold": t.get("psi_threshold") if t.get("psi_state") == "armed"
                                    and isinstance(t.get("psi_threshold"), dict) else None,
                   "mem_bytes": t.get("mem_bytes") if type(t.get("mem_bytes")) is int else None,
+                  "status": self.task_status(t),
+                  "pending": TIMED_OUT if (late := _timed_out_on(unanswered, t)) else None,
+                  "pending_cmd": late["cmd"] if late else None,
                   "can_sever": "sever" in breakers and "ISOLATE" not in self._enforced(t),
                   "can_cap": "cap" in breakers and "THROTTLE" not in self._enforced(t)}
                  for t in raw_tasks]
@@ -306,12 +350,19 @@ class StatusClient:
             detail = "; ".join(f"limit without launch provenance on {n}: treated as THROTTLE" for n in unproven[:3]) + " | " + detail
         if odd:
             detail = "; ".join(f"unknown verb {v!r} on {n}" for n, v in odd[:3]) + " | " + detail
+        if unanswered:
+            detail = "; ".join(f"COMMAND_TIMEOUT: {a['cmd']} on {a['task']} sent {now - a['since']:.0f} s ago, no reply "
+                               f"(unconfirmed)" for a in unanswered[:3]) + " | " + detail
         if unreflected:
             detail = "; ".join(f"ACK_NOT_REFLECTED: {a['cmd']} on {a['task']} acknowledged {now - a['since']:.0f} s ago, "
                                f"{a['verb']} not in force" for a in unreflected[:3]) + " | " + detail
         return {"status": st, "colour": COLOURS[st], "title": f"cora: {label}",
                 "detail": detail,
                 "mode": mode, "tasks": tasks, "session": sess, "replay": _replay_of(s)}
+
+
+def _timed_out_on(unanswered: list, t: dict) -> Optional[dict]:
+    return next((a for a in unanswered if a["task"] == t.get("name") and a["cgroup_id"] == t.get("cgroup_id")), None)
 
 
 def _replay_of(state) -> Optional[str]:

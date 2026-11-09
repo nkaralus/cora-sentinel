@@ -618,3 +618,67 @@ def test_on_state_sees_every_frame_even_several_in_one_read():
     c.on_state = lambda f: seen.append(f["seq"])
     c.ingest(b"".join((json.dumps({**BASE, "status": "clear", "seq": i, "tasks": []}) + "\n").encode() for i in (1, 2, 3)))
     assert seen == [1, 2, 3] and c.state["seq"] == 3
+
+
+
+# ================================================================ a frozen daemon: commands time out, never hang
+def _frozen_pair(now):
+    a, b = socket.socketpair()
+    a.setblocking(False)
+    c = StatusClient("/virtual", clock=lambda: now[0])
+    c.sock, c.connected_at = a, now[0]
+    c.ingest((json.dumps({**BASE, "status": "clear", "seq": 1, "mono": 50.0,
+                          "tasks": [task(name="game", cgroup_id=9)]}) + "\n").encode())
+    return c, b
+
+
+def test_a_breaker_sent_to_a_frozen_daemon_times_out_instead_of_waiting_forever():
+    now = [100.0]
+    c, peer = _frozen_pair(now)
+    try:
+        tag = c.send("sever", "game", 9)                                   # the daemon reads nothing, answers nothing
+        assert tag in c._sent and c.view()["tasks"][0]["pending"] is None
+        now[0] += uiclient.ACK_TIMEOUT_S + 0.1
+        c.last_rx = now[0]                                                 # the feed itself still looks alive
+        v = c.view()
+        assert c._sent == {} and tag in c.timed_out
+        assert v["tasks"][0]["pending"] == "timed out (daemon unresponsive)" and v["tasks"][0]["pending_cmd"] == "sever"
+        assert (v["status"], v["title"]) == ("unknown", "cora: breaker unanswered: daemon unresponsive")
+        assert "COMMAND_TIMEOUT: sever on game sent 5 s ago, no reply (unconfirmed)" in v["detail"]
+        c.ingest((json.dumps({"schema": SCHEMA, "type": "result", "id": tag, "ok": True}) + "\n").encode())
+        assert c.timed_out == {} and tag in c.awaiting                     # a late answer un-latches, then is checked
+    finally:
+        c.close()
+        peer.close()
+
+
+def test_a_send_into_a_full_socket_gives_up_after_send_timeout(monkeypatch):
+    now = [100.0]
+    c, peer = _frozen_pair(now)
+    try:
+        c.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+        try:
+            while True:
+                c.sock.send(b"x" * 65536)                                  # fill it: nobody on the other end reads
+        except BlockingIOError:
+            pass
+        monkeypatch.setattr(uiclient, "SEND_TIMEOUT_S", 0.2)
+        t0 = time.monotonic()
+        assert c.send("cap", "game", 9) is None
+        assert time.monotonic() - t0 < 1.5 and c.sock is None and c.error.startswith("could not send")
+        assert c._sent == {} and c.timed_out == {}                         # nothing left pending on a dead link
+    finally:
+        c.close()
+        peer.close()
+
+
+def test_task_status_ranks_one_task_by_what_the_feed_says_about_it():
+    c = StatusClient("/x")
+    assert c.task_status(task()) == "clear"
+    assert c.task_status(task(pressure={"active": True})) == "pressure"
+    assert c.task_status(task(psi_state="refused")) == "psi_refused"
+    assert c.task_status(task(psi_state="refused", pids=0)) == "clear"
+    assert c.task_status(task(enforced=["ISOLATE"])) == "contained"
+    assert c.task_status(task(enforced=["MELT"])) == "unknown"
+    assert c.task_status(task(errors=["firewall unreadable (x)"], enforced=["ISOLATE"])) == "blind"
+    assert c.task_status(task(alarm="action failed: x", errors=["e"])) == "alarm"

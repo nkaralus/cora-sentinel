@@ -10,6 +10,9 @@ lock for microseconds and return. Every client gets newline-delimited JSON:
      "status": "clear|evaluating|pressure|psi_refused|contained|blind|alarm",
      "mode": "enforce|dry-run|detect-only", "evaluating": K, "tasks": [...], "session": {...}, "mono": SECONDS}
 
+Each task carries "errors" (its own share of truth_errors: what could not be read about it), and "alarm" (why, when a
+failed automatic action named it: the session-wide "alarm" status says something went wrong, this says where; an event
+dropped uncontained names no task, so it has no per-task alarm).
 Each task carries "limits": {"source": "launch" | "sentinel" | "none" | "unknown", "cpu_max", "memory_high", "memory_max"}: the
 kernel's limits and who set them. A ceiling the operator asked for at launch (cora-run --app --memory-high: the
 scope's recorded memory_high, cpu.max untouched) is "launch" and is NOT a THROTTLE: it neither makes the task
@@ -106,6 +109,7 @@ PRESSURE_HOLD_S = 10.0                              # a tripped wire keeps the s
 COMMUNITY_PREFIX = "community-"
 ACTION_RE = re.compile(r"^(done|dry-run):(ISOLATE|THROTTLE|SUSPEND|TERMINATE)@cgroup:(.+?)(\[.*\])?$")
 CONTAINING = ("ISOLATE", "THROTTLE", "SUSPEND")
+FAILED_RE = re.compile(r"^failed:[^@]*@cgroup:(.+?)(\[.*\])?$")
 
 
 def _now_iso() -> str:
@@ -164,6 +168,7 @@ class Hub:
         self._lock = threading.Lock()
         self._contained: Dict[str, tuple] = {}     # task -> (cgroup id when acted on, {"ISOLATE": "done"|"dry-run"})
         self._baseline: Dict[str, int] = {}        # task -> memory.current when first seen
+        self._task_alarms: Dict[str, str] = {}     # task -> why it alarmed (a failed automatic action), this session
         self.session = {"started": _now_iso(), "blocked_total": 0, "community_blocked": 0, "contained_actions": 0,
                         "dropped_uncontained": 0, "failed_actions": 0, "manual_overrides": 0}
         self._dirty = True
@@ -213,6 +218,9 @@ class Hub:
             for a in actions:
                 if a.startswith("failed:") and not manual:
                     self.session["failed_actions"] += 1
+                    fm = FAILED_RE.match(a)
+                    if fm:                               # the session alarms; this task is the one it alarms about
+                        self._task_alarms[fm.group(1)] = f"action failed: {a}"[:200]
                 m = ACTION_RE.match(a)
                 if m and m.group(2) in CONTAINING:
                     name, cid = m.group(3), ids.get(m.group(3))
@@ -290,6 +298,9 @@ class Hub:
                                              "some_avg10": pr.get("some_avg10"), "full_avg10": pr.get("full_avg10")}
                 state, thr = psi_state_of(name, rec, armed, refused)
                 tasks[-1]["psi_state"], tasks[-1]["psi_threshold"] = state, thr
+                tasks[-1]["errors"] = sorted(info.get("errors", []))       # this task's share of truth_errors
+                if name in self._task_alarms:
+                    tasks[-1]["alarm"] = self._task_alarms[name]
                 if rec:
                     tasks[-1]["scope"] = {"app": rec["app"], "uid": rec["uid"], "profile": rec.get("profile", "app"),
                                           "memory_max": rec.get("memory_max"), "memory_high": rec.get("memory_high")}
