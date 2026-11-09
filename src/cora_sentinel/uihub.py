@@ -7,7 +7,7 @@ The daemon never waits on a client. A thread owns the socket; the daemon only ca
 lock for microseconds and return. Every client gets newline-delimited JSON:
 
     {"schema": "cora.sentinel.ui/v1", "type": "state", "seq": N, "ts": "...",
-     "status": "clear|evaluating|pressure|contained|blind|alarm",
+     "status": "clear|evaluating|pressure|psi_refused|contained|blind|alarm",
      "mode": "enforce|dry-run|detect-only", "evaluating": K, "tasks": [...], "session": {...}, "mono": SECONDS}
 
 Each task carries "limits": {"source": "launch" | "sentinel" | "none", "cpu_max", "memory_high", "memory_max"}: the
@@ -43,6 +43,8 @@ Status precedence (the worst wins):
   blind       the kernel's state could not be read (truth_errors: e.g. the firewall is unreadable), so the feed cannot
               say what is in force; loud, never "clear", until the next read succeeds
   contained   at least one live task is isolated, throttled or suspended right now
+  psi_refused a live launch scope asked for a memory-pressure tripwire and the kernel refused it: that task is
+              unwatched (below contained, so it never hides an active containment; the client ranks it the same way)
   pressure    a launch scope's memory-pressure tripwire fired within PRESSURE_HOLD_S (signal only: nothing is changed)
   evaluating  the model has events queued or in flight
   clear       none of the above
@@ -290,6 +292,8 @@ class Hub:
                 status = "blind"
             elif any(t["contained"] for t in tasks):
                 status = "contained"
+            elif any(t["psi_state"] == "refused" and t["pids"] != 0 for t in tasks):
+                status = "psi_refused"
             elif any((t.get("pressure") or {}).get("active") for t in tasks):
                 status = "pressure"
             elif evaluating:

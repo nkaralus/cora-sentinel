@@ -28,7 +28,7 @@ from cora_sentinel.ring_buffer import human_bytes  # noqa: F401  (shared; uiclie
 DEFAULT_SOCKET = "/run/cora-sentinel/ui.sock"
 COLOURS = {"clear": "green", "evaluating": "amber", "pressure": "amber", "contained": "indigo", "alarm": "red",
            "blind": "red", "unknown": "red", "connecting": "grey", "unreachable": "grey", "psi_refused": "amber"}
-KNOWN_STATUS = frozenset({"clear", "evaluating", "pressure", "contained", "blind", "alarm"})   # what the daemon may send
+KNOWN_STATUS = frozenset({"clear", "evaluating", "pressure", "psi_refused", "contained", "blind", "alarm"})   # what the daemon may send
 KNOWN_VERBS = frozenset({"ISOLATE", "THROTTLE", "SUSPEND"})                                       # what can be in force
 PSI_STATES = frozenset({"armed", "refused", "disabled", "unmonitored"})   # anything else, or nothing: "unknown"
 # worst wins when several faults are true at once; alarm outranks unknown (an unknown never hides a known alarm)

@@ -63,6 +63,23 @@ def threshold(trigger: Optional[str]) -> Optional[Dict[str, object]]:
             "trigger": trigger}
 
 
+def retry_refused(watcher: "PressureWatcher", trigger_of: Callable[[str], Optional[str]]) -> List[str]:
+    """Try every refused trigger again whose scope still wants one (trigger_of(name) -> its trigger, or None when the
+    scope is gone or launched with off). A refusal can heal without a restart: PSI switched back on for the cgroup
+    (cgroup.pressure = 1), the PSI files back. Returns the names that are armed now; the rest stay refused."""
+    armed = []
+    for name in sorted(watcher.refused()):
+        trigger = trigger_of(name)
+        if not trigger:
+            continue
+        try:
+            watcher.add(name, trigger)
+        except PsiError:
+            continue
+        armed.append(name)
+    return armed
+
+
 def read_pressure(text: str, totals: bool = False) -> Dict[str, float]:
     """'some avg10=1.23 avg60=... total=...' lines -> {'some_avg10': 1.23, 'full_avg10': ...}. totals=True also
     returns the cumulative stall counters, 'some_total_us' / 'full_total_us' (integers, microseconds): two of them a

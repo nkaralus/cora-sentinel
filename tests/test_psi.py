@@ -501,3 +501,37 @@ def test_a_snapshot_taken_while_the_kernel_decides_never_sees_the_trigger_armed(
         pass
     assert seen == [{}]
     assert watcher.armed() == ({"game-abcdef": DEFAULT_TRIGGER} if kernel_says == "yes" else {})
+
+
+def test_a_refused_trigger_heals_without_a_restart_when_retried(watcher, monkeypatch):
+    real = refuse_writes(monkeypatch, watcher)
+    with pytest.raises(PsiError):
+        watcher.add("game-abcdef", DEFAULT_TRIGGER)
+    want = {"game-abcdef": DEFAULT_TRIGGER, "gone-abcdef": None}
+    assert psi.retry_refused(watcher, want.get) == [] and watcher.refused() == {"game-abcdef"}   # still refused
+    monkeypatch.setattr(psi.os, "write", real)                             # e.g. cgroup.pressure back to 1
+    assert psi.retry_refused(watcher, want.get) == ["game-abcdef"]
+    assert watcher.armed() == {"game-abcdef": DEFAULT_TRIGGER} and watcher.refused() == set()
+
+
+def test_retry_skips_scopes_that_are_gone_or_launched_with_off(watcher):
+    with pytest.raises(PsiError):
+        watcher.add("nosuch-abcdef", DEFAULT_TRIGGER)
+    calls = []
+    assert psi.retry_refused(watcher, lambda n: calls.append(n)) == [] and calls == ["nosuch-abcdef"]
+    assert watcher.refused() == {"nosuch-abcdef"}                          # untouched: nothing to arm
+
+
+def test_the_daemon_retries_refused_tripwires_on_its_reaper_tick():
+    src = (__import__("pathlib").Path(psi.__file__).parent / "daemon.py").read_text()
+    reap = src[src.index("for name in scopes.reap():"):]
+    assert "retry_refused(psi, lambda n: (scopes.describe(n) or {}).get(\"psi_memory\"))" in reap[:900]
+
+
+def test_retry_skips_a_live_scope_that_no_longer_wants_a_trigger(watcher, monkeypatch):
+    real = refuse_writes(monkeypatch, watcher)
+    with pytest.raises(PsiError):
+        watcher.add("game-abcdef", DEFAULT_TRIGGER)                       # the cgroup exists; the write was refused
+    monkeypatch.setattr(psi.os, "write", real)
+    assert psi.retry_refused(watcher, lambda n: None) == []               # no crash, nothing armed
+    assert watcher.armed() == {} and watcher.refused() == {"game-abcdef"}

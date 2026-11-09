@@ -682,3 +682,39 @@ def test_the_client_passes_known_psi_states_and_calls_anything_else_unknown(psi_
     for t in snap["tasks"]:
         t["psi_state"], t["psi_threshold"] = "melting", {"fraction": 0.5}
     assert all(t["psi_state"] == "unknown" and t["psi_threshold"] is None for t in c.view()["tasks"])
+
+
+def test_a_live_refused_tripwire_raises_the_daemon_status_to_psi_refused(psi_world):
+    make, hub, w, refuse, root = psi_world
+    refuse.add("some 150000 1000000")
+    name = make("some 150000 1000000")
+    h = hub()
+    snap = h.snapshot()
+    assert snap["status"] == "psi_refused"
+    c = StatusClient("/x", clock=lambda: 0.0)
+    c.sock, c.last_rx, c.connected_at, c.state = object(), 0.0, 0.0, snap
+    v = c.view()
+    assert (v["status"], v["colour"]) == ("psi_refused", "amber") and f"psi refused on {name}" in v["detail"]
+    assert "received status" not in v["detail"]                           # a status the client knows, not "unknown"
+    (root / name / "cgroup.procs").write_text("")                          # every process gone: pids == 0
+    assert h.snapshot()["status"] == "clear"
+
+
+def test_psi_refused_sits_below_alarm_blind_and_contained_and_above_pressure(live):
+    live.tasks = {"t": {"pids": 1, "mem_bytes": 1, "id": 7, "enforced": [], "unknown": [], "errors": [], "psi": None}}
+
+    class P:
+        def armed(self):
+            return {}
+
+        def refused(self):
+            return {"t"}
+    h = Hub("/nonexistent/ui.sock", tasks=lambda: dict(live.tasks), evaluating=lambda: 1, psi=P(), log=lambda m: None)
+    h.note_pressure("t", {"some_avg10": 40.0})
+    assert h.snapshot()["status"] == "psi_refused"                         # above pressure and evaluating
+    live.tasks["t"]["enforced"] = ["ISOLATE"]
+    assert h.snapshot()["status"] == "contained"                           # an active containment is never hidden
+    live.tasks["t"]["errors"] = ["firewall unreadable (X)"]
+    assert h.snapshot()["status"] == "blind"
+    h.note_decision({"final": "DROPPED"})
+    assert h.snapshot()["status"] == "alarm"

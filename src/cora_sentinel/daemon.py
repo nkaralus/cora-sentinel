@@ -1086,6 +1086,11 @@ def main() -> int:
                     if psi is not None:
                         psi.remove(name)
                     print(f"[cora-sentinel] launch scope {name} ended and was removed", file=sys.stderr, flush=True)
+                if psi is not None:                      # a refused tripwire is retried, so it can heal without a restart
+                    from cora_sentinel.psi import retry_refused
+                    for name in retry_refused(psi, lambda n: (scopes.describe(n) or {}).get("psi_memory")):
+                        print(f"[psi] re-armed {name}: its tripwire was refused before and is armed now",
+                              file=sys.stderr, flush=True)
             except Exception as e:
                 print(f"[cora-sentinel] scope reap failed: {e!r}", file=sys.stderr)
         if fw and n % 60 == 0:  # housekeeping: drop rules whose task cgroup is gone
