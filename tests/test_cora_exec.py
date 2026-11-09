@@ -165,7 +165,7 @@ def test_set_assembles_the_whole_block_and_parks_it_with_the_phrase_as_data(base
     assert rec["intent"] == {"op": "set", "target": "%Crate", "ref": None, "side": None,
                              "phrase": "move it to x=600, y=600 please", "attempts": 1,
                              "model_output": '{"x":600,"y":600,"w":50,"h":50}',
-                             "model_outputs": ['{"x":600,"y":600,"w":50,"h":50}']}
+                             "model_outputs": ['{"x":600,"y":600,"w":50,"h":50}'], "warnings": []}
     assert out.change == "%Crate: [100, 100, 50, 50] -> [600, 600, 50, 50]"
 
 
@@ -583,3 +583,74 @@ def test_the_approval_line_is_against_the_staged_from_version_even_after_commit(
     out = X.Exec(h, Stub()).run("set", "%Crate", None, dx=10)
     h.approve(out.ticket_id)
     assert X.describe_ticket(h, out.ticket_id) == "%Crate: [100, 100, 50, 50] -> [110, 100, 50, 50]"
+
+
+# ================================================================ number echo (advisory) and flag edges
+def test_phrase_numbers_skip_names_and_keep_signs():
+    assert X.phrase_numbers("move %Node12 to x=-50, y=600, then 600 again") == [-50, 600]
+    assert X.phrase_numbers(None) == [] and X.phrase_numbers("no numbers") == []
+
+
+def test_a_number_the_model_dropped_is_warned_about_but_not_refused(base):
+    h = harness(base)
+    out = X.Exec(h, Stub({"gap": 100})).run("place", "%Crate", "put it 20 px from the wall", ref="%Wall", side="left")
+    warn = "[WARN: number 20 from phrase not present in proposed slots]"
+    assert out.ok and out.code == "PARKED" and out.warnings == [warn]
+    assert out.change.endswith(warn) and X.describe_ticket(h, out.ticket_id).endswith(warn)
+    assert journal(base)[0]["intent"]["warnings"] == [warn]
+
+
+def test_numbers_that_are_in_the_slots_raise_no_warning(base):
+    out = run(base, Stub({"x": 600, "y": 600, "w": 50, "h": 50}), "set", "%Crate", "move it to x=600, y=600")
+    assert out.warnings == [] and "WARN" not in out.change and journal(base)[0]["intent"]["warnings"] == []
+
+
+def test_exact_moves_have_no_echo_check(base):
+    out = run(base, Stub(), "set", "%Crate", "shift it by 999", dx=10)
+    assert out.code == "PARKED" and out.warnings == [] and journal(base)[0]["intent"]["warnings"] == []
+
+
+@pytest.mark.parametrize("kw", [{"dx": B.COORD_MAX}, {"dx": -B.COORD_MAX - 101}, {"dy": 10 ** 30}, {"dy": -(10 ** 30)}])
+def test_a_delta_past_the_coordinate_range_is_refused_cleanly(base, kw):
+    stub = Stub()
+    out = run(base, stub, "set", "%Crate", None, **kw)
+    assert (out.code, stub.calls) == ("DELTA_OUT_OF_RANGE", 0) and "outside" in out.detail
+
+
+def test_a_delta_to_exactly_the_range_edge_reaches_the_bus(base):
+    out = run(base, Stub(), "set", "%Crate", None, dx=B.COORD_MAX - 100)      # x == COORD_MAX: mule-legal, off the world
+    assert out.code == "GI_3:OUT_OF_WORLD"
+
+
+def test_centring_a_node_larger_than_the_world_does_not_fit():
+    """Unreachable with a valid registry (subnetbus refuses a node outside its world, on allocate, set_bounds and
+    load), so the impossible state is injected in memory: the check is defence in depth, and it says why."""
+    import dataclasses
+    reg = B.demo_registry()
+    reg._nodes["%Crate"] = dataclasses.replace(reg.get("%Crate"), bounds=B.AABB(0, 0, 1200, 50))
+
+    class Fake:
+        def live_registry(self):
+            return reg
+
+        def status(self):
+            return {"parked": {}}
+
+        def submit(self, *a, **k):
+            raise AssertionError("must not get this far")
+    stub = Stub()
+    out = X.Exec(Fake(), stub).run("set", "%Crate", None, center=True)
+    assert (out.code, stub.calls) == ("DOES_NOT_FIT", 0) and out.conflicts == [[0.0, 0.0, 1000.0, 1000.0]]
+    assert "1200x50" in out.detail and "1000x1000" in out.detail
+    reg2 = B.demo_registry()
+    with pytest.raises(B.BusError):
+        reg2.set_bounds("%Crate", B.AABB(0, 0, 1200, 50))          # why it cannot happen for real
+
+
+def test_centring_where_it_already_is_is_no_change(base):
+    h = harness(base)
+    out = X.Exec(h, Stub()).run("set", "%Crate", None, center=True)
+    assert h.approve(out.ticket_id).code == "COMMITTED"
+    stub = Stub()
+    out = X.Exec(h, stub).run("set", "%Crate", None, center=True)
+    assert (out.code, stub.calls) == ("NO_CHANGE", 0) and "[475, 475, 50, 50]" in out.detail

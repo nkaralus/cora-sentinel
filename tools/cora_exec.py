@@ -36,6 +36,11 @@ Rules
     showed the model answering "move it 100 px right" with the unchanged position).
   * Inference runs in a worker process (tools/cora_model.py); this file never imports llama_cpp.
   * Audit: the journal keeps, as data beside the ticket, the phrase, every raw model output and the accepted one.
+  * Number echo (advisory, never a refusal): every integer in the phrase (names stripped first) that is not among the
+    accepted slots ([x, y, w, h], or [gap]) adds "[WARN: number N from phrase not present in proposed slots]" to the
+    change line, the approve screen and the journal. A heuristic: "100 px to the right" legitimately has no 100 in it.
+  * Edges: --dx/--dy that would take x or y past +-COORD_MAX is DELTA_OUT_OF_RANGE; --center of a node larger than
+    the world is DOES_NOT_FIT (with the world as the conflict); a centre that is where it already is, NO_CHANGE.
   * The phrase is sanitised (printable ASCII, whitespace collapsed, at most PHRASE_MAX) and journaled as data with the
     ticket; it is shown to the model as a JSON string value, never as instructions.
   * 2D, y grows downward (Godot): "above" is smaller y. Place keeps the target's size and centres it on the reference
@@ -57,7 +62,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from cora_exec_bridge import (AABB, NAMESPACE, NODE_NAME_RE, TIME_SLOT, Bridge, name_problems)  # noqa: E402
+from cora_exec_bridge import (AABB, COORD_MAX, NAMESPACE, NODE_NAME_RE, TIME_SLOT, Bridge, name_problems)  # noqa: E402
 from cora_model import DEFAULT_MODEL, ModelError, ModelWorker  # noqa: E402
 from cora_stage_harness import Harness  # noqa: E402
 from cora_sentinel._vendor.mule import load_spec  # noqa: E402
@@ -93,6 +98,7 @@ class Outcome:
     attempts: List[dict] = field(default_factory=list)   # [{"raw", "slots", "bounds", "code"}] in order
     conflicts: List[list] = field(default_factory=list)  # GI_3: the bounds it collided with, or the world it left
     change: Optional[str] = None                         # what a parked ticket would do, in numbers
+    warnings: List[str] = field(default_factory=list)    # advisory: number-echo mismatches
 
 
 def sanitize(phrase: Any) -> str:
@@ -197,9 +203,12 @@ class Exec:
         if not verdict.ok:
             return Outcome(False, verdict.code, verdict.detail, attempts=attempts,
                            conflicts=conflicts(reg, verdict.code, node, bounds) if verdict.code.startswith("GI_3:") else [])
+        slots = attempts[-1].get("slots") if attempts else None
+        warnings = echo_warnings(intent.get("phrase"), slots) if slots else []
+        intent["warnings"] = warnings
         r = self.harness.submit(ticket, intent=intent)
-        return Outcome(r.ok, r.code, r.detail, r.ticket_id, r.state, attempts=attempts,
-                       change=change_summary(block, reg) if r.ok else None)
+        return Outcome(r.ok, r.code, r.detail, r.ticket_id, r.state, attempts=attempts, warnings=warnings,
+                       change=with_warnings(change_summary(block, reg), warnings) if r.ok else None)
 
     def reserve(self, name: str, kind: str, subnet: Optional[str] = None) -> Outcome:
         reg = self.harness.live_registry()
@@ -254,12 +263,20 @@ class Exec:
                 return no(f"{node.name} is only reserved: it has no position to move or size to centre", "NOT_PLACED")
             if _ints(node.bounds) is None or (refnode is not None and refnode.bounds is not None and _ints(refnode.bounds) is None):
                 return no("non-integer bounds cannot be expressed in mule's integer slots", "NON_INTEGER_BOUNDS")
+            x, y, w, h = _ints(node.bounds)
+            for axis, cur, d in (("x", x, dx), ("y", y, dy)):
+                if d is not None and not -COORD_MAX <= cur + d <= COORD_MAX:
+                    return no(f"{axis} would be {cur} + {d} = {cur + d}, outside +-{COORD_MAX}", "DELTA_OUT_OF_RANGE")
             if center:
                 frame = refnode.bounds if refnode is not None else reg.subnet(node.subnet).world
                 if frame is None:
                     return no(f"nothing to centre in: {node.subnet} has no world and no --ref was given")
                 if _ints(frame) is None:
                     return no("non-integer bounds cannot be expressed in mule's integer slots", "NON_INTEGER_BOUNDS")
+                fx, fy, fw, fh = _ints(frame)
+                if refnode is None and (w > fw or h > fh):
+                    return Outcome(False, "DOES_NOT_FIT", f"{node.name} is {w}x{h}, the world of {node.subnet} is {fw}x{fh}",
+                                   conflicts=[[float(fx), float(fy), float(fw), float(fh)]])
             return node, refnode, sanitize(phrase) if phrase is not None else None
         if op == "place":
             if refnode is None or side is None:
@@ -340,6 +357,26 @@ def _box(b) -> Optional[list]:
     return [int(v) if float(v).is_integer() else v for v in (b.x, b.y, b.w, b.h)]
 
 
+NUMBER_RE = re.compile(r"-?\d+")
+
+
+def phrase_numbers(phrase: Optional[str]) -> List[int]:
+    """The integers an operator wrote, in order, once each; node names (%Node12) are not numbers."""
+    if not phrase:
+        return []
+    text = re.sub(r"%[A-Za-z0-9]+", " ", phrase)
+    return list(dict.fromkeys(int(n) for n in NUMBER_RE.findall(text)))
+
+
+def echo_warnings(phrase: Optional[str], slots: Dict[str, int]) -> List[str]:
+    vals = set(slots.values())
+    return [f"[WARN: number {n} from phrase not present in proposed slots]" for n in phrase_numbers(phrase) if n not in vals]
+
+
+def with_warnings(line: str, warnings: List[str]) -> str:
+    return " ".join([line, *warnings])
+
+
 def change_summary(action: dict, before) -> str:
     """One line, in numbers, for the operator who approves: what this ticket changes. `before` is the registry the
     ticket was staged from."""
@@ -374,7 +411,8 @@ def describe_ticket(h: Harness, ticket_id: str) -> Optional[str]:
     if rec is None:
         return None
     from cora_sentinel._vendor.subnetbus import Registry
-    return change_summary(rec["ticket"]["action"], Registry.load(h.versions / rec["base"] / "state_registry.json"))
+    line = change_summary(rec["ticket"]["action"], Registry.load(h.versions / rec["base"] / "state_registry.json"))
+    return with_warnings(line, (rec.get("intent") or {}).get("warnings") or [])
 
 
 # ---------------------------------------------------------------------------------------------- CLI
